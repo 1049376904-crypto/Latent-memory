@@ -137,6 +137,10 @@ class MemoryIndex:
         # 不销毁；退出的只是检索可见性。撤回账本按内容哈希持久化（同权重先例）
         self.retracted = set()          # chunk 下标
         self.retraction_log = {}        # 内容哈希 → {reason, time, source, heading}
+        # 实体标注（图谱层可插拔升级路径，任务卡"图谱实体抽取可插拔"）：
+        # chunk 下标 → 实体集合。默认空——图谱走零依赖词面代理；用户花 LLM 调用
+        # 抽取过实体（load_entities 接入 .entities.json）后，实体边并进图谱
+        self._entities = {}
 
     def add(self, text, meta=None):
         self.chunks.append(text)
@@ -174,6 +178,22 @@ class MemoryIndex:
             if not 2 <= len(ds) <= max_df:
                 continue
             w = self._bm25.idf(t)
+            for a in range(len(ds)):
+                for b in range(a + 1, len(ds)):
+                    link[(ds[a], ds[b])] += w
+        # 实体边（2026.07.31，设计笔记候选 4 的可插拔槽）：词面代理的已知局限是
+        # "同一件事换了说法就连不上"（没有共享字面词）；用户若花过 LLM 调用抽取
+        # 实体（load_entities），共享同一实体的块在这里连边，强度用 idf 同款思路
+        # （越少块共享的实体区分度越高）。**与词面边是并集不是替换**——实体标注
+        # 可能只覆盖部分语料，丢掉词面边等于让没标注的块之间断联
+        ent_chunks = defaultdict(list)
+        for i in sorted(self._entities):
+            for e in self._entities[i]:
+                ent_chunks[e].append(i)
+        for e, ds in ent_chunks.items():
+            if len(ds) < 2:
+                continue
+            w = math.log(1.0 + self._bm25.N / len(ds))
             for a in range(len(ds)):
                 for b in range(a + 1, len(ds)):
                     link[(ds[a], ds[b])] += w
@@ -434,6 +454,62 @@ class MemoryIndex:
                 self.retracted.add(i)
                 n += 1
         return n
+
+    # ---------- 实体标注接入（图谱层可插拔升级路径） ----------
+
+    def load_entities(self, path):
+        """从 .entities.json（内容哈希 → 实体列表）接入实体标注，返回接上的块数。
+        按内容哈希对号入座（同权重/撤回先例）；**载入后要重新 build() 才生效**——
+        图谱边在 build 时算。文件不存在按零处理。
+
+        文件怎么来：抽取要花 LLM 调用，这笔成本花不花由用户定（同"隐私二选一
+        不给静默默认值"原则，设计笔记"自动提炼草稿流程"）——用
+        entity_extraction_prompt() 导出任务书给用户自己的模型（路线 C，零密钥
+        零 HTTP），答案经 entities_from_answer() 转成本文件格式落盘。"""
+        p = Path(path)
+        if not p.exists():
+            return 0
+        data = json.loads(p.read_text(encoding="utf-8"))
+        n = 0
+        for i, c in enumerate(self.chunks):
+            ents = data.get(_chunk_key(c))
+            if ents:
+                self._entities[i] = set(ents)
+                n += 1
+        return n
+
+
+def entity_extraction_prompt(index, max_chunks=50):
+    """给用户自己的模型的实体抽取任务书（路线 C：不内置 API，导出 prompt）。
+    语料超过 max_chunks 块时只出前一批并明确说明——长语料分批抽，不静默截断。"""
+    total = len(index.chunks)
+    lines = [
+        "下面是一批记忆片段。给每一段列出它提到的**具体实体**：人、物件、地点、",
+        "事件名、约定名——要求是「换个说法仍指同一个东西」的那类词（如「那台望远镜」",
+        "里的「望远镜」）。不要抽情绪词、形容词、日期。每段 0~5 个，没有就给空列表。",
+        "输出 JSON：{\"1\": [\"实体A\", \"实体B\"], \"2\": [], ...}，键是片段编号，只输出 JSON。",
+        "",
+    ]
+    for i, c in enumerate(index.chunks[:max_chunks], 1):
+        lines.append(f"[{i}] {c}")
+        lines.append("")
+    if total > max_chunks:
+        lines.append(f"（共 {total} 块，本批只含前 {max_chunks} 块；剩余分批再抽，别漏）")
+    return "\n".join(lines)
+
+
+def entities_from_answer(index, numbered, offset=0):
+    """模型答案（{"1": [...], ...}，编号从 1 起）→ .entities.json 的内容
+    （内容哈希 → 实体列表）。offset 用于分批：第二批 offset=50 时编号 1 对应
+    第 51 块。编号越界明确报错，不静默丢。"""
+    out = {}
+    for k, ents in numbered.items():
+        i = int(k) - 1 + offset
+        if not 0 <= i < len(index.chunks):
+            raise ValueError(f"编号 {k}（offset={offset}）超出语料范围（共 {len(index.chunks)} 块）")
+        if ents:
+            out[_chunk_key(index.chunks[i])] = sorted(set(ents))
+    return out
 
 
 def _chunk_key(text):
@@ -973,6 +1049,53 @@ def _selftest(embed=False):
         assert all("保险丝" not in x["text"]
                    for x in idx16d.retrieve("咖啡机坏了是什么原因", topN=4)), \
             "撤回要撑过重启——不然'改过来了'只活一个进程（失败得像成功）"
+
+    # 17.【图谱实体可插拔槽（设计笔记候选 4）】词面代理的已知局限："同一件事
+    #     换了说法"没有共享字面词就连不上——实体标注接上后要连得上
+    def _build_17():
+        i17 = MemoryIndex()
+        i17.add("## 山顶的约定\n那晚在山顶聊到以后，说好要买一台能看土星的家伙。")  # 0
+        i17.add("## 到货\n快递终于送来了，装在阳台，晚上迫不及待试了试。")            # 1
+        i17.add("## 学做咖喱\n试了椰浆咖喱，小火慢炖差点糊锅。")                      # 2
+        return i17
+    base17 = _build_17().build()
+    r17 = base17.retrieve("山顶 土星", topN=3)
+    assert all(x["id"] != 1 for x in r17), \
+        "前提确认：无实体标注时换了说法的块连不上（词面代理已知局限）"
+    #  a)【变异靶心：_build_graph 忽略实体边必红】实体标注接上 → 图谱带回换说法的块
+    idx17 = _build_17()
+    with tempfile.TemporaryDirectory() as td17:
+        ep = Path(td17) / ".entities.json"
+        ep.write_text(json.dumps(
+            {_chunk_key(idx17.chunks[0]): ["望远镜"],
+             _chunk_key(idx17.chunks[1]): ["望远镜"]}, ensure_ascii=False),
+            encoding="utf-8")
+        assert idx17.load_entities(ep) == 2
+    idx17.build()
+    assert 1 in idx17.graph_neighbors(0), "共享实体的块该连上边"
+    r17b = idx17.retrieve("山顶 土星", topN=3)
+    assert any(x["id"] == 1 for x in r17b), \
+        "实体标注接上后，换了说法的关联块该被图谱带进结果"
+    #  b)【变异靶心：实体边替换而非并集必红】只标注了一对块时，词面代理的边不能丢
+    idxg2 = MemoryIndex()
+    for t in ["## 镜片保养\n给望远镜擦镜片，用了专用的软布。",
+              "## 挑设备\n看了三款设备，那台望远镜带脚架。",
+              "## 无关\n中午吃了拌面。"]:
+        idxg2.add(t)
+    idxg2._entities = {0: {"软布"}, 2: {"软布"}}   # 只给 0/2 标实体
+    idxg2.build()
+    assert 1 in idxg2.graph_neighbors(0), "没被实体标注覆盖的词面边（共享'望远镜'）不能丢——并集不是替换"
+    assert 2 in idxg2.graph_neighbors(0), "实体边也在"
+    #  c) 任务书与答案回转（路线 C 闭环）：编号→哈希，越界报错不静默丢
+    p17 = entity_extraction_prompt(base17)
+    assert "[1]" in p17 and "只输出 JSON" in p17
+    conv = entities_from_answer(base17, {"1": ["望远镜"], "2": []})
+    assert conv == {_chunk_key(base17.chunks[0]): ["望远镜"]}, "空列表不占条目，编号从 1 起"
+    try:
+        entities_from_answer(base17, {"9": ["x"]})
+        raise AssertionError("越界编号该报错")
+    except ValueError:
+        pass
     #  d) 窗口号与层标记
     assert parse_window_no("window_01.md") == 1 and parse_window_no("window_36_某某.md") == 36
     assert parse_window_no("Window-7.md") == 7 and parse_window_no("2026-07-15.md") is None

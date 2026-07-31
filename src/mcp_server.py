@@ -179,7 +179,8 @@ class MemoryServer:
     """协议层与业务层的接线。持有 index 与 thread store，工具处理器一律薄转发。"""
 
     def __init__(self, index=None, thread_store=None, search_topN=5, recall_topN=3,
-                 corpus_dir=None, weights_path=None, retractions_path=None):
+                 corpus_dir=None, weights_path=None, retractions_path=None,
+                 entities_path=None):
         # 两个 topN 分开（2026.07.31 真实语料冒烟后拆的）：显式检索是用户/模型
         # 主动问一件事，多给几条值；开场召回每次换窗都付一遍，条数要克制
         self.index = index if index is not None else MemoryIndex().build()
@@ -199,6 +200,10 @@ class MemoryServer:
             self.index.load_retractions(retractions_path)
         if weights_path is not None:
             self.index.load_weights(weights_path)
+        # 实体标注（图谱可插拔升级）：语料目录下有 .entities.json 就接上——
+        # 实体边在 build 时算，接上后要重建一次索引才生效
+        if entities_path is not None and self.index.load_entities(entities_path):
+            self.index.build()
 
     # ---------- 三个工具：只转发，不实现 ----------
 
@@ -599,9 +604,29 @@ def _selftest():
         assert s12b.index.retraction_log, "重启后撤回账本该从盘上回来"
         assert json.loads(rp.read_text(encoding="utf-8")), "账本文件要真在盘上（可追溯）"
 
-    print("selftest ok（13项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层 / "
+    # 13.【图谱实体可插拔·接线靶心（变异：__init__ 不接 entities_path 必红）】
+    #     语料目录下有 .entities.json 时 server 要接上并重建——换了说法的关联块
+    #     经图谱进结果
+    from memory_retrieval import _chunk_key
+    def mk13():
+        i = MemoryIndex()
+        i.add("## 山顶的约定\n那晚在山顶聊到以后，说好要买一台能看土星的家伙。")
+        i.add("## 到货\n快递终于送来了，装在阳台，晚上迫不及待试了试。")
+        return i.build()
+    with tempfile.TemporaryDirectory() as td:
+        ep = _P(td) / ".entities.json"
+        idx13 = mk13()
+        ep.write_text(json.dumps({_chunk_key(idx13.chunks[0]): ["望远镜"],
+                                  _chunk_key(idx13.chunks[1]): ["望远镜"]},
+                                 ensure_ascii=False), encoding="utf-8")
+        s13 = MemoryServer(index=mk13(), thread_store=ThreadStore(), entities_path=ep)
+        r13 = call(s13, "memory_search", {"query": "山顶 土星"}, now)
+        assert r13["isError"] is False and "阳台" in r13["content"][0]["text"], \
+            "server 接上 .entities.json 后，换了说法的关联块该被图谱带回"
+
+    print("selftest ok（14项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层 / "
           "完整链路 / stdio / UTF-8 / 写回当场可查 / 用进撑过重启 / "
-          "无可靠命中明确说 / 撤回更正闭环）")
+          "无可靠命中明确说 / 撤回更正闭环 / 实体标注接线）")
 
 
 if __name__ == "__main__":
@@ -619,6 +644,7 @@ if __name__ == "__main__":
                      thread_store=ThreadStore(args.threads),
                      corpus_dir=args.corpus,
                      weights_path=Path(args.corpus) / ".weights.json",
-                     retractions_path=Path(args.corpus) / ".retractions.json").serve_stdio()
+                     retractions_path=Path(args.corpus) / ".retractions.json",
+                     entities_path=Path(args.corpus) / ".entities.json").serve_stdio()
     else:
         ap.print_help()

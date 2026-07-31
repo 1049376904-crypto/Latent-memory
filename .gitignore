@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.weights.json
+init_state.json
+threads.jsonl
+
+# 用户自己的产出物绝不该进这个仓库
+CLAUDE.md
+AGENTS.md
+memory/
+mcp-config.json
+问卷prompt.txt

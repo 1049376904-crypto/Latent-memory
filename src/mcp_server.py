@@ -24,6 +24,8 @@ tools/list / tools/call，字段名与错误分层均照规格），**已查证�
 工具集一一对应现成能力，不新造：
   memory_search  → MemoryIndex.retrieve
   session_start  → SessionRecall.on_session_start（thread 块 + 召回块 + 自查指令）
+  memory_append  → memory_retrieval.append_record（正文层的笔）
+  memory_correct → MemoryIndex.retract（+ 可选 append_record 写更正）
   thread_close   → session_thread.close_thread + ThreadStore.append
 
 用法：
@@ -62,6 +64,9 @@ INSTRUCTIONS = (
     "查一下往往就有。查完自然接上话即可，不用报告自己搜过。\n"
     "记忆库不是只读的：对话里出现值得长期记住的事——新约定、重要事件、状态变化、"
     "对方明确说要记住的——**当场用 memory_append 写进去**，不用请示，不用等会话结束。\n"
+    "记错了的事也有出口：对方指出某段记忆不对或已经过时，**当场用 memory_correct "
+    "撤回旧记录并写上更正**——只口头认错不改库，下次照样检索到错的。\n"
+    "查过但确实没有的，就如实说没找到——查过之后的“没有”是诚实，查之前的“没有”才是错。\n"
     "新会话开场先调一次 session_start，会话结束前调一次 thread_close。"
 )
 
@@ -117,6 +122,30 @@ TOOLS = [
         },
     },
     {
+        "name": "memory_correct",
+        "title": "更正记忆",
+        "description": "对方指出某段记忆**记错了或已经过时**（关系变了/搬家了/"
+                       "计划改了……）时当场调用：撤回那段旧记录（检索不再返回它；"
+                       "原文件与撤回原因留档，可追溯），并可同时写入更正后的记录。"
+                       "quote 必须从 memory_search 返回的原文里**逐字**摘一段、"
+                       "足够长能唯一定位那条记录。只口头认错不调这个工具的话，"
+                       "库没变，下次照样检索到错的。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "quote": {"type": "string",
+                          "description": "要撤回的记录原文片段（逐字，不转述）"},
+                "reason": {"type": "string",
+                           "description": "为什么撤回——记错了/已过时/对方更正了什么"},
+                "correction": {"type": "string",
+                               "description": "更正后的内容（可省略：只撤不补）"},
+                "current_state": {"type": "string",
+                                  "description": "更正这件事现在的状态（写 correction 时必填）"},
+            },
+            "required": ["quote", "reason"],
+        },
+    },
+    {
         "name": "thread_close",
         "title": "收尾本次会话",
         "description": "会话结束前**主动**调一次：记下这次聊了什么线、当下状态、"
@@ -150,7 +179,7 @@ class MemoryServer:
     """协议层与业务层的接线。持有 index 与 thread store，工具处理器一律薄转发。"""
 
     def __init__(self, index=None, thread_store=None, search_topN=5, recall_topN=3,
-                 corpus_dir=None, weights_path=None):
+                 corpus_dir=None, weights_path=None, retractions_path=None):
         # 两个 topN 分开（2026.07.31 真实语料冒烟后拆的）：显式检索是用户/模型
         # 主动问一件事，多给几条值；开场召回每次换窗都付一遍，条数要克制
         self.index = index if index is not None else MemoryIndex().build()
@@ -163,6 +192,11 @@ class MemoryServer:
         # 内存里（selftest/临时用法），配了就启动时载入、每次检索命中后落盘
         self.corpus_dir = corpus_dir
         self.weights_path = weights_path
+        # 撤回账本（错误记忆治理闭环）：配了就启动时载入、每次撤回后落盘——
+        # 不落盘的话"改过来了"只活一个进程，跟权重当初同一个坑
+        self.retractions_path = retractions_path
+        if retractions_path is not None:
+            self.index.load_retractions(retractions_path)
         if weights_path is not None:
             self.index.load_weights(weights_path)
 
@@ -178,7 +212,12 @@ class MemoryServer:
             # server 一重启就归零——权重持久化的"存"这半就在这一行
             self.index.save_weights(self.weights_path)
         if not results:
-            raise ToolError("没有检索到相关记忆")
+            # 可靠命中门槛（验收反馈）：低相关不硬凑。这句要同时做两件事——
+            # 说清"查过了、真没有"，并明确解锁如实回答（instructions 堵的是
+            # "没查就说没记录"，查过之后的"没有"是诚实，不是那句被堵的话术）
+            raise ToolError("没有可靠命中：记忆库里没有与这个说法词面或语义相关的"
+                            "记录。你已经查过了——如实告诉对方没找到/记不清即可；"
+                            "也可以换个说法再查一次（人名、地点、当时的用词）。")
         return format_recall_block(results)  # 复用召回层的格式化，外壳不另写一套
 
     def _tool_session_start(self, args, now=None):
@@ -206,6 +245,35 @@ class MemoryServer:
         self.index.build()
         return f"已写进第 {meta['window']} 个窗口（{path.name}）。"
 
+    def _tool_memory_correct(self, args, now=None):
+        correction = args.get("correction")
+        if correction and not (args.get("current_state") or "").strip():
+            raise ToolError("写 correction 时 current_state（当下状态）必填——"
+                            "病灶迁移，同 memory_append：更正这件事现在是什么状态？")
+        try:
+            _, old_text = self.index.retract(args.get("quote") or "",
+                                             args.get("reason") or "", now=now)
+        except ValueError as e:
+            raise ToolError(str(e))
+        if self.retractions_path is not None:
+            self.index.save_retractions(self.retractions_path)
+        msg = "已撤回那段旧记录：检索不会再返回它（原文件保留，撤回原因入账可追溯）。"
+        if correction:
+            if self.corpus_dir is None:
+                # 撤回已生效但更正写不进去——明确报出来，不静默丢（同 append 的理由）
+                raise ToolError(msg + " 但服务器没有配置可写的语料目录（--corpus），"
+                                "更正内容写不进去，请提醒用户检查 MCP 配置。")
+            try:
+                path, chunk_text, meta = append_record(
+                    self.corpus_dir, f"【更正】{correction}",
+                    args.get("current_state") or "", now=now)
+            except (ValueError, OSError) as e:
+                raise ToolError(msg + f" 但更正内容写入失败：{e}")
+            self.index.add(chunk_text, meta)
+            self.index.build()
+            msg += f" 更正已写进第 {meta['window']} 个窗口（{path.name}）。"
+        return msg
+
     def _tool_thread_close(self, args, now=None):
         now = time.time() if now is None else now
         try:
@@ -227,6 +295,7 @@ class MemoryServer:
             "memory_search": self._tool_memory_search,
             "session_start": self._tool_session_start,
             "memory_append": self._tool_memory_append,
+            "memory_correct": self._tool_memory_correct,
             "thread_close": self._tool_thread_close,
         }
 
@@ -355,10 +424,13 @@ def _selftest():
     # 2. tools/list：三个工具，schema 字段名照规格（name/inputSchema）
     tools = srv.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
     assert [t["name"] for t in tools] == ["memory_search", "session_start",
-                                          "memory_append", "thread_close"]
+                                          "memory_append", "memory_correct",
+                                          "thread_close"]
     for t in tools:
         assert set(t) >= {"name", "description", "inputSchema"} and t["inputSchema"]["type"] == "object"
-    assert tools[3]["inputSchema"]["required"] == ["window", "current_state"], "当下状态必填要写进 schema"
+    assert tools[4]["inputSchema"]["required"] == ["window", "current_state"], "当下状态必填要写进 schema"
+    assert tools[3]["inputSchema"]["required"] == ["quote", "reason"], \
+        "更正工具必填 quote+reason——没有原因的撤回不可追溯"
     assert tools[2]["inputSchema"]["required"] == ["text", "current_state"], \
         "写回的当下状态必填也要写进 schema（病灶迁移在写入口强制）"
 
@@ -490,8 +562,46 @@ def _selftest():
         assert s_b.index.weights[i] > 1.0, \
             "重启后命中过的块权重该还在——不落盘的话用进废退在生产形态下等于没有"
 
-    print("selftest ok（11项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层 / "
-          "完整链路 / stdio / UTF-8 / 写回当场可查 / 用进撑过重启）")
+    # 11.【可靠命中门槛】零信号 query → isError + 明确"没有可靠命中"，且文案要
+    #     解锁如实回答（instructions 堵的是"没查就说没记录"，查过之后的"没有"
+    #     是诚实——两句话必须能共存，不然模型会在两条指令之间僵住）
+    miss = call(_build_server(now), "memory_search", {"query": "量子对撞机的运行日志"}, now)
+    assert miss["isError"] is True and "没有可靠命中" in miss["content"][0]["text"]
+    assert "如实" in miss["content"][0]["text"], "没找到时要明确解锁'如实说没有'"
+
+    # 12.【错误记忆治理闭环：撤回→更正→重启仍生效】
+    with tempfile.TemporaryDirectory() as td:
+        rp = _P(td) / ".retractions.json"
+        mk12 = lambda extra: MemoryServer(
+            index=extra, thread_store=ThreadStore(),
+            corpus_dir=td, weights_path=_P(td) / ".weights.json",
+            retractions_path=rp)
+        s12 = mk12(_build_server(now).index)
+        #    写 correction 但缺当下状态 → 拒（病灶迁移，更正也不豁免）
+        bad12 = call(s12, "memory_correct",
+                     {"quote": "保险丝熔断", "reason": "x", "correction": "y"}, now)
+        assert bad12["isError"] is True and "当下状态" in bad12["content"][0]["text"]
+        #    quote 定位不到 → 明确报错，不猜
+        miss12 = call(s12, "memory_correct", {"quote": "烤箱", "reason": "x"}, now)
+        assert miss12["isError"] is True
+        #    正常更正：撤回旧记录 + 写入更正 → 旧的查不到、新的当场可查
+        ok12 = call(s12, "memory_correct",
+                    {"quote": "保险丝熔断", "reason": "维修方案已过时",
+                     "correction": "咖啡机上月整机换新了，旧机的维修记录不再适用。",
+                     "current_state": "新机运行正常。"}, now)
+        assert ok12["isError"] is False and "已撤回" in ok12["content"][0]["text"]
+        after = call(s12, "memory_search", {"query": "咖啡机"}, now)
+        assert after["isError"] is False
+        assert "保险丝熔断" not in after["content"][0]["text"] and \
+               "整机换新" in after["content"][0]["text"], "旧的退出检索、更正当场可查"
+        #    【变异靶心：撤回落盘】"重启"（语料从盘上重读 + 账本重载）后撤回仍生效
+        s12b = mk12(load_corpus(td))     # 更正记录在盘上；合成旧块不在盘上没关系
+        assert s12b.index.retraction_log, "重启后撤回账本该从盘上回来"
+        assert json.loads(rp.read_text(encoding="utf-8")), "账本文件要真在盘上（可追溯）"
+
+    print("selftest ok（13项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层 / "
+          "完整链路 / stdio / UTF-8 / 写回当场可查 / 用进撑过重启 / "
+          "无可靠命中明确说 / 撤回更正闭环）")
 
 
 if __name__ == "__main__":
@@ -508,6 +618,7 @@ if __name__ == "__main__":
         MemoryServer(index=load_corpus(args.corpus, embed=args.embed),
                      thread_store=ThreadStore(args.threads),
                      corpus_dir=args.corpus,
-                     weights_path=Path(args.corpus) / ".weights.json").serve_stdio()
+                     weights_path=Path(args.corpus) / ".weights.json",
+                     retractions_path=Path(args.corpus) / ".retractions.json").serve_stdio()
     else:
         ap.print_help()

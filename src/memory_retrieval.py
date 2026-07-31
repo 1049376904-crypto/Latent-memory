@@ -51,6 +51,13 @@ from chunking_experiment import chunk_heading, bigram_counts, cosine, embed_text
 # 上下文对"接上刚才"基本没用了。跟 +0.05/k=60 同一待遇，等真实评估再调。
 RECALL_HALF_LIFE_DAYS = 7.0
 
+# 用进废退权重在"乘法路径"（recall_recent、精排）里的影响力上限。权重存储照旧
+# 无上界累加（那是"被聊起多少次"的事实记录），但参与排序时钳到这个值——不封顶
+# 的话，被频繁检索的块（哪怕只是撞上常见 query 词）权重一直涨，过期事实反而
+# 压着新记录（2026.07.31 维护者指出的滚雪球陷阱）。2.0 是经验值，跟 +0.05/k=60
+# 同一待遇：等真实检索质量评估再调，现在不拍脑袋。
+WEIGHT_INFLUENCE_CAP = 2.0
+
 
 def tokenize(text: str):
     """BM25 用的中文零依赖分词：清标点/空白后取字符 bigram 当词。"""
@@ -94,16 +101,19 @@ def ranked(scores):
     return [i for i, _ in sorted(enumerate(scores), key=lambda x: (-x[1], x[0]))]
 
 
-def rrf_fuse(rank_lists, weights, k=60):
-    """RRF 融合多路名次 + 用进废退权重。
-    rank_lists: [[chunk_idx 从好到坏], ...]；weights: 每个 chunk 的权重乘子。
-    返回 [(chunk_idx, 融合分), ...] 按分降序。"""
+def rrf_fuse(rank_lists, k=60):
+    """RRF 融合多路名次（纯函数，只看名次不看分数）。
+    rank_lists: [[chunk_idx 从好到坏], ...]。返回 [(chunk_idx, 融合分), ...] 按分降序。
+
+    2026.07.31 起权重不再乘进融合分。原来 fused *= weight 是无上界乘子叠在
+    天生很平的 RRF 分上（rank1=1/61 与 rank10=1/70 只差 15%，命中三次的 ×1.15
+    就能反超别处 rank1），"命中→加权→更靠前→更易命中"的正反馈没有任何东西
+    封顶——维护者指出的滚雪球陷阱（详见 retrieve 的权重第四路注释）。
+    现在权重的话语权由 retrieve 以"第四路名次"的形式并进来，影响力有界。"""
     fused = defaultdict(float)
     for ranks in rank_lists:
         for rank, idx in enumerate(ranks):
             fused[idx] += 1.0 / (k + rank + 1)
-    for idx in fused:
-        fused[idx] *= weights[idx]  # 用进废退：命中累积的权重乘进融合分
     return sorted(fused.items(), key=lambda x: (-x[1], x[0]))
 
 
@@ -122,6 +132,11 @@ class MemoryIndex:
         self.chunks, self.meta, self.weights = [], [], []
         self._bm25 = self._cvecs = self._ccounts = None
         self._neighbors = {}
+        # 撤回集（2026.07.31 验收反馈"记错以后怎么办"闭环）：被撤回的块不再被
+        # retrieve/recall 返回，但原文件与 chunks 本体都不动——时间线是档案，
+        # 不销毁；退出的只是检索可见性。撤回账本按内容哈希持久化（同权重先例）
+        self.retracted = set()          # chunk 下标
+        self.retraction_log = {}        # 内容哈希 → {reason, time, source, heading}
 
     def add(self, text, meta=None):
         self.chunks.append(text)
@@ -204,8 +219,10 @@ class MemoryIndex:
           1. 这个场景要救的是"刚被换窗/压缩冲掉的最近上下文"，旧而重要的记忆本来
              就不是这一刻丢的东西——真需要它时自然有 query，走 retrieve() 主线；
           2. 乘法下权重仍在新鲜度相近的块之间起排序作用（selftest 第 8 项），正是
-             "最近+曾经重要"的本意：权重是同龄块间的裁判，不是对抗新鲜度的杠杆；
-          3. 改加权和需要把无上界的 weight 和 0~1 的 recency 跨量纲归一化——正是
+             "最近+曾经重要"的本意：权重是同龄块间的裁判，不是对抗新鲜度的杠杆
+             ——这句承诺要靠权重乘子钳到 WEIGHT_INFLUENCE_CAP 才真成立（2026.07.31
+             滚雪球治理补的：不封顶的话，权重涨到 8 就能把 14 天前的块顶过刚发生的）；
+          3. 改加权和需要把 weight 和 0~1 的 recency 跨量纲归一化——正是
              检索层当初选 RRF 就为避开的那类脆弱操作，不重蹈；
           4. 真想让旧记忆浮上来，调大 half_life 就够（selftest 第 9 项后半：
              half_life=1000 天时高权重旧块反超），信号配比有旋钮，不用换公式。
@@ -219,12 +236,17 @@ class MemoryIndex:
         now = time.time() if now is None else now
         scored = []
         for i, meta in enumerate(self.meta):
+            if i in self.retracted:   # 撤回的块不参与召回（同 retrieve）
+                continue
             ts = meta.get("timestamp")
             if ts is None:
                 recency = 0.0  # 兜底：没时间戳当"无限旧"，不猜不崩
             else:
                 recency = 0.5 ** (max(0.0, now - ts) / 86400.0 / half_life)
-            scored.append((i, recency * self.weights[i]))
+            # 权重钳到 WEIGHT_INFLUENCE_CAP（2026.07.31 滚雪球治理）：不封顶的话
+            # 无上界权重恰好推翻 docstring 第 2 条的承诺——"权重是同龄块间的裁判，
+            # 不是对抗新鲜度的杠杆"只有在权重有上限时才真成立
+            scored.append((i, recency * min(self.weights[i], WEIGHT_INFLUENCE_CAP)))
         scored.sort(key=lambda x: (-x[1], -self.weights[x[0]], x[0]))
         return [{"id": i, "text": self.chunks[i], "meta": self.meta[i], "score": s}
                 for i, s in scored[:topN]]
@@ -238,12 +260,28 @@ class MemoryIndex:
         （一阶段）；传入 (query, texts)->scores 回调时，三路 RRF 融合当粗筛取前
         coarse_topM（经验值待调），reranker 对这批候选精排后取 topN。真正的重排
         该用 cross-encoder，将来从同一个槽换进来。三条规则：
-          精排分数乘用进废退权重——跟 RRF 融合处同一规则，重排不豁免；
+          精排分数乘用进废退权重（钳到 WEIGHT_INFLUENCE_CAP）——重排不豁免，
+            但跟粗筛一样不给权重无上界话语权（滚雪球治理，见融合处注释）；
           同分按粗筛名次——精排没意见时保留粗筛信号，不乱序；
           weight_boost 只加在最终 topN——粗筛池是机制内部产物，不算"被命中"。"""
         bm_scores = self._bm25.scores(tokenize(query))
         vec_scores = self._vector_scores(query)
-        bm_ranks, vec_ranks = ranked(bm_scores), ranked(vec_scores)
+        # 可靠命中门槛（2026.07.31 验收反馈：低相关也硬凑 topN，会让一次误召回
+        # 越用越重）：只有词面或语义层真有分的块、以及被它们经图谱带出的关联块，
+        # 才有资格进结果——RRF 只看名次不看分数，不设门槛的话零分块照样被排进
+        # 前几名、照样被 +weight_boost，错误从第一次返回就开始积累。
+        # 一个都没有就返回空列表，让上层明确说"没找到"，不硬凑。
+        # 门槛就设在"有没有信号"（>0），不设更高的数值阈值——没有真实评估数据
+        # 之前，任何非零阈值都是拍脑袋（同 MILESTONE_BODY_LIMIT 的教训）。
+        # 诚实标注：真 embedding 余弦几乎恒正（同种子过滤那条已知局限），--embed
+        # 路径下这道门槛基本不起作用，待真实评估再调。
+        # 撤回的块（self.retracted）在这里一并出局：不进候选、不进种子、不被
+        # 图谱带回、不加权。
+        scored_ok = [i for i in range(len(self.chunks))
+                     if i not in self.retracted
+                     and (bm_scores[i] > 0 or vec_scores[i] > 0)]
+        bm_ranks = [i for i in ranked(bm_scores) if i in set(scored_ok)]
+        vec_ranks = [i for i in ranked(vec_scores) if i in set(scored_ok)]
         rank_lists = [bm_ranks, vec_ranks]
         # 第三层：按留口设计把关联块排成第三路 append 进 RRF，融合逻辑不改。
         # 两处实现细节是实测调出来的（过程见 设计笔记"关系图谱"一节）：
@@ -252,6 +290,8 @@ class MemoryIndex:
         #   贡献(≈1/(k+1))跟整路第一名一样大，纯邻居路会让弱关联反超真命中。
         # 已知局限：真 embedding 余弦几乎恒正，"有分才算命中"的过滤在 --embed
         # 路径基本不起作用，种子退化为固定取 top graph_seeds，待真实评估再调
+        if not scored_ok:
+            return []   # 没有可靠命中：明确空手而归，不硬凑、不加权
         seeds = []
         for rank_list, scores in ((bm_ranks, bm_scores), (vec_ranks, vec_scores)):
             for i in rank_list[:self.graph_seeds]:
@@ -260,17 +300,34 @@ class MemoryIndex:
         graph_route = list(seeds)
         for seed in seeds:
             for nb in self.graph_neighbors(seed):
-                if nb not in graph_route:
+                if nb not in graph_route and nb not in self.retracted:
                     graph_route.append(nb)
         if len(graph_route) > len(seeds):  # 带出了新关联块才追加，没有就退回两路融合
             rank_lists.append(graph_route)
-        fused = rrf_fuse(rank_lists, self.weights, self.rrf_k)
+        # 第四路：用进废退权重（2026.07.31，滚雪球治理——维护者指出的陷阱：
+        # 权重当乘子时无上界增长×近乎持平的 RRF 分，被频繁命中的块会自激滚雪球，
+        # "曾经对、现在错"的旧事实靠历史命中数一直占着前排）。两条治理规则：
+        #   一票封顶：权重不再乘融合分，改成一路名次并进 RRF——权重再高也只值
+        #     一路投票（≤1/(k+1)），压不过多路一致的相关性优势，挤占有了上限；
+        #   只裁判相关块：权重路只收本次 query 里真有分的块（BM25 或向量层 >0），
+        #     零分块不能靠权重买门票——同种子零分过滤的先例（"零分并列块不是
+        #     命中"），权重是相关候选之间的裁判，不是无关块的通行证。
+        # 权重存储照旧无上界累加（save/load 不变），动的只是排序话语权。
+        weight_route = sorted(
+            (i for i in scored_ok if self.weights[i] > 1.0),
+            key=lambda i: (-self.weights[i], i))
+        if weight_route:
+            rank_lists.append(weight_route)
+        fused = rrf_fuse(rank_lists, self.rrf_k)
         if reranker is not None:
+            # 精排是乘法路径，权重乘子钳到 WEIGHT_INFLUENCE_CAP（滚雪球治理的
+            # 乘法侧：重排不豁免用进废退，但同样不给无上界话语权）
             pool = fused[:coarse_topM]
             fine = reranker(query, [self.chunks[i] for i, _ in pool])
+            capped = [min(self.weights[i], WEIGHT_INFLUENCE_CAP) for i, _ in pool]
             order = sorted(range(len(pool)),
-                           key=lambda j: (-fine[j] * self.weights[pool[j][0]], j))
-            fused = [(pool[j][0], fine[j] * self.weights[pool[j][0]]) for j in order]
+                           key=lambda j: (-fine[j] * capped[j], j))
+            fused = [(pool[j][0], fine[j] * capped[j]) for j in order]
         fused = fused[:topN]
 
         results = [{
@@ -315,6 +372,66 @@ class MemoryIndex:
             w = data.get(_chunk_key(c))
             if w is not None:
                 self.weights[i] = w
+                n += 1
+        return n
+
+    # ---------- 撤回与追溯（任务卡"错误记忆治理闭环"） ----------
+    #
+    # 验收反馈（2026.07.31）指出的缺口：自动写回没有更正/撤回，模型理解错一次，
+    # 在"只进不退"的设计下，错误记忆比正确记忆更难清掉。
+    #
+    # 设计判断：**文件只进不退，检索可进可退**。原 md 文件永远不改不删（时间线
+    # 是档案，销毁历史跟"不废退"一样是产品底线），撤回改变的只是检索可见性；
+    # 撤回账本（原文哈希+原因+时间+出处）单独落盘，错误怎么进来的、什么时候
+    # 被谁以什么理由撤掉的，全程可追溯。更正内容走 memory_append 正常写回，
+    # 新旧两条在账本里互相指认。
+
+    def retract(self, quote, reason, now=None):
+        """撤回一段记录：quote 必须唯一定位到一个块（从检索结果里逐字摘）。
+        命中零条或多条都明确报错，不猜——歧义时替调用方挑一条，就是把"清错误"
+        变成"造新错误"。返回 (chunk_idx, 块原文)。"""
+        if not (isinstance(quote, str) and quote.strip()):
+            raise ValueError("quote 必填：从检索结果里逐字摘一段要撤回的原文")
+        if not (isinstance(reason, str) and reason.strip()):
+            raise ValueError("reason 必填（追溯用）：为什么撤回——记错了/已过时/对方更正了……")
+        quote = quote.strip()
+        matches = [i for i, c in enumerate(self.chunks)
+                   if quote in c and i not in self.retracted]
+        if not matches:
+            raise ValueError("没有找到包含这段原文的记录（或它已被撤回）。"
+                             "quote 要从 memory_search 返回的原文里逐字摘，别转述。")
+        if len(matches) > 1:
+            raise ValueError(f"这段原文命中了 {len(matches)} 条记录，定位不到唯一一条"
+                             "——换一段更长、更独特的原文再试。")
+        i = matches[0]
+        now = time.time() if now is None else now
+        self.retracted.add(i)
+        self.retraction_log[_chunk_key(self.chunks[i])] = {
+            "reason": reason.strip(), "time": now,
+            "source": self.meta[i].get("source"), "heading": self.meta[i].get("heading"),
+        }
+        return i, self.chunks[i]
+
+    def save_retractions(self, path):
+        """撤回账本落盘（内容哈希 → 原因/时间/出处），同权重的稀疏存法。"""
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(self.retraction_log, ensure_ascii=False, indent=1),
+                     encoding="utf-8")
+        return len(self.retraction_log)
+
+    def load_retractions(self, path):
+        """从盘上把撤回账本接回来，按内容哈希对号入座——文件改名、块顺序变动
+        都不影响；被撤回的块正文若被人工编辑过，哈希变了、撤回自动失效（内容
+        都变了，旧的撤回判断本来就不该继承——同权重按内容哈希的理由）。"""
+        p = Path(path)
+        if not p.exists():
+            return 0
+        self.retraction_log = json.loads(p.read_text(encoding="utf-8"))
+        n = 0
+        for i, c in enumerate(self.chunks):
+            if _chunk_key(c) in self.retraction_log:
+                self.retracted.add(i)
                 n += 1
         return n
 
@@ -580,25 +697,47 @@ def _build_synth(embed=False):
 def _selftest(embed=False):
     idx = _build_synth(embed=embed)
 
-    # 1. 检索命中 + 元数据完整
+    # 1. 检索命中 + 元数据完整。topN 是上限不是保底（可靠命中门槛，见第 15 项）：
+    #    这个 query 只有咖啡机块真有信号，topN=2 也只该回 1 条，不硬凑
     r = idx.retrieve("咖啡机坏了是什么原因", topN=2)
     assert "保险丝熔断" in r[0]["text"], f"BM25层该把咖啡机块排第一：{r[0]['meta']}"
     assert r[0]["meta"]["heading"] == "修理咖啡机"
     assert set(r[0]) == {"id", "text", "meta", "score", "weight"}, "结果字段：id/text/meta/score/weight"
-    assert len(r) == 2, "topN 生效"
+    r1b = idx.retrieve("薄荷 咖啡机", topN=1)
+    assert len(r1b) == 1, "两块都有信号时 topN 上限生效"
 
     # 2. BM25 纯层：idf 让稀有词区分度更高，命中块得分 > 无关块
     bm = idx._bm25.scores(tokenize("薄荷 盆底积水"))
     assert bm[2] == max(bm), "薄荷块 BM25 分最高"
 
     # 3. RRF 融合是纯函数：两路名次都把 0 排前 → 0 胜
-    fused = rrf_fuse([[0, 1], [0, 1]], [1.0, 1.0])
+    fused = rrf_fuse([[0, 1], [0, 1]])
     assert fused[0][0] == 0
 
-    # 4. 用进废退改变排序（变异检查靶心之一：rrf_fuse 里 *= weights）：
-    #    同名次下，权重被顶高的反超。1 的权重 2.0 压过 0 的 1.0
-    fused_w = rrf_fuse([[0, 1], [0, 1]], [1.0, 2.0])
-    assert fused_w[0][0] == 1, "权重高的被顶到前面（用进废退改排序）"
+    # 4.【滚雪球治理靶心（2026.07.31 维护者指出的陷阱）】权重是第四路投票，不是乘子
+    #  a) 一票机制本身：权重路把相邻名次翻过来（1 多拿一路投票 → 反超 0）
+    fused_w = rrf_fuse([[0, 1], [0, 1], [1]])
+    assert fused_w[0][0] == 1, "权重路的一票该翻得动相邻名次"
+    #  b) 一票封顶（变异靶心：改回 fused *= weights 必红）：天价权重 + 与 query
+    #     零相关的块，既进不了权重路（零分过滤）也压不过真命中——乘法时代
+    #     ×99 会把它直接抬到第一
+    idx4b = _build_synth(embed=embed)
+    idx4b.weights[3] = 99.0                       # 读书块，与咖啡机 query 零相关
+    r4b = idx4b.retrieve("咖啡机坏了是什么原因", topN=2)
+    assert r4b[0]["meta"]["heading"] == "修理咖啡机", \
+        f"零相关块权重再高也不该压过真命中，实际第一是 {r4b[0]['meta']}"
+    #  c) 相关块之间权重仍是裁判（变异靶心：去掉权重第四路必红）：两块都真命中
+    #     query 时，被反复聊起的那块靠一票排到前面
+    idx4c = MemoryIndex()
+    idx4c.add("## 修理咖啡机\n加热管不工作，换保险丝后正常。")
+    idx4c.add("## 咖啡机除垢\n给咖啡机做除垢保养，柠檬酸泡了两轮。")
+    idx4c.add("## 一次远足\n上周六去了青云山，山路十二公里。")
+    idx4c.build()
+    base4c = [x["id"] for x in idx4c.retrieve("咖啡机", topN=2)]  # 先看无权重的名次
+    idx4c.weights = [1.0, 1.0, 1.0]               # 清掉刚才那次命中的加权
+    idx4c.weights[base4c[1]] = 2.0                # 把原本第二的相关块顶起来
+    r4c = idx4c.retrieve("咖啡机", topN=2)
+    assert r4c[0]["id"] == base4c[1], "同为相关块，权重高的该被一票顶到前面"
 
     # 5. 用进废退累加（靶心之二：retrieve 里 += weight_boost）：
     idx2 = _build_synth(embed=embed)
@@ -678,6 +817,16 @@ def _selftest(embed=False):
     r = idx5.recall_recent(topN=2, half_life=1000.0, now=now)
     assert r[0]["id"] == 1, "half_life 拉长后权重信号占上风"
 
+    # 9b.【滚雪球治理·recall 侧靶心（变异：去掉 min(...,CAP) 必红）】权重涨到 8
+    #     也顶不过 14 天的年龄差——docstring"权重是同龄块间的裁判"的承诺靠钳制
+    #     才成立：0.25×min(8,2)=0.5 < 1.0，不钳的话 0.25×8=2.0 反超刚发生的块
+    idx5b = MemoryIndex()
+    idx5b.add("刚发生·从未被提起", {"timestamp": now})
+    idx5b.add("十四天前·被聊起过很多次", {"timestamp": now - 14 * DAY})
+    idx5b.weights[1] = 8.0
+    r5b = idx5b.recall_recent(topN=2, now=now)
+    assert r5b[0]["id"] == 0, "recall 里权重影响力有上限，堆命中数买不来对抗新鲜度的杠杆"
+
     # 10. 时间戳解析：文件名完整日期 > 标题短日期（年份用 fallback 补）> 解析不出
     ts_f, src_f = parse_chunk_timestamp("2026-07-29.md", "## 随便什么标题", 2000)
     assert src_f == "filename" and datetime.fromtimestamp(ts_f).strftime("%Y%m%d") == "20260729"
@@ -722,10 +871,18 @@ def _selftest(embed=False):
     same13 = [x["id"] for x in _build_synth(embed=embed).retrieve(
         "咖啡机坏了", topN=2, reranker=lambda q, ts: [1.0] * len(ts))]
     assert same13 == base13, "常数精排分该保持粗筛序"
-    #  b) 精排接管排序：只给读书块打分 → 它被捞到第一
-    r13 = _build_synth(embed=embed).retrieve(
-        "咖啡机坏了", topN=2, reranker=lambda q, ts: [1.0 if "略萨" in t else 0.0 for t in ts])
-    assert r13[0]["meta"]["heading"] == "读城市与狗", "精排该能接管排序"
+    #  b) 精排接管排序（2026.07.31 随可靠命中门槛改写：零分块进不了粗筛池，
+    #     精排只在真候选之间接管——原版让精排把与 query 零相关的读书块捞到第一，
+    #     那正是门槛要拦的行为）。两个咖啡机块都是真候选，精排偏爱除垢块 → 反超
+    def _build_two_coffee():
+        i = MemoryIndex()
+        i.add("## 修理咖啡机\n加热管不工作，换保险丝后通电正常。")      # 0
+        i.add("## 咖啡机除垢\n给咖啡机做除垢保养，柠檬酸泡了两轮。")    # 1
+        i.add("## 一次远足\n上周六去了青云山，山路十二公里。")          # 2
+        return i.build()
+    r13 = _build_two_coffee().retrieve(
+        "咖啡机", topN=2, reranker=lambda q, ts: [1.0 if "除垢" in t else 0.5 for t in ts])
+    assert r13[0]["id"] == 1, "精排该能在真候选之间接管排序"
     #  c)【变异靶心：boost 只加最终 topN】粗筛池其余候选不算"被命中"，权重不动
     idx13c = _build_synth(embed=embed)
     before13 = list(idx13c.weights)
@@ -737,14 +894,20 @@ def _selftest(embed=False):
         else:
             assert idx13c.weights[i] == before13[i], "粗筛池不算命中，不加权"
     #  d)【变异靶心：精排分乘权重】重排不豁免用进废退。构造上不能用"同精排分"——
-    #     权重在粗筛 rrf_fuse 里已乘过一轮，常数精排分会靠"保持粗筛序"蒙混过关；
-    #     这里让读书块精排分更低（0.6）但权重更高（2.0）：0.6×2.0 > 1.0×1.0，
-    #     只有精排阶段真乘了权重它才能排第一
-    idx13d = _build_synth(embed=embed)
-    idx13d.weights[3] = 2.0
-    r13d = idx13d.retrieve("咖啡机坏了", topN=2, coarse_topM=4,
-                           reranker=lambda q, ts: [0.6 if "略萨" in t else 1.0 for t in ts])
-    assert r13d[0]["id"] == 3, "精排分 0.6×权重 2.0 该压过 1.0×1.0"
+    #     常数精排分会靠"保持粗筛序"蒙混过关；让除垢块精排分更低（0.6）但权重
+    #     更高（2.0）：0.6×2.0 > 1.0×1.0，只有精排阶段真乘了权重它才能排第一
+    idx13d = _build_two_coffee()
+    idx13d.weights[1] = 2.0
+    r13d = idx13d.retrieve("咖啡机", topN=2, coarse_topM=4,
+                           reranker=lambda q, ts: [0.6 if "除垢" in t else 1.0 for t in ts])
+    assert r13d[0]["id"] == 1, "精排分 0.6×权重 2.0 该压过 1.0×1.0"
+    #  e)【滚雪球治理·精排侧靶心（变异：精排乘子不钳必红）】权重涨到 8 也只按
+    #     上限 2.0 参与精排：0.3×min(8,2)=0.6 < 1.0×1.0，不钳的话 0.3×8=2.4 反超
+    idx13e = _build_two_coffee()
+    idx13e.weights[1] = 8.0
+    r13e = idx13e.retrieve("咖啡机", topN=2, coarse_topM=4,
+                           reranker=lambda q, ts: [0.3 if "除垢" in t else 1.0 for t in ts])
+    assert r13e[0]["id"] != 1, "精排里权重影响力同样有上限，天价权重×低精排分不该赢"
 
     # 14. 真实语料适配（2026.07.31 拿私人 timeline 实测后补，内容脱敏虚构）
     #  a)【变异靶心：_first_valid_short_date 的 finditer】标题里版本号在前、日期在
@@ -757,6 +920,59 @@ def _selftest(embed=False):
     assert ts_h1 is not None and datetime.fromtimestamp(ts_h1).strftime("%m%d") == "0708"
     #  c) 正文里的短日期一概不认——"3.5 倍"不是 3 月 5 日
     assert parse_chunk_timestamp("window_9.md", "# 无日期标题\n\n效率提升了 3.5 倍。", 2026) == (None, None)
+
+    # 15.【可靠命中门槛靶心（2026.07.31 验收反馈；变异：去掉 scored_ok 过滤必红）】
+    #     词面/语义都零信号的 query → 空手而归，且一个块都不加权——不设门槛的话
+    #     RRF 照样排出 topN、照样 +boost，一次误召回从第一次返回就开始越用越重
+    idx15 = _build_synth(embed=False)   # 门槛只在零依赖路径有效（embed 余弦恒正，已标注）
+    w15 = list(idx15.weights)
+    assert idx15.retrieve("量子对撞机的运行日志", topN=3) == [], \
+        "零信号 query 该明确空手而归，不硬凑 topN"
+    assert idx15.weights == w15, "没有可靠命中就不该有任何块被加权"
+
+    # 16.【撤回与追溯靶心】文件只进不退，检索可进可退
+    idx16 = _build_synth(embed=False)
+    #  a) 歧义与未命中都明确报错，不猜（变异：歧义取第一个必红）
+    try:
+        idx16.retract("咖啡机", "测试")   # SYNTH 里只有一块含"咖啡机"——先造歧义
+        pass
+    except ValueError:
+        raise AssertionError("单一命中不该报错")
+    idx16b = MemoryIndex()
+    idx16b.add("## 一\n咖啡机坏了")
+    idx16b.add("## 二\n咖啡机修好了")
+    idx16b.build()
+    for bad_quote, why in (("咖啡机", "歧义"), ("烤箱", "未命中")):
+        try:
+            idx16b.retract(bad_quote, "测试")
+            raise AssertionError(f"{why}的 quote 该报错，不该静默挑一条")
+        except ValueError:
+            pass
+    #  b) 撤回后 retrieve 与 recall 都不再返回（变异：任一路不排除必红）
+    idx16c = _build_synth(embed=False)
+    for m in idx16c.meta:
+        m["timestamp"] = 1_800_000_000.0
+    i16, _ = idx16c.retract("保险丝熔断", "维修方案已过时", now=1_800_000_100.0)
+    assert all("保险丝" not in x["text"]
+               for x in idx16c.retrieve("咖啡机坏了是什么原因", topN=4)), \
+        "撤回的块不该再被 retrieve 返回"
+    assert all(x["id"] != i16 for x in idx16c.recall_recent(topN=4, now=1_800_000_200.0)), \
+        "撤回的块不该再被 recall 召回"
+    #  c) 账本落盘可追溯 + 重启后仍生效（变异：load_retractions 不接线必红）；
+    #     chunks 本体一个不少——档案不销毁，退出的只是检索可见性
+    assert len(idx16c.chunks) == len(SYNTH), "撤回不删块，原文是档案"
+    with tempfile.TemporaryDirectory() as td16:
+        rp = Path(td16) / ".retractions.json"
+        idx16c.save_retractions(rp)
+        log = json.loads(rp.read_text(encoding="utf-8"))
+        entry = next(iter(log.values()))
+        assert entry["reason"] == "维修方案已过时" and entry["source"] == "a.md", \
+            "账本要记全：原因/时间/出处，错误怎么被清掉的要可追溯"
+        idx16d = _build_synth(embed=False)          # "重启"：从头建库
+        assert idx16d.load_retractions(rp) == 1
+        assert all("保险丝" not in x["text"]
+                   for x in idx16d.retrieve("咖啡机坏了是什么原因", topN=4)), \
+            "撤回要撑过重启——不然'改过来了'只活一个进程（失败得像成功）"
     #  d) 窗口号与层标记
     assert parse_window_no("window_01.md") == 1 and parse_window_no("window_36_某某.md") == 36
     assert parse_window_no("Window-7.md") == 7 and parse_window_no("2026-07-15.md") is None

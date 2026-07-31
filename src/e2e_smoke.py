@@ -150,8 +150,10 @@ def _selftest():
         #    server 按生产接线配（corpus_dir + weights_path），跟 CLI 启动一致——
         #    冒烟测的就是用户真实路径，不配阉割版
         weights_path = got["memory_dir"] / ".weights.json"
+        retractions_path = got["memory_dir"] / ".retractions.json"
         srv = MemoryServer(index=index, thread_store=ThreadStore(),
-                           corpus_dir=got["memory_dir"], weights_path=weights_path)
+                           corpus_dir=got["memory_dir"], weights_path=weights_path,
+                           retractions_path=retractions_path)
         now = _T0.replace(day=23).timestamp()
         hs = srv.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                          "params": {"protocolVersion": PROTOCOL_VERSION,
@@ -182,22 +184,45 @@ def _selftest():
         #    接线）——写回的记录该从盘上回来，检索命中过的块权重也该还在
         srv2 = MemoryServer(index=load_corpus(got["memory_dir"]),
                             thread_store=ThreadStore(),
-                            corpus_dir=got["memory_dir"], weights_path=weights_path)
+                            corpus_dir=got["memory_dir"], weights_path=weights_path,
+                            retractions_path=retractions_path)
         #    权重检查必须在重启后的**第一次检索之前**——检索的副作用本身会加权，
         #    放后面的话断言会被本会话新加的权重救活，测不到"载入"这半（第一版
         #    就犯了这个错，变异"启动不载入权重"没红才发现）
         boosted = [w for w in srv2.index.weights if w > 1.0]
         assert boosted, "重启后、检索前，此前命中过的块权重就该 >1.0——用进要撑过重启"
-        hit3 = srv2.handle(
+        callf = lambda s, name, a: s.handle(
             {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-             "params": {"name": "memory_search",
-                        "arguments": {"query": "企鹅漫步"}}}, now=now)["result"]
+             "params": {"name": name, "arguments": a}}, now=now)["result"]
+        hit3 = callf(srv2, "memory_search", {"query": "企鹅漫步"})
         assert hit3["isError"] is False and "凉快的早上" in hit3["content"][0]["text"], \
             "重启后写回的记录该从盘上回来——不然'记住了'只活一个进程"
 
+        # 7. 更正闭环（错误记忆治理，验收反馈后补的一环）：撤回记错的记录并写更正
+        #    → 旧的退出检索、更正当场可查 → 再"重启"一次撤回仍生效（账本在盘上）
+        fixed = callf(srv2, "memory_correct",
+                      {"quote": "凉快的早上", "reason": "她说记错了，想看的不是企鹅",
+                       "correction": "她更正说想看的是火烈鸟，不是企鹅漫步。",
+                       "current_state": "改成看火烈鸟，档期还没定。"})
+        assert fixed["isError"] is False, f"更正不该失败：{fixed}"
+        hit4 = callf(srv2, "memory_search", {"query": "企鹅漫步"})
+        #    接缝断言⑤：撤回的原文不再出现在任何返回里（可能还有更正记录被命中，
+        #    但"凉快的早上"那段旧原文必须消失）
+        assert hit4["isError"] is True or "凉快的早上" not in hit4["content"][0]["text"], \
+            "撤回的记录不该再被检索返回"
+        srv3 = MemoryServer(index=load_corpus(got["memory_dir"]),
+                            thread_store=ThreadStore(),
+                            corpus_dir=got["memory_dir"], weights_path=weights_path,
+                            retractions_path=retractions_path)
+        hit5 = callf(srv3, "memory_search", {"query": "火烈鸟"})
+        assert hit5["isError"] is False and "火烈鸟" in hit5["content"][0]["text"], \
+            "更正内容该从盘上回来"
+        assert srv3.index.retraction_log, \
+            "撤回账本该撑过重启——不然'改过来了'只活一个进程"
+
     print("selftest ok（端到端冒烟：导入 → 问卷 → 答卷解析 → 确认 → 三件套 → "
           "回读 → 握手 → 检索命中原文 → thread 往返 → 写回当场可查 → "
-          "重启后记录与权重都在，接缝断言四处）")
+          "重启后记录与权重都在 → 更正闭环撤回撑过重启，接缝断言五处）")
 
 
 if __name__ == "__main__":

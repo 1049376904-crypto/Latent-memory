@@ -39,6 +39,7 @@
 import argparse
 import json
 import re
+import sys
 from collections import namedtuple
 from datetime import datetime
 from pathlib import Path
@@ -1087,6 +1088,36 @@ def _selftest():
         cold_md = got["persona"].read_text(encoding="utf-8")
         assert cold_md.rstrip().endswith("你来，我就在。"), "填空的最终约定要落在文件收尾"
 
+    # 8f.【变异靶心：AI 驱动路径不绕过确认关卡】产品事实是多数用户不开终端，
+    #     真实形态是 AI 边问边跑。原来确认只有 input() 交互一条路，AI 驱动时只能
+    #     盲灌 y——那正好违反"每条都要对方认过"的纪律，且违反得无声无息。
+    #     拆成"取清单/落决定"两个非交互动作后，这条钉死：**没表态的仍然未决**，
+    #     结构化入口不能变成一路默认 keep 的后门
+    p_ai = Persona("partner")
+    fill_protocol_defaults(p_ai)
+    qs_ai = questions_for(coverage_report(p_ai), has_corpus=False)
+    apply_answers(p_ai, qs_ai, {"disagree": {"keys": "A"}, "state_now": {"keys": "A"}})
+    pend_ai = pending_confirmations(p_ai)
+    assert len(pend_ai) == 2, f"两题该产出两条草稿，实际 {len(pend_ai)}"
+    #    只对其中一条表态 → 另一条必须仍未决（不被默认留下，也不被默认删掉）
+    apply_confirmations(p_ai, {pend_ai[0].key: "keep"})
+    left_ai = pending_confirmations(p_ai)
+    assert len(left_ai) == 1 and left_ai[0].key == pend_ai[1].key, \
+        "没表态的条目必须保持未决——结构化入口不是一路 keep 的后门"
+    #    而未决状态下出货仍被出口闸挡住（AI 驱动不豁免）
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            write_bundle(td, p_ai, confirmed=True)
+            assert False, "还有未决草稿时，AI 驱动路径同样不该出货"
+        except PermissionError as e:
+            assert "静默消失" in str(e)
+    #    机器可读问卷要能真喂给 AI：题目、选项键、指引一个都不能少
+    payload = _questions_payload(qs_ai)
+    assert payload and all(q["qid"] and q["kind"] for q in payload)
+    ch = next(q for q in payload if q["kind"] == "choice")
+    assert ch["options"] and all(set(v) == {"label", "directive"} for v in ch["options"].values()), \
+        "选项要同时给'念给用户听的文案'和'写进人格文件的指引'"
+
     # 9.【变异靶心：写盘要过确认关卡】未确认时拒绝写用户磁盘
     with tempfile.TemporaryDirectory() as td:
         try:
@@ -1137,10 +1168,10 @@ def _selftest():
         except ValueError as e:
             assert "开篇缺" in str(e)
 
-    print("selftest ok（16项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
+    print("selftest ok（17项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
           "归属句式 / 默认值不预支历史 / 协议层不问用户 / 导出纪律 / 渲染顺序 / "
           "答案读回不静默丢 / 未决草稿不蒸发 / 记忆库落盘带日期 / 冷启动出得了货 / "
-          "确认关卡 / 续跑 / 完整性）")
+          "AI 驱动不绕过确认 / 确认关卡 / 续跑 / 完整性）")
 
 
 def _rebuild(state):
@@ -1157,10 +1188,47 @@ def _rebuild(state):
     return persona, qs
 
 
+def _load_json_arg(value):
+    """`--answers-json` / `--decisions-json` 的取值：文件路径，或 `-` 表示读 stdin，
+    或直接就是一段 JSON 字面量。三种都收——驱动方是 AI 时，它手上是内存里的
+    结构化数据，不该被逼着先落一个临时文件。"""
+    if value == "-":
+        return json.loads(sys.stdin.read())
+    p = Path(value)
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    return json.loads(value)
+
+
+def _questions_payload(qs):
+    """问卷的机器可读形态。AI 驱动时靠它拿题目，不用去抠给人看的排版文本
+    （抠文本＝解析自己的输出，格式一改就断，而且断得无声无息）。"""
+    return [{"qid": q.qid, "section": q.section, "label": q.label, "kind": q.kind,
+             "text": q.text, "max_chars": q.max_chars,
+             "options": ({k: {"label": v[0], "directive": v[1]}
+                          for k, v in q.options.items()} if q.options else None),
+             "attribution": q.attribution, "optional": q.optional}
+            for q in qs]
+
+
 def _step_questionnaire(args):
     persona = Persona("partner")
     fill_protocol_defaults(persona)
     report = coverage_report(persona)
+    if args.json:
+        qs = questions_for(report, has_corpus=bool(args.corpus))
+        save_state(args.out, {"step": "questionnaire", "client": args.client,
+                              "has_corpus": bool(args.corpus)})
+        print(json.dumps({
+            "coverage": [{"section": s, "status": st, "note": n} for s, st, n in report],
+            "questions": _questions_payload(qs),
+            "freeform_policy": FREEFORM_POLICY.format(n=FREEFORM_MAX_CHARS),
+            "next": "把这些题**在对话里**一题一题问对方（不是让 TA 写作文，选项念给 TA 听）；"
+                    "收齐后跑 --step answers --answers-json <JSON>，"
+                    "格式：{\"题目qid\": {\"keys\": \"AC\", \"note\": \"可选的一句补充\"}} ；"
+                    "pick/short 题用 {\"pick\": \"选中或写下的原文\"}。",
+        }, ensure_ascii=False, indent=1))
+        return
     print("【覆盖度体检】")
     for _, status, note in report:
         mark = {"ok": "✓", "missing": "缺", "vague": "空泛", "protocol": "系统"}[status]
@@ -1179,9 +1247,29 @@ def _step_questionnaire(args):
 
 
 def _step_answers(args, state):
-    if not args.answers:
-        raise SystemExit("这一步要 --answers <答案清单文件>")
     _, qs = _rebuild(state)
+    if args.answers_json:
+        # AI 驱动路径：答案本来就在驱动方手里，直接收结构化数据。
+        # 不走 parse_answer_sheet——那套连猜带解析的机制是为"另一个模型吐回来的
+        # 不可控文本"准备的，AI 手上已有结构时再序列化成清单、再解析回来，
+        # 是凭空多一趟往返和一整个解析失败面。
+        answers = _load_json_arg(args.answers_json)
+        qids = {q.qid for q in qs}
+        unknown = sorted(set(answers) - qids)
+        if unknown:   # 不静默丢：认不出的 qid 明确报出来
+            raise SystemExit(f"这些 qid 不在当前问卷里：{unknown}\n当前问卷：{sorted(qids)}")
+        answers = {k: v for k, v in answers.items() if v is not None}
+        state.update(step="answers", answers=answers)
+        save_state(args.out, state)
+        got = len(answers)
+        print(f"【答案读回】收下 {got}/{len(qs)} 题（结构化输入，无解析环节）。"
+              + ("" if got == len(qs) else f" 没答的 {len(qs)-got} 题对应的节会空着——"
+                                           "空着是诚实的，不要替对方编。"))
+        print("\n【下一步】--step confirm --list --json 取待确认草稿，"
+              "**逐条念给对方听、由对方决定**，再用 --decisions-json 落决定。")
+        return
+    if not args.answers:
+        raise SystemExit("这一步要 --answers <答案清单文件> 或 --answers-json <JSON>")
     text = Path(args.answers).read_text(encoding="utf-8")
     answers, problems = parse_answer_sheet(text, qs)
     print("【答案读回】")
@@ -1199,6 +1287,46 @@ def _step_confirm(args, state):
     persona, _ = _rebuild(state)
     decisions = state.setdefault("decisions", {})
     pend = pending_confirmations(persona)
+    # --- AI 驱动路径（--list 取待确认清单、--decisions-json 落决定）---
+    #
+    # 为什么必须有这条路：确认关卡原来只有 input() 交互循环一条路，而 AI 驱动
+    # 时它没法好好走，只能盲管道灌 y——那恰好违反引导指南纪律三"人格文件每条
+    # 都要念给对方听、对方说可以才留"。CLI 只给交互一条路，等于逼着驱动方
+    # 破坏我们自己定的纪律，而且破坏得无声无息（文件照常生成，看着一切正常）。
+    # 拆成"取清单 / 落决定"两个非交互动作后，中间那一步——真的问人——回到
+    # 对话里，那本来就是它该待的地方。
+    if args.list:
+        payload = [{"key": p.key, "kind": p.kind, "label": p.label, "value": p.value}
+                   for p in pend]
+        if args.json:
+            print(json.dumps({
+                "pending": payload,
+                "next": "**逐条念给对方听，由对方决定**，不要替 TA 一路 keep——"
+                        "人格文件的每一条都要 TA 认过（引导指南纪律三）。"
+                        "收齐后：--step confirm --decisions-json "
+                        "'{\"key\": \"keep\"|\"drop\"|{\"edit\": \"改后的文本\"}}'；"
+                        "没表态的条目保持未决，不会被默认留下或删掉。",
+            }, ensure_ascii=False, indent=1))
+        else:
+            for p in payload:
+                print(f"—— {p['kind']}【{p['label']}】（key={p['key']}）\n   {p['value']}")
+        return
+    if args.decisions_json:
+        incoming = _load_json_arg(args.decisions_json)
+        known = {p.key for p in pend}
+        unknown = sorted(set(incoming) - known)
+        if unknown:   # 同答案侧：认不出的 key 明确报出来，不静默丢
+            raise SystemExit(f"这些 key 不在待确认清单里：{unknown}\n"
+                             f"待确认：{sorted(known)}")
+        decisions.update(incoming)
+        state["step"] = "confirm"
+        save_state(args.out, state)
+        persona, _ = _rebuild(state)
+        left = len(pending_confirmations(persona))
+        print(f"已落 {len(incoming)} 条决定，还剩 {left} 条未决。"
+              + ("下一步：--step ship" if not left
+                 else " 未决的保持未决——没问过对方的条目不会被默认留下。"))
+        return
     if not pend:
         print("没有待确认的草稿。下一步：--step ship")
         return
@@ -1279,7 +1407,19 @@ if __name__ == "__main__":
     ap.add_argument("--client", default="claude-code", choices=sorted(CLIENT_FILENAMES))
     ap.add_argument("--step", choices=["questionnaire", "answers", "confirm", "ship"],
                     help="不传则按 init_state.json 里的进度接着跑")
-    ap.add_argument("--answers", help="answers 步：模型整理好的答案清单文件")
+    ap.add_argument("--answers", help="answers 步：模型整理好的答案清单文件（人工路径）")
+    # --- 以下三个是给「AI 驱动」用的程序接口（人自己敲命令时用不上）---
+    # 产品事实：多数用户不会开终端敲 python，真实形态是把仓库交给 AI、AI 边问边跑。
+    # 引导指南本来就假定 AI 驱动，但 CLI 只提供了给人用的交互路径——差的这一截
+    # 在这里补上。库函数（apply_answers / apply_confirmations）本来就收字典。
+    ap.add_argument("--json", action="store_true",
+                    help="机器可读输出（questionnaire 出题目、confirm --list 出待确认清单）")
+    ap.add_argument("--answers-json", dest="answers_json",
+                    help="answers 步：结构化答案（文件路径 / JSON 字面量 / - 读 stdin）")
+    ap.add_argument("--list", action="store_true",
+                    help="confirm 步：只列出待确认草稿，不进交互循环")
+    ap.add_argument("--decisions-json", dest="decisions_json",
+                    help="confirm 步：结构化决定（同上三种取值），非交互落盘")
     ap.add_argument("--import", dest="import_path",
                     help="ship 步：语料导出文件（ChatGPT/Claude json、聊天 txt、timeline md），"
                          "由 memory_import 认格式并落成记忆库")

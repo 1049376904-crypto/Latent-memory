@@ -461,7 +461,32 @@ def fill_protocol_defaults(persona):
 _HEAD_SEPS = set(" \t.。、,，:：)）]】>》-—=→")
 _SKIP_WORDS = ("跳过", "略过", "不填", "答不上", "说不好", "没有", "无", "skip", "-", "—", "/")
 _NOTE_RE = re.compile(r"(?:补充|另外|备注|补一句)\s*[:：]\s*(.+)$")
+# 自由补充最自然的写法是带括号的"（补充：…）"，_NOTE_RE 只吃掉左边的引导词，
+# 右括号会跟着补充内容一路漏进人格文件（内测冒烟时真踩到）。收尾的成对符号
+# 在这里剥掉——但只剥**没配对的**：补充内容自己带成对引号收尾时（"她叫我
+# “阿岸”"，称呼类补充恰恰常见这种写法），一律 rstrip 会把右引号也剥掉，
+# 剩半对引号——修"半个括号"不能引进"半对引号"，还是同一类病
+_NOTE_CLOSERS = {"）": "（", ")": "(", "】": "【", "]": "[",
+                 "」": "「", "』": "『", "”": "“"}
+_NOTE_SELF_PAIRED = "\"'"    # 开闭同符号：奇数个才说明收尾那只落了单
 _CJK_RE = re.compile(r"[一-鿿]")
+
+
+def _strip_note_trail(text):
+    """剥掉补充内容收尾落单的闭合符号与句末标点。逐个看：末尾是闭合符号且
+    对应的开符号在剩余内容里配不齐，才剥；配得齐说明是内容自己的，留下。"""
+    t = text.strip()
+    while t:
+        ch = t[-1]
+        if ch in "。 　\t":
+            t = t[:-1].rstrip()
+        elif ch in _NOTE_CLOSERS and t.count(_NOTE_CLOSERS[ch]) < t.count(ch):
+            t = t[:-1].rstrip()
+        elif ch in _NOTE_SELF_PAIRED and t.count(ch) % 2 == 1:
+            t = t[:-1].rstrip()
+        else:
+            break
+    return t
 
 
 def _split_head(line):
@@ -541,7 +566,7 @@ def parse_answer_sheet(text, questions):
         note = ""
         mnote = _NOTE_RE.search(body)
         if mnote:
-            note = mnote.group(1).strip()[:FREEFORM_MAX_CHARS]
+            note = _strip_note_trail(mnote.group(1))[:FREEFORM_MAX_CHARS]
             body = body[:mnote.start()].strip()
         if _is_skip(body) and not note:
             answers[qid] = None
@@ -892,6 +917,20 @@ def _selftest():
     note_field = [f for f in p3c.fields if f.id == "style_disagree"][0]
     assert len(note_field.value) < 200, f"自由补充要被截断，实际 {len(note_field.value)} 字"
     assert "不同意就直接说" in note_field.value, "选项指引仍在，自由补充是附加不是替换"
+    #   【变异靶心：括号不漏进人格文件】内测冒烟真踩到的——"（补充：…）"是最自然
+    #    的写法，_NOTE_RE 只吃左边的引导词，右括号会跟着内容一路漏进最终文件
+    #    反向靶心：内容自己带的成对符号必须留下——"半个括号"的修法不能引进
+    #    "半对引号"（称呼类补充常写成 她叫我“阿岸”，一律 rstrip 会剥掉右引号）
+    for _sheet, _want in (("7. A（补充：她更在意具体的话）", "她更在意具体的话"),
+                          ("7. A [备注：换个括号]", "换个括号"),
+                          ("7. A 补充：不带括号", "不带括号"),
+                          ("7. A（补充：她叫我“阿岸”）", "她叫我“阿岸”"),
+                          ("7. A（补充：她说「随便」就是不随便）", "她说「随便」就是不随便")):
+        _p = Persona("partner"); fill_protocol_defaults(_p)
+        _qs = questions_for(coverage_report(_p))
+        _a, _ = parse_answer_sheet(_sheet, _qs)
+        _note = [v for v in _a.values() if isinstance(v, dict) and v.get("note")][0]["note"]
+        assert _note == _want, f"自由补充要剥掉收尾的成对符号：期望 {_want!r}，实际 {_note!r}"
 
     # 5b.【变异靶心：默认值不预支历史】协议层默认值会一字不差进每个用户的人格
     #     文件，包括零语料的冷启动用户——不能替他们声称一段还没发生的关系

@@ -712,15 +712,35 @@ def mcp_config_snippet(server_path, corpus_dir, threads_path, client="claude-cod
     return json.dumps(cfg, ensure_ascii=False, indent=2)
 
 
-INDEX_README = """这个目录是记忆库的索引层（规格 §5）：每个会话一条高密度摘要，专门喂检索。
+INDEX_README = """这个目录是记忆库的索引层（规格 §5）：高密度摘要，专门喂检索。
 
 现在是空的，这是有意的——索引层要靠模型读完整段叙事再浓缩，本地规则写不出来，
 硬写只会写出一段谁看都像的套话，喂进检索反而是噪声（宁可短且真）。
 
-补的办法跟问卷同一条路：把 ../timeline/ 里的某个窗口整段贴给你自己的模型，让它
-写一段 200 字左右的高密度摘要——人名、原话、当时在处理什么，都留着，不要润色成
-读后感——存成同名的 .md 放进这个目录。索引层和叙事层同名同窗口号，检索层会自动
-把它们认成同一次会话的两种写法。
+补的办法跟问卷同一条路：把叙事层整段贴给你自己的模型，让它写高密度摘要——人名、
+原话、当时在处理什么，都留着，不要润色成读后感。有两种补法，各补各的缺口：
+
+【一】按窗口摘要
+把 ../timeline/ 里的某个窗口整段贴给模型，写一段 200 字左右的摘要，存成跟那个
+窗口同名的文件，例如 window_07_2026-07-20.md 。索引层和叙事层同名同窗口号，
+检索层会自动把它们认成同一次会话的两种写法，日期也跟着继承过来。
+
+【二】按主题线摘要
+一件事往往横跨很多个窗口：一个约定从提起、到反复、到兑现，可能散在十个窗口里。
+把同一条线涉及的几个窗口一起贴给模型，让它写这条线**从头到现在**的一段摘要，
+收尾落一句这件事现在的状态。按窗口切的摘要看不见这种跨度——这是主题线摘要独有
+的价值，也是检索最难自己拼出来的东西。
+
+文件名必须是 topic_<线名>_<YYYY-MM-DD>.md ，例如 topic_望远镜_2026-07-31.md ，
+日期填这条线最后一次发生的日期。
+
+**日期不能省，这是硬要求，不是格式洁癖。** 主题线跨窗口、没有单一窗口号，借不到
+叙事层的日期；文件名再不带日期，时间戳就只能退到文件的修改时间（mtime）。而
+mtime 在这里不是"不太准"，是**全错且整齐地错**——重新下载或复制一遍目录，会把
+所有文件的 mtime 刷成同一时刻，一批主题线摘要于是拿到同一个假时间戳。换新窗口
+时的开场召回正是按时间新鲜度排序的，而主题线摘要恰恰是最该在开场被带回来的那种
+内容：等于让最有价值的记忆被一个垃圾时间戳排序，而且它在索引层、本来就更容易被
+检索排到前面，错得更容易被看见。
 
 注意：这个说明文件故意不是 .md，免得它自己被当成语料读进检索库。
 """
@@ -1044,7 +1064,7 @@ def _selftest():
     #     文件名日期是 parse_chunk_timestamp 的最高优先级来源——真实语料 95.6% 落
     #     mtime 兜底的根子就是文件名不带日期，自己生成的语料没理由重蹈
     from memory_import import MemoryEntry
-    from memory_retrieval import load_corpus
+    from memory_retrieval import load_corpus, parse_chunk_timestamp
     ents = [MemoryEntry(timestamp=1750000000.0, speaker="她", text="第一晚说的话"),
             MemoryEntry(timestamp=1750000300.0, speaker="我", text="我答了她"),
             MemoryEntry(timestamp=1750100000.0, speaker="她", text="隔天的新话题")]
@@ -1057,10 +1077,27 @@ def _selftest():
         assert idx.chunks and all(m.get("timestamp_source") != "mtime"
                                   for m in idx.meta), \
             "带日期的文件名不该有任何块落到 mtime 兜底"
-        assert (Path(td) / "memory" / "index" / "README.txt").exists(), \
-            "index 层留空但要说明怎么补——不假装生成"
+        readme_path = Path(td) / "memory" / "index" / "README.txt"
+        assert readme_path.exists(), "index 层留空但要说明怎么补——不假装生成"
         assert not list((Path(td) / "memory" / "index").glob("*.md")), \
             "index 层不该有我们硬编的摘要，套话喂检索是噪声"
+        #    【变异靶心：README 命名规则与解析器的一致性】这份说明是**用户照着做**的
+        #    规范，而它跟解析器之间此前没有任何东西守着——措辞一飘（比如把示例里的
+        #    日期写没了），用户按它命名的文件就整批掉进 mtime 兜底，且是"全错且整齐
+        #    地错"（复制一遍目录会把 mtime 刷成同一时刻，一批摘要拿同一个假时间戳，
+        #    偏偏开场召回按新鲜度排序）。所以不写死文件名断言，而是**从 README 正文
+        #    里把命名示例抠出来喂给真解析器**——沿用脱敏那次的教训：自我声明不等于
+        #    真的做到，纪律要能被机械检查。
+        readme = readme_path.read_text(encoding="utf-8")
+        examples = re.findall(r"[A-Za-z0-9_一-鿿-]+_\d{4}-\d{2}-\d{2}\.md", readme)
+        assert len(examples) >= 2, \
+            f"README 要给出可照抄的命名示例（按窗口、按主题线各一），实际 {examples}"
+        assert any(n.startswith("topic_") for n in examples), \
+            "主题线命名示例必须在——跨窗口摘要借不到窗口日期，全靠文件名这一条路"
+        for name in examples:
+            ts_ex, src_ex = parse_chunk_timestamp(name, "", 2026)
+            assert src_ex == "filename", \
+                f"README 教用户这么命名，解析器却认不出来：{name} → {src_ex}"
 
     # 8e.【变异靶心：冷启动出得了货】没语料时 pick 一刀切曾让最终约定这题消失，
     #     而结尾是 validate 硬必填——冷启动用户答完全部问卷仍然永远出不了货。

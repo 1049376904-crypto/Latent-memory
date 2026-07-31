@@ -271,7 +271,7 @@ class MemoryIndex:
         return [{"id": i, "text": self.chunks[i], "meta": self.meta[i], "score": s}
                 for i, s in scored[:topN]]
 
-    def retrieve(self, query, topN=5, reranker=None, coarse_topM=20):
+    def retrieve(self, query, topN=5, reranker=None, coarse_topM=20, routes=None):
         """query → 前 topN 个相关片段 [{id, text, meta, score, weight}]。
         命中的片段权重 +weight_boost（用进废退），作为副作用记在 index 上。
 
@@ -283,7 +283,15 @@ class MemoryIndex:
           精排分数乘用进废退权重（钳到 WEIGHT_INFLUENCE_CAP）——重排不豁免，
             但跟粗筛一样不给权重无上界话语权（滚雪球治理，见融合处注释）；
           同分按粗筛名次——精排没意见时保留粗筛信号，不乱序；
-          weight_boost 只加在最终 topN——粗筛池是机制内部产物，不算"被命中"。"""
+          weight_boost 只加在最终 topN——粗筛池是机制内部产物，不算"被命中"。
+
+        routes：消融开关，默认 None＝四路全开（行为与不传完全一致）。传一个子集
+        （如 {"bm25", "vector"}）可以只用其中几路——回归集靠它量"每一层各自贡献
+        多少"，而且量的是**真实检索路径**，不是脚本自己拼一套 rank_lists 走捷径
+        （同 e2e"走用户真实路径"那条纪律）。四个键：bm25 / vector / graph / weight。
+        注意可靠命中门槛不受 routes 影响——门槛问的是"这个块跟 query 有没有关系"，
+        跟"用哪几路排序"是两件事。"""
+        routes = {"bm25", "vector", "graph", "weight"} if routes is None else set(routes)
         bm_scores = self._bm25.scores(tokenize(query))
         vec_scores = self._vector_scores(query)
         # 可靠命中门槛（2026.07.31 验收反馈：低相关也硬凑 topN，会让一次误召回
@@ -300,9 +308,11 @@ class MemoryIndex:
         scored_ok = [i for i in range(len(self.chunks))
                      if i not in self.retracted
                      and (bm_scores[i] > 0 or vec_scores[i] > 0)]
-        bm_ranks = [i for i in ranked(bm_scores) if i in set(scored_ok)]
-        vec_ranks = [i for i in ranked(vec_scores) if i in set(scored_ok)]
-        rank_lists = [bm_ranks, vec_ranks]
+        ok = set(scored_ok)
+        bm_ranks = [i for i in ranked(bm_scores) if i in ok]
+        vec_ranks = [i for i in ranked(vec_scores) if i in ok]
+        rank_lists = [r for r, on in ((bm_ranks, "bm25" in routes),
+                                      (vec_ranks, "vector" in routes)) if on]
         # 第三层：按留口设计把关联块排成第三路 append 进 RRF，融合逻辑不改。
         # 两处实现细节是实测调出来的（过程见 设计笔记"关系图谱"一节）：
         #   种子只取真有分的命中——零分并列块不是命中，它们的邻居是纯噪声；
@@ -322,7 +332,8 @@ class MemoryIndex:
             for nb in self.graph_neighbors(seed):
                 if nb not in graph_route and nb not in self.retracted:
                     graph_route.append(nb)
-        if len(graph_route) > len(seeds):  # 带出了新关联块才追加，没有就退回两路融合
+        # 带出了新关联块才追加，没有就退回两路融合
+        if "graph" in routes and len(graph_route) > len(seeds):
             rank_lists.append(graph_route)
         # 第四路：用进废退权重（2026.07.31，滚雪球治理——维护者指出的陷阱：
         # 权重当乘子时无上界增长×近乎持平的 RRF 分，被频繁命中的块会自激滚雪球，
@@ -336,7 +347,7 @@ class MemoryIndex:
         weight_route = sorted(
             (i for i in scored_ok if self.weights[i] > 1.0),
             key=lambda i: (-self.weights[i], i))
-        if weight_route:
+        if "weight" in routes and weight_route:
             rank_lists.append(weight_route)
         fused = rrf_fuse(rank_lists, self.rrf_k)
         if reranker is not None:
@@ -406,10 +417,22 @@ class MemoryIndex:
     # 被谁以什么理由撤掉的，全程可追溯。更正内容走 memory_append 正常写回，
     # 新旧两条在账本里互相指认。
 
-    def retract(self, quote, reason, now=None):
+    def retract(self, quote, reason, now=None, replaced_by=None):
         """撤回一段记录：quote 必须唯一定位到一个块（从检索结果里逐字摘）。
         命中零条或多条都明确报错，不猜——歧义时替调用方挑一条，就是把"清错误"
-        变成"造新错误"。返回 (chunk_idx, 块原文)。"""
+        变成"造新错误"。返回 (chunk_idx, 块原文)。
+
+        两件事跟着一起做（验收反馈 ③ 的两个子项）：
+
+        **旧块权重归位**：被撤回的块权重重置回 1.0。它历史上攒的命中数是**错误
+        信号**——一条记错的记录被反复召回过，恰恰说明它污染过多少次对话，那些
+        命中不该继续算作"这条重要"。不归位的话，权重还会随块一起落盘、重启后
+        回来，留下一个高权重的死块；万一将来支持人工改正文（哈希变、撤回失效），
+        它会带着这份污染权重复活。
+
+        **追溯链**：`replaced_by` 记下更正后那条记录的内容哈希，让账本能回答
+        "哪条记录改了哪条"，而不只是"这条被撤了"。调用方先写更正、再把新块文本
+        传进来（MCP 的 memory_correct 就是这个顺序）。只撤不补时为 None。"""
         if not (isinstance(quote, str) and quote.strip()):
             raise ValueError("quote 必填：从检索结果里逐字摘一段要撤回的原文")
         if not (isinstance(reason, str) and reason.strip()):
@@ -426,11 +449,21 @@ class MemoryIndex:
         i = matches[0]
         now = time.time() if now is None else now
         self.retracted.add(i)
+        self.weights[i] = 1.0        # 权重归位：误召回攒的命中数是错误信号，不留
         self.retraction_log[_chunk_key(self.chunks[i])] = {
             "reason": reason.strip(), "time": now,
             "source": self.meta[i].get("source"), "heading": self.meta[i].get("heading"),
+            "replaced_by": _chunk_key(replaced_by) if replaced_by else None,
         }
         return i, self.chunks[i]
+
+    def link_correction(self, chunk_idx, correction_text):
+        """回填追溯链：把"这条被哪条更正了"记进账本。更正内容写完之后才调得了
+        （新块的内容哈希这时才存在），所以跟 retract 分成两步，不合并。"""
+        key = _chunk_key(self.chunks[chunk_idx])
+        if key in self.retraction_log:
+            self.retraction_log[key]["replaced_by"] = _chunk_key(correction_text)
+        return key
 
     def save_retractions(self, path):
         """撤回账本落盘（内容哈希 → 原因/时间/出处），同权重的稀疏存法。"""

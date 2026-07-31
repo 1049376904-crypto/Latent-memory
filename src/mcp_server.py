@@ -255,17 +255,19 @@ class MemoryServer:
         if correction and not (args.get("current_state") or "").strip():
             raise ToolError("写 correction 时 current_state（当下状态）必填——"
                             "病灶迁移，同 memory_append：更正这件事现在是什么状态？")
+        # 撤回先做——它同时是 quote 的校验关卡；quote 定位不到就该在写任何东西
+        # 之前失败（否则更正落了盘、旧记录还在，比什么都没做更糟）
         try:
-            _, old_text = self.index.retract(args.get("quote") or "",
-                                             args.get("reason") or "", now=now)
+            old_idx, _ = self.index.retract(args.get("quote") or "",
+                                            args.get("reason") or "", now=now)
         except ValueError as e:
             raise ToolError(str(e))
-        if self.retractions_path is not None:
-            self.index.save_retractions(self.retractions_path)
         msg = "已撤回那段旧记录：检索不会再返回它（原文件保留，撤回原因入账可追溯）。"
         if correction:
             if self.corpus_dir is None:
                 # 撤回已生效但更正写不进去——明确报出来，不静默丢（同 append 的理由）
+                if self.retractions_path is not None:
+                    self.index.save_retractions(self.retractions_path)
                 raise ToolError(msg + " 但服务器没有配置可写的语料目录（--corpus），"
                                 "更正内容写不进去，请提醒用户检查 MCP 配置。")
             try:
@@ -273,10 +275,17 @@ class MemoryServer:
                     self.corpus_dir, f"【更正】{correction}",
                     args.get("current_state") or "", now=now)
             except (ValueError, OSError) as e:
+                if self.retractions_path is not None:
+                    self.index.save_retractions(self.retractions_path)
                 raise ToolError(msg + f" 但更正内容写入失败：{e}")
             self.index.add(chunk_text, meta)
             self.index.build()
+            # 追溯链补上：让账本能回答"哪条记录改了哪条"，不只是"这条被撤了"。
+            # 只能在更正写完之后回填——新块的内容哈希这时才存在
+            self.index.link_correction(old_idx, chunk_text)
             msg += f" 更正已写进第 {meta['window']} 个窗口（{path.name}）。"
+        if self.retractions_path is not None:
+            self.index.save_retractions(self.retractions_path)
         return msg
 
     def _tool_thread_close(self, args, now=None):

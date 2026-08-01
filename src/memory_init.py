@@ -1076,6 +1076,28 @@ def render_persona_md(persona, title="核心人格"):
     return "\n".join(lines).rstrip() + "\n"
 
 
+# 写在 `mcp-config.json` 里的那句说明（2026.08.01 维护者拍板：**不改名，加说明**）。
+#
+# 要防的失效形态是卡里那句"下次就会是有人改了它、发现不生效"——**那件事必须先
+# 打开文件才会发生**，所以一句写在文件里的话，正好在他需要的那一刻被读到。
+#
+# **为什么不改成 `mcp-config-样板.json`**：这个名字躺在出货话术、《快速上手》三处、
+# 引导指南、注入契约、公开仓库 `.gitignore`，还有已经发出去的截图里。改名等于把
+# 那批锚点一次性作废——而我们当天刚交过这笔学费：README 的自查锚点写死了三个
+# 文件名，`persona.md` 一出现就开始把**正确**的产出判成错的。过期的锚点比没有更糟。
+# 何况引发这条的那次误判**不是名字造成的**（用户看的是仓库根上的遗留文件，
+# 不是自己的产出目录）。
+#
+# JSON 没有注释，所以这是一个真键。文档教的是"把里面的 mcpServers 那段抄进去"、
+# 不是整份粘贴，正常路径碰不到它；万一整份粘过去，多一个顶层键多数客户端会忽略、
+# 少数会报错——**报错是响的，不是无声的**，这个代价我们接受。
+CONFIG_NOTE_KEY = "_说明"
+CONFIG_NOTE = ("这是给你抄进客户端配置的样板，不会被任何客户端自动读取。"
+               "改这个文件不生效——要改就改客户端那边真正生效的那份"
+               "（Claude Code 重跑一次 claude mcp add，或改你项目里的 .mcp.json；"
+               "其它客户端改你抄进去的那段）。")
+
+
 def mcp_config_snippet(server_path, corpus_dir, threads_path, route=None):
     """给用户直接粘贴的 MCP 配置。路径统一用正斜杠——JSON 里反斜杠要转义，
     而正斜杠在 Windows 上一样认，少一个踩坑点。
@@ -1093,13 +1115,14 @@ def mcp_config_snippet(server_path, corpus_dir, threads_path, route=None):
     跟上面那个删掉的 client 形参不是一回事。**key 永远不进这个文件**——云端档
     只在这里写"走云端"，endpoint/模型/key 全从环境变量读；这份配置会跟着产出
     目录走，用户会随手把它贴给别人。"""
-    cfg = {"mcpServers": {"memory": {
-        "command": "python",
-        "args": [str(Path(server_path).resolve()).replace("\\", "/"),
-                 "--corpus", str(corpus_dir).replace("\\", "/"),
-                 "--threads", str(threads_path).replace("\\", "/")]
-                + route_args(route or ROUTE_DEFAULT),
-    }}}
+    cfg = {CONFIG_NOTE_KEY: CONFIG_NOTE,
+           "mcpServers": {"memory": {
+               "command": "python",
+               "args": [str(Path(server_path).resolve()).replace("\\", "/"),
+                        "--corpus", str(corpus_dir).replace("\\", "/"),
+                        "--threads", str(threads_path).replace("\\", "/")]
+                       + route_args(route or ROUTE_DEFAULT),
+           }}}
     return json.dumps(cfg, ensure_ascii=False, indent=2)
 
 
@@ -2488,6 +2511,21 @@ def _selftest():
         server_arg = Path(cfg["mcpServers"]["memory"]["args"][0])
         assert server_arg.is_absolute() and server_arg.exists(), \
             f"mcp-config.json 里的 server 路径不可直接使用：{server_arg}"
+        #    **样板说明必须在文件里**（2026.08.01 维护者拍板"不改名、加说明"）：
+        #    要防的是"有人改了这个文件、发现不生效"，而那件事必须先打开文件才会
+        #    发生——所以说明写在文件里，正好在他需要的那一刻被读到。
+        #    三条一起钉：键在、话说到点上、**结构没被这一行搞坏**（它是个真键，
+        #    不是注释；把配置本体挤歪了就是拿一句提醒换一个真 bug）。
+        assert CONFIG_NOTE_KEY in cfg, \
+            "mcp-config.json 里没有那句样板说明——用户打开它改，不会知道改了不生效"
+        for must in ("不会被任何客户端自动读取", "改这个文件不生效"):
+            assert must in cfg[CONFIG_NOTE_KEY], \
+                f"样板说明没说到点上，缺：{must!r}"
+        assert set(cfg) == {CONFIG_NOTE_KEY, "mcpServers"} and \
+            cfg["mcpServers"]["memory"]["command"] == "python", \
+            f"那一行说明把配置结构挤歪了：{sorted(cfg)}"
+        #    **说明本身不许把 key 漏出去**：它是随产出目录走的文件，同 key 那条纪律
+        assert "sk-" not in cfg[CONFIG_NOTE_KEY]
         #    **同档再出一次货不许自己退自己**：重跑 ship 是常规操作（补了语料、
         #    改了一条就再出一次），而退役发生在写盘之后——判据要是漏了"跟这次
         #    同名就不动"，第二次 ship 会把刚写好的人格文件改成 .bak，产出目录

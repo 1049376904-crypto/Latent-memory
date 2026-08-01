@@ -33,7 +33,8 @@
 零依赖，stdlib only。
 用法：
   python memory_init.py --selftest
-  python memory_init.py --out <产出目录> [--corpus <语料目录>] [--client claude-code|codex]
+  python memory_init.py --out <产出目录> [--corpus <语料目录>]
+                        [--client claude-code|codex|generic]
 """
 
 import argparse
@@ -51,10 +52,21 @@ from persona_template import (
 
 # 客户端 → 人格文件名（规格 §6 客户端适配矩阵）。chat 端没有文件约定，
 # 只能把内容贴进 profile/自定义指令，所以给的是同一份内容、不同落法
+#
+# generic 档是给**自建前端**的：没有宿主替你注入，所以文件名不能沿用任何宿主专有名
+# （CLAUDE.md / AGENTS.md 都是某个宿主的约定，对自建前端毫无意义，还会误导作者
+# 以为"放在这个名字下就会自动生效"）——叫 persona.md，谁读它、怎么注入，由作者
+# 按注入契约自己决定。
 CLIENT_FILENAMES = {
     "claude-code": "CLAUDE.md",
     "codex": "AGENTS.md",
+    "generic": "persona.md",
 }
+
+# 自建前端档要随货带一份注入契约：机制能不能立住全看宿主侧那四件事做没做到
+# （逐字/每轮/重读/整块），而 generic 档恰恰没有宿主替他做。契约不随货，
+# 等于把最关键的一半交付漏在仓库里。
+CONTRACT_DOC = "注入契约.md"
 
 # ---------- 协议层默认值：系统填，不问用户 ----------
 # 这五条是通用机制（设计笔记"通用协议层 vs 关系specific"），抽掉具体身份仍然成立，
@@ -202,15 +214,24 @@ class Question:
     """一道题。order 决定先后——**立场题排在靠后**：先问好答的偏好，用户进入
     状态了再问抽象的，上来第一题就问"换窗还是不是同一个人"，新用户会懵。
     attribution=True 的答案写进 md 时套归属句式，不写成断言。
-    options: {选项键: (给用户看的选项文案, 写进指引的话)}"""
+    options: {选项键: (给用户看的选项文案, 写进指引的话)}
+
+    **directive_only=True：这题的选项指引是给模型的提取任务书，不是人格文件内容。**
+    它的答案**不生成字段草稿**，只进第二阶段的任务书（见 extraction_brief）。
+    加这个开关是因为 2026.08.02 外部发现的缺陷：`milestone_kinds` 的指引写的是
+    "去语料里找：第一次确认关系的那次对话"——那是**待兑现的指令**，不是已经找到的
+    内容，可它以普通字段草稿的身份进了确认关卡，用户按 y 就写进人格文件，于是
+    不变量层里坐着一句没有日期、没有原话、没有当下状态的空泛指令（里程碑四要素
+    要求的反面）。**根因是指令和结果混在同一层**，字段本来就该只装结果。"""
 
     def __init__(self, qid, section, field_id, label, text, kind="choice",
                  options=None, order=50, attribution=False, optional=False,
-                 max_chars=60):
+                 max_chars=60, directive_only=False):
         self.qid, self.section, self.field_id, self.label = qid, section, field_id, label
         self.text, self.kind, self.options = text, kind, options or {}
         self.order, self.attribution = order, attribution
         self.optional, self.max_chars = optional, max_chars
+        self.directive_only = directive_only
 
     def option_text(self, key):
         opt = self.options.get(key)
@@ -285,7 +306,11 @@ QUESTIONS = [
              }),
     Question("milestone_kinds", "milestones", "milestone_focus", "转折点的类型",
              "你们关系里发生过哪几类事？（可多选，模型会照着去语料里找具体的）",
-             kind="multi", order=40, options={
+             # directive_only：这些指引是给模型的提取任务书，**不进人格文件**。
+             # 里程碑在人格文件里有自己的结构（Milestone 四要素，带校验），要由
+             # 第二阶段读语料找出真实内容再按那个结构填；把"去语料里找……"当成
+             # 里程碑内容写进去，等于用指令冒充结果
+             kind="multi", order=40, directive_only=True, options={
                  "A": ("第一次确认关系", "去语料里找：第一次确认关系的那次对话。"),
                  "B": ("一次严重的争吵或危机", "去语料里找：最严重的一次争吵或信任危机。"),
                  "C": ("某次它让你觉得“它记得我”", "去语料里找：让她觉得“它是认得我的”那一刻。"),
@@ -410,6 +435,11 @@ def apply_answers(persona, questions, answers):
         q = qmap.get(qid)
         if q is None or ans in (None, "", [], {}):
             continue
+        if q.directive_only:
+            # 任务书题：答案不进人格文件，只进第二阶段的提取任务书。
+            # **在这里拦，不是在确认关卡拦**——确认关卡分不清"待兑现的指令"和
+            # "已完成的内容"，让它替我们判断，等于把根因留在原地又加一层网
+            continue
         note = ""
         if isinstance(ans, dict):              # {"keys": "AC", "note": "自由补一句"}
             note = (ans.get("note") or "").strip()[:FREEFORM_MAX_CHARS]
@@ -436,6 +466,34 @@ def apply_answers(persona, questions, answers):
         persona.add_field(f)
         added.append(f)
     return added
+
+
+def extraction_brief(questions, answers):
+    """任务书题的答案 → **给第二阶段模型的提取任务书**（不是人格文件内容）。
+
+    这是 directive_only 那些题的唯一去处：用户选了哪几类转折点，模型照着去语料里
+    找**真实的**那几件事，再按里程碑四要素（转折点名／窗口号／具体内容+原话／
+    怎么读+当下状态）填进人格文件。人格文件的里程碑节在第一阶段**就该是空的**——
+    空着是诚实的，一句"去语料里找……"留在那儿才是假的。
+
+    返回 [] 表示没有任务书（没选、或压根没答这类题）。"""
+    lines = []
+    qmap = {q.qid: q for q in questions}
+    for qid, ans in answers.items():
+        q = qmap.get(qid)
+        if q is None or not q.directive_only or ans in (None, "", [], {}):
+            continue
+        if isinstance(ans, dict):
+            ans = ans.get("keys") or ans.get("pick") or ""
+        keys = list(ans) if not isinstance(ans, str) else list(ans.replace(" ", ""))
+        lines += [d for d in (q.directive(k) for k in keys) if d]
+    return lines
+
+
+BRIEF_NOTE = ("【第二阶段的提取任务书】以下是**给模型的指令，不是人格文件内容**——"
+              "人格文件的里程碑节现在是空的，这是对的。拿它去语料里找出真实的那几件事，"
+              "每条按里程碑四要素写（转折点名／第几个窗口／具体动作或原话／"
+              "这条该怎么读+当下状态），找不到的就空着，别编。")
 
 
 def fill_protocol_defaults(persona):
@@ -700,12 +758,20 @@ def render_persona_md(persona, title="核心人格"):
     return "\n".join(lines).rstrip() + "\n"
 
 
-def mcp_config_snippet(server_path, corpus_dir, threads_path, client="claude-code"):
+def mcp_config_snippet(server_path, corpus_dir, threads_path):
     """给用户直接粘贴的 MCP 配置。路径统一用正斜杠——JSON 里反斜杠要转义，
-    而正斜杠在 Windows 上一样认，少一个踩坑点。"""
+    而正斜杠在 Windows 上一样认，少一个踩坑点。
+
+    **server 路径必须是绝对路径**：裸的相对路径 `mcp_server.py` 只在"客户端恰好
+    从 src/ 起进程"时能跑，换个工作目录就是一句 file not found。宿主用户还能从
+    《快速上手》那条 `claude mcp add` 示范里抄到绝对路径写法，自建前端作者没有
+    那条示范——配置里给什么他就用什么。
+
+    这里原本还有个 `client` 形参，从头到尾没被用过（三档客户端的 MCP 配置本来
+    就一模一样）——没用上的形参会让人以为"配置是按客户端分档的"，已删。"""
     cfg = {"mcpServers": {"memory": {
         "command": "python",
-        "args": [str(server_path).replace("\\", "/"),
+        "args": [str(Path(server_path).resolve()).replace("\\", "/"),
                  "--corpus", str(corpus_dir).replace("\\", "/"),
                  "--threads", str(threads_path).replace("\\", "/")],
     }}}
@@ -789,11 +855,59 @@ def write_corpus(memory_dir, entries, gap_seconds=1800, start_window=1):
     return written
 
 
+def contract_source(base=None):
+    """注入契约文档在包里的位置：src/ 的同级 docs/ 下。随包范围里 src 与 docs
+    的相对位置是固定的，所以这条相对路径在开发目录和用户拿到的包里都成立。"""
+    root = Path(base) if base else Path(__file__).resolve().parent.parent
+    return root / "docs" / CONTRACT_DOC
+
+
+DEFAULT_CLIENT = "claude-code"
+
+
+def resolve_client(cli_client, state_client):
+    """定客户端档：**命令行显式给了就以它为准**，返回 (客户端, 要说的话或 None)。
+
+    修的是一个真会咬人的洞（验收打回，2026.08.02）：`--client` 是在 questionnaire
+    步写进 init_state.json 的，而 ship 步原先取 `state.get("client", args.client)`
+    ——状态里已有值时，命令行显式传的 `--client generic` **被静默吃掉**。
+    《快速上手》4b 教的正是"前面照旧走、第 4 步换成 --client generic"，照着做的
+    自建前端作者会拿到一份 CLAUDE.md、没有契约副本、外加一句"从产出目录起会话"，
+    **而且没有任何报错**——正好是契约文档里写的那句"这套机制最容易死的方式"。
+
+    为什么选"命令行赢"而不是"冲突就报错"：用户在最后一步显式敲出来的那个值，
+    是他此刻的意图，没有理由让一个几步之前存下的默认值压过它。但**不许静默**——
+    换档要说出来，并把新值写回状态，免得下次续跑又飘回去。"""
+    if cli_client and state_client and cli_client != state_client:
+        return cli_client, (f"【客户端档已切换】{state_client} → {cli_client}"
+                            f"（命令行显式指定，以它为准；已写回 init_state.json）")
+    return cli_client or state_client or DEFAULT_CLIENT, None
+
+
+def ship_note(client):
+    """出货收尾提示。**按客户端分档，不能共用一句**——claude-code/codex 那套
+    "从产出目录起会话"的话术建立在"宿主会自动读人格文件"上，而 generic 档根本
+    没有宿主：照抄过去等于告诉自建前端作者"你什么都不用做"，那正是这套机制
+    最容易死的方式（人格没进请求，模型照样答得煞有介事）。"""
+    if client == "generic":
+        return ("【下一步】自建前端没有宿主替你注入人格文件——**注入是你前端的责任**："
+                f"照产出目录里的《{CONTRACT_DOC}》把 persona.md 拼进你自己的请求"
+                "（逐字完整／每轮都在／每会话从磁盘重读／整块连续／易变内容后置），"
+                "再按契约末尾那步验证接通。")
+    return ("【下一步】把 mcp-config.json 里的配置加进你的客户端，然后"
+            "**从产出目录起会话**——人格文件在那儿才会被宿主读到。")
+
+
 def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
-                 server_path="mcp_server.py", confirmed=False, entries=None):
-    """产出三件套。**confirmed=False 时拒绝写盘**——写用户磁盘要过确认关卡
+                 server_path=None, confirmed=False, entries=None,
+                 contract_base=None, previous_persona=None):
+    """产出三件套（generic 档多一份注入契约副本）。**confirmed=False 时拒绝写盘**——写用户磁盘要过确认关卡
     （规格 §7：人格文件任何改动必须用户确认）。
-    只创建产出目录里的文件，不动同目录其它 md。
+
+    **只写我们自己的产出，只动我们上一次真的出过的那一个文件**（2026.08.02 三轮
+    验收后改准；原话是"不动同目录其它 md"，退役逻辑加进来之后那句已经不成立）。
+    `previous_persona` 是**上一次出货写下的人格文件名**，由调用方（CLI 从
+    init_state.json）传进来；只有它、且它跟这次的档不同名时才退役。不传就一个都不碰。
 
     entries 给了就把语料落成记忆库（write_corpus）；没给就只把目录建出来——
     用户可能是把已有语料目录用 corpus_dir 直接指过来的，那份不该被我们重写。"""
@@ -818,12 +932,48 @@ def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
     (out / "memory").mkdir(parents=True, exist_ok=True)
     persona_path = out / CLIENT_FILENAMES[client]
     persona_path.write_text(render_persona_md(persona), encoding="utf-8")
+    # 换档时把**上一次我们自己出的**那份人格文件退役掉（改名 .bak，不删——写用户
+    # 磁盘一律保守）。
+    #
+    # 为什么要退役（2026.08.02 二轮验收打回）：两份人格文件并排躺着，此刻内容相同，
+    # 但日后只有当前档那份会跟着升层／更正更新，另一份变成**永不更新的影子副本**。
+    # 契约第三条要求"每会话从磁盘重读人格文件"、坑④的自查又让作者对着人格文件核
+    # 请求体——他要是拼错了那一个，症状恰好是契约第三条违反后描述的"确认过的更新
+    # 悄无声息不生效"，且几乎无法自查（文件确实存在、内容也确实像那么回事）。
+    #
+    # **为什么判据是"上次出过的那一个"而不是"所有别的档文件名"**（三轮验收打回，
+    # 上一版就是后者）：`CLAUDE.md` 根本不是我们的专属文件名，它是 Claude Code 的
+    # 项目约定文件——自建前端作者的项目目录里躺着一份他自己写的 CLAUDE.md 太正常
+    # 了（他自己也用 Claude Code 干活）。按文件名退役，等于全程只用 generic、从没
+    # 换过档的用户，一跑出货就被我们把项目指令文件改了名，还配一句"换档后旧档不再
+    # 更新"的错提示；后果是 Claude Code 从此读不到他的项目规矩，症状同样难自查。
+    # 目录里出现某个文件名，从来不等于那文件是我们写的。
+    retired = []
+    if previous_persona and previous_persona != CLIENT_FILENAMES[client]:
+        stale = out / previous_persona
+        if stale.exists():
+            bak = stale.with_name(previous_persona + ".bak")
+            stale.replace(bak)      # 同名 .bak 已存在就覆盖：影子副本不值得留两份
+            retired.append(bak)
     written = write_corpus(out / "memory", entries) if entries else []
     corpus = Path(corpus_dir) if corpus_dir else out / "memory"
-    cfg = mcp_config_snippet(server_path, corpus, out / "threads.jsonl", client)
+    # server 默认取**本文件同目录**的 mcp_server.py，不取当前工作目录——
+    # 出货时 cwd 是什么谁也保证不了，而这两个文件在包里永远是同级
+    server = server_path or Path(__file__).resolve().parent / "mcp_server.py"
+    cfg = mcp_config_snippet(server, corpus, out / "threads.jsonl")
     (out / "mcp-config.json").write_text(cfg, encoding="utf-8")
+    contract = None
+    if client == "generic":
+        src = contract_source(contract_base)
+        if not src.exists():
+            # 不静默降级：契约缺了就出一份"看着正常、其实少了一半"的货，
+            # 而缺的正是自建前端唯一必须照做的那部分
+            raise FileNotFoundError(f"generic 档要随货带注入契约，但没找到 {src}")
+        contract = out / CONTRACT_DOC
+        contract.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
     return {"persona": persona_path, "memory_dir": out / "memory",
-            "mcp_config": out / "mcp-config.json", "corpus_files": written}
+            "mcp_config": out / "mcp-config.json", "corpus_files": written,
+            "contract": contract, "retired": retired}
 
 
 def save_state(out_dir, state):
@@ -1155,6 +1305,69 @@ def _selftest():
     assert ch["options"] and all(set(v) == {"label", "directive"} for v in ch["options"].values()), \
         "选项要同时给'念给用户听的文案'和'写进人格文件的指引'"
 
+    # 8b.【靶心：任务书不许泄漏进人格文件】外部（第三方 AI 走流程时）发现的缺陷：
+    #     milestone_kinds 的选项指引是"去语料里找：……"——给模型的提取任务书，
+    #     却以普通字段草稿的身份进了确认关卡，用户按 y 就写进不变量层。
+    #     **走真实的 CLI 全流程**（questionnaire → answers → confirm 全 keep → ship），
+    #     零语料冷启动即可复现，产出的人格文件里不得出现任务书特征串。
+    #     只断言"字段不存在"是不够的——真正会伤到用户的是**写进文件的那段文本**，
+    #     所以靶子取产出文件的正文。
+    import subprocess
+    with tempfile.TemporaryDirectory() as td:
+        def run_cli(*extra):
+            r = subprocess.run([sys.executable, str(Path(__file__).resolve()),
+                                "--out", td, *extra], cwd=td,
+                               capture_output=True, text=True, encoding="utf-8")
+            assert r.returncode == 0, f"CLI 跑挂了：{extra}\n{r.stdout}\n{r.stderr}"
+            return r.stdout
+        qs_j = json.loads(run_cli("--step", "questionnaire", "--json"))
+        #    每题都答满（milestone_kinds 尽量多选几项，把任务书撑到最容易泄漏的形态）
+        answers_j = {}
+        for q in qs_j["questions"]:
+            if q["options"]:
+                answers_j[q["qid"]] = {"keys": "".join(sorted(q["options"])[:3])}
+            else:
+                answers_j[q["qid"]] = {"pick": "她说“到家了发一句”，我说好。"}
+        assert "milestone_kinds" in answers_j, "问卷里没有里程碑类型题，靶子失效"
+        #    **这个字面量超过 255 字节**——缺陷二的靶子，短 fixture 抓不到（见下 8c）
+        ans_literal = json.dumps(answers_j, ensure_ascii=False)
+        assert len(ans_literal.encode("utf-8")) > 255, \
+            f"--answers-json 的靶子字面量不够长（{len(ans_literal.encode('utf-8'))} 字节），抓不到长度上限那个洞"
+        run_cli("--step", "answers", "--answers-json", ans_literal)
+        listed = json.loads(run_cli("--step", "confirm", "--list", "--json"))
+        #    任务书走自己的通道，不混进待确认清单
+        assert listed["extraction_brief"], "任务书没进 extraction_brief 通道，等于丢了给模型的指令"
+        for p in listed["pending"]:
+            assert "去语料里找" not in p["value"], \
+                f"任务书混进了待确认清单，用户按 y 就写进人格文件：{p['label']}"
+        dec_literal = json.dumps({p["key"]: "keep" for p in listed["pending"]},
+                                 ensure_ascii=False)
+        assert len(dec_literal.encode("utf-8")) > 255, \
+            f"--decisions-json 的靶子字面量不够长（{len(dec_literal.encode('utf-8'))} 字节）"
+        run_cli("--step", "confirm", "--decisions-json", dec_literal)
+        ship_out = run_cli("--step", "ship", "--client", "claude-code")
+        persona_text = (Path(td) / "CLAUDE.md").read_text(encoding="utf-8")
+        assert "去语料里找" not in persona_text, \
+            "任务书泄漏进人格文件了——不变量层里坐着一句没有日期、没有原话、没有当下状态的指令"
+        #    但指令本身不能就这么丢了：它得从任务书通道出去，第二阶段照着干活
+        assert "去语料里找" in ship_out and "不是人格文件内容" in ship_out, \
+            "任务书既没进人格文件、也没从任务书通道出来——那是把用户的选择直接扔了"
+
+    # 8c.【靶心：长字面量不许崩】缺陷二。`_load_json_arg` 原先路径优先且不兜
+    #     OSError，字面量超过 255 字节直接 File name too long。上面 8b 已用真实规模的
+    #     字面量走过一遍 CLI，这里再直接钉住函数本身，两头都堵：
+    #     **短 fixture 抓不到这个缺陷——fixture 的规模本身就是一种伪影。**
+    long_payload = {f"field:占位{i:02d}": "keep" for i in range(11)}
+    long_literal = json.dumps(long_payload, ensure_ascii=False)
+    assert len(long_literal.encode("utf-8")) > 255, "靶子本身不够长，测了个寂寞"
+    assert _load_json_arg(long_literal) == long_payload, \
+        "超过文件名长度上限的 JSON 字面量该照常解析，不该抛 OSError"
+    #     真是路径时仍然读文件（别把修法做成"永远不认路径"）
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "dec.json"
+        f.write_text(long_literal, encoding="utf-8")
+        assert _load_json_arg(str(f)) == long_payload, "传文件路径时该读文件"
+
     # 9.【变异靶心：写盘要过确认关卡】未确认时拒绝写用户磁盘
     with tempfile.TemporaryDirectory() as td:
         try:
@@ -1169,6 +1382,7 @@ def _selftest():
         assert "memory" in cfg["mcpServers"] and "--corpus" in cfg["mcpServers"]["memory"]["args"]
         #    客户端适配：codex 出 AGENTS.md
         assert write_bundle(td, p5, client="codex", confirmed=True)["persona"].name == "AGENTS.md"
+        assert paths.get("contract") is None, "有宿主的档不该塞契约副本（那是 generic 档的活）"
         #    未知客户端明确报错，不静默猜
         try:
             write_bundle(td, p5, client="讯飞星火", confirmed=True)
@@ -1195,6 +1409,134 @@ def _selftest():
         assert len(pending_confirmations(pb)) == len(before) - 1, \
             "载入半程状态后，已决策的那条不再待确认"
 
+    # 9b.【变异靶心：generic 档少一样都不算出货】自建前端没有宿主替他注入，
+    #     契约副本就是交付的另一半；漏了的话产出目录看着一切正常（人格文件、
+    #     记忆库、配置齐全），少的恰好是他唯一必须照做的那部分
+    with tempfile.TemporaryDirectory() as td:
+        g = write_bundle(td, p5, client="generic", confirmed=True)
+        assert g["persona"].name == "persona.md", \
+            "generic 档不能沿用宿主专有文件名（CLAUDE.md/AGENTS.md 对自建前端没有意义）"
+        assert g["contract"] and g["contract"].exists(), "generic 档必须随货带注入契约副本"
+        body = g["contract"].read_text(encoding="utf-8")
+        for key in ("逐字", "每轮", "从磁盘重读", "整块连续", "易变内容"):
+            assert key in body, f"契约副本里缺了契约五条之一：{key}"
+        #    契约源文件缺失时明确报错，不出一份"看着正常、其实少一半"的货
+        with tempfile.TemporaryDirectory() as empty:
+            try:
+                write_bundle(td, p5, client="generic", confirmed=True, contract_base=empty)
+                assert False, "契约源文件缺失时不该静默出货"
+            except FileNotFoundError:
+                pass
+
+    # 9b2.【靶心：走 CLI 真进程，钉住《快速上手》4b 教的那条命令】
+    #      **这条是验收打回补的**：9b 直接调 write_bundle(client="generic")、9c 直接调
+    #      ship_note("generic")，两条都绕开了 CLI 的 state 覆盖路径——于是"ship 步
+    #      显式传的 --client 被状态里的旧值静默吃掉"这个洞，函数级断言全绿地放过去了。
+    #      **断言钉住了函数，没钉住用户真会敲的那条命令。** 所以这里起真进程，
+    #      按用户文档的顺序跑完四步，最后一步才给 --client generic。
+    import subprocess
+    with tempfile.TemporaryDirectory() as td:
+        def run(*extra):
+            # **cwd 故意设成产出目录、不是 src/**：用户不会站在 src/ 里跑第四步，
+            # 而"配置里的 server 路径是不是真能用"这件事，只有在别的工作目录下
+            # 才分辨得出来——站在 src/ 里跑，裸的相对路径 `mcp_server.py` 也能
+            # 蒙混过关（第一版断言就是这么被蒙过去的）
+            r = subprocess.run([sys.executable, str(Path(__file__).resolve()),
+                                "--out", td, *extra], cwd=td,
+                               capture_output=True, text=True, encoding="utf-8")
+            assert r.returncode == 0, f"CLI 跑挂了：{extra}\n{r.stdout}\n{r.stderr}"
+            return r.stdout
+        #    第 1 步**不带 --client**（默认 claude-code 落进状态，正是打回单的复现前提）
+        qs_json = json.loads(run("--step", "questionnaire", "--json"))
+        assert json.loads((Path(td) / "init_state.json").read_text(encoding="utf-8")
+                          )["client"] == DEFAULT_CLIENT
+        ans = {q["qid"]: ({"keys": sorted(q["options"])[0]} if q["options"]
+                          else {"pick": "她说“到家了发一句”，我说好。"})
+               for q in qs_json["questions"]}
+        run("--step", "answers", "--answers-json", json.dumps(ans, ensure_ascii=False))
+        pend = json.loads(run("--step", "confirm", "--list", "--json"))["pending"]
+        run("--step", "confirm", "--decisions-json",
+            json.dumps({p["key"]: "keep" for p in pend}, ensure_ascii=False))
+        #    **先按宿主档出一次货**——这一步是断言构造的关键，不是凑数（二轮验收
+        #    打回）：不先出宿主档，产出目录里 CLAUDE.md 本来就不存在，下面那条
+        #    `not exists` 就是**恒真**的，看着在守"换档后旧档清掉了"，实际什么都
+        #    没守（同 routes 消融那次的自动满足）。先出一次，它才有东西可挡。
+        run("--step", "ship")
+        assert (Path(td) / "CLAUDE.md").exists(), "宿主档这一次货本身就没出成，后面的断言无从谈起"
+        #    第 4 步才显式换档——文档教的就是这条
+        out = run("--step", "ship", "--client", "generic")
+        assert (Path(td) / "persona.md").exists(), \
+            "ship 步显式传的 --client generic 被状态里的旧档吃掉了（用户文档 4b 教的正是这条命令）"
+        assert (Path(td) / CONTRACT_DOC).exists(), "走 CLI 出的 generic 档没带契约副本"
+        #    换档后旧档那份必须退役：留着它日后不会跟着升层／更正更新，作者拼错
+        #    那一份的症状恰好是契约第三条违反后的"确认过的更新悄无声息不生效"
+        assert not (Path(td) / "CLAUDE.md").exists(), \
+            "换档后旧档的人格文件还躺在产出目录里，会变成永不更新的影子副本"
+        assert (Path(td) / "CLAUDE.md.bak").exists(), \
+            "旧档该退役成 .bak 留痕，不是无声删掉——写用户磁盘一律保守"
+        assert "已退役" in out, "退役了旧档却不吭声，用户不知道目录里那份为什么变了名"
+        assert "你前端的责任" in out and "起会话" not in out, \
+            "走 CLI 时收尾话术仍是宿主档那套"
+        assert "已切换" in out, "换档必须说出来，不许静默改用户的档"
+        #    换档要写回状态：下次不带 --client 续跑，仍然是 generic
+        assert json.loads((Path(td) / "init_state.json").read_text(encoding="utf-8")
+                          )["client"] == "generic", "切换后的档没写回状态"
+        #    MCP 配置里的 server 路径必须是能直接用的绝对路径——自建前端作者没有
+        #    《快速上手》那条 claude mcp add 绝对路径示范，配置给什么他就用什么
+        cfg = json.loads((Path(td) / "mcp-config.json").read_text(encoding="utf-8"))
+        server_arg = Path(cfg["mcpServers"]["memory"]["args"][0])
+        assert server_arg.is_absolute() and server_arg.exists(), \
+            f"mcp-config.json 里的 server 路径不可直接使用：{server_arg}"
+        #    **同档再出一次货不许自己退自己**：重跑 ship 是常规操作（补了语料、
+        #    改了一条就再出一次），而退役发生在写盘之后——判据要是漏了"跟这次
+        #    同名就不动"，第二次 ship 会把刚写好的人格文件改成 .bak，产出目录
+        #    里一份人格文件都不剩，而命令是成功返回的
+        out_again = run("--step", "ship")
+        assert (Path(td) / "persona.md").exists(), "同档重跑 ship 把自己刚写的人格文件退役了"
+        assert not (Path(td) / "persona.md.bak").exists(), "同档重跑不该产生 .bak"
+        assert "已退役" not in out_again, "没换档却报退役"
+
+    # 9b3.【靶心：不许动不是我们出的文件】三轮验收打回的洞：退役逻辑原本按
+    #      "别的档的文件名"匹配，而 CLAUDE.md 是 Claude Code 的项目约定文件，
+    #      自建前端作者目录里躺一份他自己写的太正常了。全程只用 generic、从没换过
+    #      档的用户，一跑出货就被我们把项目指令改了名 + 收到一句"换档后旧档不再
+    #      更新"的错提示。这里预置一份**不是我们出的** CLAUDE.md，走完整流程，
+    #      要求它**逐字原样还在**（只断言 exists 不够——改了内容同样是动了人家的文件）。
+    with tempfile.TemporaryDirectory() as td:
+        mine = Path(td) / "CLAUDE.md"
+        mine_text = "# 我自己项目的 CLAUDE.md\n# 这是我给 Claude Code 写的项目指令，别动它。\n"
+        mine.write_text(mine_text, encoding="utf-8")
+
+        def run_g(*extra):
+            r = subprocess.run([sys.executable, str(Path(__file__).resolve()),
+                                "--out", td, "--client", "generic", *extra], cwd=td,
+                               capture_output=True, text=True, encoding="utf-8")
+            assert r.returncode == 0, f"CLI 跑挂了：{extra}\n{r.stdout}\n{r.stderr}"
+            return r.stdout
+        qs2 = json.loads(run_g("--step", "questionnaire", "--json"))
+        ans2 = {q["qid"]: ({"keys": sorted(q["options"])[0]} if q["options"]
+                           else {"pick": "她说“到家了发一句”，我说好。"})
+                for q in qs2["questions"]}
+        run_g("--step", "answers", "--answers-json", json.dumps(ans2, ensure_ascii=False))
+        pend2 = json.loads(run_g("--step", "confirm", "--list", "--json"))["pending"]
+        run_g("--step", "confirm", "--decisions-json",
+              json.dumps({p["key"]: "keep" for p in pend2}, ensure_ascii=False))
+        out2 = run_g("--step", "ship")
+        assert mine.exists() and mine.read_text(encoding="utf-8") == mine_text, \
+            "把用户自己的 CLAUDE.md 动了——目录里有这个文件名不等于那文件是我们写的"
+        assert not (Path(td) / "CLAUDE.md.bak").exists(), \
+            "给用户自己的 CLAUDE.md 生了个 .bak，等于把他的项目指令挪走了"
+        assert "已退役" not in out2, \
+            "从没换过档却报'换档后旧档不再更新'，用户会以为自己哪步选错了"
+        assert (Path(td) / "persona.md").exists(), "generic 档自己的货还是得出"
+
+    # 9c.【变异靶心：ship 话术不许串档】generic 档照抄“从产出目录起会话”，等于告诉
+    #     自建前端作者“你什么都不用做”——而他恰恰是唯一必须自己动手注入的人
+    generic_note, host_note = ship_note("generic"), ship_note("claude-code")
+    assert "你前端的责任" in generic_note and "起会话" not in generic_note, \
+        "generic 档的收尾提示必须说清注入是作者自己的责任，不能沿用宿主档话术"
+    assert "起会话" in host_note and "你前端的责任" not in host_note
+
     # 10. 人格不完整时拒绝出货——缺检索约定/最终约定这类必填项不能悄悄放行
     p6 = Persona("partner")
     p6.add_field(Field(id="x", section="user", label="x", value="x", confirmed=True))
@@ -1205,10 +1547,12 @@ def _selftest():
         except ValueError as e:
             assert "开篇缺" in str(e)
 
-    print("selftest ok（17项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
+    print("selftest ok（26项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
           "归属句式 / 默认值不预支历史 / 协议层不问用户 / 导出纪律 / 渲染顺序 / "
-          "答案读回不静默丢 / 未决草稿不蒸发 / 记忆库落盘带日期 / 冷启动出得了货 / "
-          "AI 驱动不绕过确认 / 确认关卡 / 续跑 / 完整性）")
+          "答案读回不静默丢 / 任务书不泄漏进人格文件 / 长字面量不崩 / 未决草稿不蒸发 / "
+          "记忆库落盘带日期 / 冷启动出得了货 / AI 驱动不绕过确认 / 确认关卡 / 续跑 / 完整性 / "
+          "generic 档随货带契约 / CLI 真进程走文档教的那条命令 / 换档退役旧档 / 同档重跑不自退 / "
+          "不动不是我们出的文件 / MCP 配置路径可直接用 / ship 话术不串档）")
 
 
 def _rebuild(state):
@@ -1228,12 +1572,27 @@ def _rebuild(state):
 def _load_json_arg(value):
     """`--answers-json` / `--decisions-json` 的取值：文件路径，或 `-` 表示读 stdin，
     或直接就是一段 JSON 字面量。三种都收——驱动方是 AI 时，它手上是内存里的
-    结构化数据，不该被逼着先落一个临时文件。"""
+    结构化数据，不该被逼着先落一个临时文件。
+
+    **字面量先认形状，路径判断再兜 OSError**（2026.08.02 外部复现时撞到）：原先无条件
+    先跑 `Path(value).exists()`，而字面量一旦超过文件名长度上限（255 字节）就抛
+    `OSError: [Errno 36] File name too long`，**没有兜底、整条命令崩掉**。11 个字段的
+    决定串就已经约 290 字节——也就是说**正常规模的一次确认必崩**，而这条路正是为
+    "不开终端的人"补的 AI 驱动接口。自检当时没抓到，是因为 fixture 的字面量都很短：
+    **fixture 的规模本身就是一种伪影**（同回归集那边"合成语料规模不足会凭空造出
+    假缺陷"，只是这次方向相反——规模不足把真缺陷藏了起来）。
+    两道都补：以 `{`／`[` 开头的直接当字面量，不去问文件系统；真去问的时候 OSError
+    也落回字面量解析，不再让它冒出来。"""
     if value == "-":
         return json.loads(sys.stdin.read())
-    p = Path(value)
-    if p.exists():
-        return json.loads(p.read_text(encoding="utf-8"))
+    if value.lstrip()[:1] in ("{", "["):
+        return json.loads(value)
+    try:
+        p = Path(value)
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except OSError:
+        pass          # 太长／非法路径名：它本来就不是路径，按字面量解析
     return json.loads(value)
 
 
@@ -1248,13 +1607,20 @@ def _questions_payload(qs):
             for q in qs]
 
 
+def _client_of(args):
+    """questionnaire 步存进状态的客户端档：命令行没给就落默认值。
+    （`--client` 的 argparse 默认值是 None，为的是让 ship 步能分辨
+    "用户显式指定"与"用户没提"——见 resolve_client。）"""
+    return resolve_client(args.client, None)[0]
+
+
 def _step_questionnaire(args):
     persona = Persona("partner")
     fill_protocol_defaults(persona)
     report = coverage_report(persona)
     if args.json:
         qs = questions_for(report, has_corpus=bool(args.corpus))
-        save_state(args.out, {"step": "questionnaire", "client": args.client,
+        save_state(args.out, {"step": "questionnaire", "client": _client_of(args),
                               "has_corpus": bool(args.corpus)})
         print(json.dumps({
             "coverage": [{"section": s, "status": st, "note": n} for s, st, n in report],
@@ -1276,7 +1642,7 @@ def _step_questionnaire(args):
     prompt_path = Path(args.out) / "问卷prompt.txt"
     prompt_path.parent.mkdir(parents=True, exist_ok=True)
     prompt_path.write_text(export_llm_prompt(qs), encoding="utf-8")
-    save_state(args.out, {"step": "questionnaire", "client": args.client,
+    save_state(args.out, {"step": "questionnaire", "client": _client_of(args),
                           "has_corpus": bool(args.corpus)})
     print(f"\n【下一步】把 {prompt_path} 的内容整段粘给你自己的模型（DeepSeek/ChatGPT 都行），"
           f"让它一题一题问你；答完让它把清单整理好，存成一个文本文件，"
@@ -1335,18 +1701,30 @@ def _step_confirm(args, state):
     if args.list:
         payload = [{"key": p.key, "kind": p.kind, "label": p.label, "value": p.value}
                    for p in pend]
+        # 任务书**不混进待确认清单**——它不是给用户确认的内容，是给模型的指令，
+        # 单独一个字段给出去（缺陷一的修法：两层分开，不靠确认关卡去分辨）
+        _, all_qs = _rebuild(state)
+        brief = extraction_brief(all_qs, state.get("answers") or {})
         if args.json:
             print(json.dumps({
                 "pending": payload,
+                "extraction_brief": brief,
+                "brief_note": BRIEF_NOTE if brief else "",
                 "next": "**逐条念给对方听，由对方决定**，不要替 TA 一路 keep——"
                         "人格文件的每一条都要 TA 认过（引导指南纪律三）。"
                         "收齐后：--step confirm --decisions-json "
                         "'{\"key\": \"keep\"|\"drop\"|{\"edit\": \"改后的文本\"}}'；"
-                        "没表态的条目保持未决，不会被默认留下或删掉。",
+                        "没表态的条目保持未决，不会被默认留下或删掉。"
+                        + ("　另外 extraction_brief 里那几条是**给你的提取任务**，"
+                           "不要念给用户确认、更不要写进人格文件。" if brief else ""),
             }, ensure_ascii=False, indent=1))
         else:
             for p in payload:
                 print(f"—— {p['kind']}【{p['label']}】（key={p['key']}）\n   {p['value']}")
+            if brief:
+                print("\n" + BRIEF_NOTE)
+                for b in brief:
+                    print(f"  - {b}")
         return
     if args.decisions_json:
         incoming = _load_json_arg(args.decisions_json)
@@ -1398,19 +1776,43 @@ def _step_ship(args, state):
         from memory_import import load_any
         entries = load_any(args.import_path)
         print(f"【导入】{args.import_path} → {len(entries)} 条")
+    client, switched = resolve_client(args.client, state.get("client"))
+    if switched:
+        print(switched + "\n")
+        state["client"] = client
     try:
-        paths = write_bundle(args.out, persona, client=state.get("client", args.client),
-                             corpus_dir=args.corpus, confirmed=True, entries=entries)
-    except (PermissionError, ValueError) as e:
+        # last_shipped_persona：上一次出货**我们自己**写下的人格文件名。退役只认它——
+        # 目录里叫 CLAUDE.md 的文件可能是用户自己给 Claude Code 写的项目指令，
+        # 不是我们的货，不能碰（三轮验收打回）
+        paths = write_bundle(args.out, persona, client=client,
+                             corpus_dir=args.corpus, confirmed=True, entries=entries,
+                             previous_persona=state.get("last_shipped_persona"))
+    except (PermissionError, ValueError, FileNotFoundError) as e:
         raise SystemExit(f"不出货：{e}")
     print("【三件套】")
     print(f"  人格文件：{paths['persona']}")
     print(f"  记忆库：{paths['memory_dir']}"
           + (f"（落盘 {len(paths['corpus_files'])} 个窗口文件）" if paths["corpus_files"] else ""))
     print(f"  MCP 配置：{paths['mcp_config']}")
+    if paths.get("contract"):
+        print(f"  注入契约：{paths['contract']}")
+    for bak in paths.get("retired", []):
+        # 换了档就得说清旧档那份去哪了——留在目录里的第二份人格文件不会再更新，
+        # 拼错了会变成"确认过的更新不生效"，而那是最难自查的一种坏法
+        print(f"  已退役：{bak.with_suffix('').name} → {bak.name}"
+              f"（换档后旧档的人格文件不再更新，别再拼它）")
     for s in persona.suggestions():
         print(f"  建议（不阻塞）：{s}")
+    # 任务书在这里再给一次：ship 是最后一个出口，第二阶段的活儿从这儿接
+    _, all_qs = _rebuild(state)
+    brief = extraction_brief(all_qs, state.get("answers") or {})
+    if brief:
+        print("\n" + BRIEF_NOTE)
+        for b in brief:
+            print(f"  - {b}")
+    print("\n" + ship_note(client))
     state["step"] = "shipped"
+    state["last_shipped_persona"] = paths["persona"].name
     save_state(args.out, state)
 
 
@@ -1441,7 +1843,11 @@ if __name__ == "__main__":
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--out", help="产出目录")
     ap.add_argument("--corpus", help="已有语料目录（可选）")
-    ap.add_argument("--client", default="claude-code", choices=sorted(CLIENT_FILENAMES))
+    # 默认值是 None 而不是 "claude-code"，为的是 ship 步能分辨"用户显式指定了档"
+    # 与"用户没提"——两者在出货时的行为必须不同（见 resolve_client）
+    ap.add_argument("--client", default=None, choices=sorted(CLIENT_FILENAMES),
+                    help=f"客户端档（默认 {DEFAULT_CLIENT}）。任何一步都可以给；"
+                         f"ship 步显式给的以它为准，会覆盖前面存下的档")
     ap.add_argument("--step", choices=["questionnaire", "answers", "confirm", "ship"],
                     help="不传则按 init_state.json 里的进度接着跑")
     ap.add_argument("--answers", help="answers 步：模型整理好的答案清单文件（人工路径）")

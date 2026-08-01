@@ -16,11 +16,16 @@
   多窗口、跨月（6/12 → 7/28）、index 与 timeline 双层、一条跨窗口主题线、
   一处"记错了又更正"、一处同义换说法（考图谱与实体槽）、若干无关噪声。
 
-四类查询各考一件事，**分开算分**（混在一起算总分会把某一层的退化摊平看不见）：
+五类查询各考一件事，**分开算分**（混在一起算总分会把某一层的退化摊平看不见）：
   literal   词面直给          —— 考 BM25 层
   paraphrase 换了说法         —— 考向量层 / 实体槽
   linked    跨窗口关联         —— 考图谱层
+  感受回忆   "那时候我什么感觉" —— 考"感受记成事实就检索得到"这条答案立不立得住
   absent    库里真没有         —— 考可靠命中门槛（该说没有就得说没有）
+
+**感受回忆这一类是测量，不是写作指引**（维护者裁定，2026.08.01 第三份外部反馈）：
+它只在这里记账，不反过来变成"该怎么写感受"的话进用户文档——理由与边界写在
+CASES 里那一段注释。
 
 指标：Recall@5、MRR、以及 absent 类的"正确空手率"。
 基线数字记在 BASELINE 里，是**当前实测值不是目标值**——改动检索层后重跑，
@@ -97,6 +102,7 @@
 """
 
 import argparse
+from collections import Counter
 
 from memory_retrieval import (MemoryIndex, _chunk_key, tokenize,
                               query_miss_rate, MISS_RATE_FLAG)
@@ -169,6 +175,25 @@ CASES = [
     ("linked", "浇水太勤那次之后改种什么了", ["多肉"]),
     ("linked", "十一点后到家那阵子后来结束了吗", ["结束了"]),
     ("linked", "胖乎乎那两盆是什么时候买的", ["不用天天浇"]),
+    # 感受回忆：**第三份外部反馈（同行）唯一保留下来的那一项**。"你还记不记得那时候
+    # 我是什么感觉"这类问法，恰好落在第二份反馈量出的最弱档（抽象归纳式）——两份
+    # 反馈从不同角度命中同一处。
+    #
+    # 这一类考的是本项目对"情感连续性"的答案能不能立住：**感受用纪录片写法记成
+    # 事实，就该检索得到**——不加 valence/arousal 元数据层，靠的是"她挺得意"
+    # "我把汤温着，没多问"这类**事实**本身就带着感受，读到的模型自己会判断。
+    #
+    # ⚠ **边界（维护者裁定，写死在这儿免得后来人越界）：这一类是测量，不是写作指引。**
+    # 它只进回归集记账，不反过来变成"该怎么写感受"的话往用户文档里加——"她还在
+    # 介意"是判断句不是事实，教用户写这种就是在推他们滑向评价式记录，跟纪录片
+    # 纪律直接冲突。测量不构成说服，写作指引会。
+    ("感受回忆", "她加班那阵子我心里是什么感觉", ["把汤温着"]),
+    ("感受回忆", "山顶那晚我们当时是什么心境", ["等发了奖金就去"]),
+    ("感受回忆", "第一次真看到土星那晚是什么感受", ["那天说的以后"]),
+    ("感受回忆", "她那个项目结束以后整个人什么状态", ["睡到中午"]),
+    ("感受回忆", "那两盆植物活下来的时候她是什么反应", ["她挺得意"]),
+    ("感受回忆", "刚搬过去那会儿她对新住处是什么态度", ["夏天不闷"]),
+    ("感受回忆", "我做那锅咖喱的时候她怎么评价的", ["至少这次能吃"]),
     # absent 拆成两个子类**分开算分**（2026.08.01，第一份外部内测反馈后重做）。
     # 混成一个数会把真实威胁平均掉——这正是第四伪影能藏这么久的原因之一。
     #
@@ -230,6 +255,12 @@ ABSTRACT_QUERIES = {
     "厨房采光怎么样", "她那阵子很晚回家", "阳台上种的那盆草为什么没活",
     "那本小说的叙事结构", "她加班那个项目最后怎么样了", "项目交付之后她怎么休息的",
     "她终于能好好休息了吗", "两盆植物现在的状态",
+    # 感受回忆整类都是归纳式：问的是"当时什么感觉"，语料里写的是当时做了什么、
+    # 说了什么，词面天然不重合——这正是它落在最弱档的原因
+    "她加班那阵子我心里是什么感觉", "山顶那晚我们当时是什么心境",
+    "第一次真看到土星那晚是什么感受", "她那个项目结束以后整个人什么状态",
+    "那两盆植物活下来的时候她是什么反应",
+    "刚搬过去那会儿她对新住处是什么态度", "我做那锅咖喱的时候她怎么评价的",
 }
 
 
@@ -274,6 +305,8 @@ BASELINE = {
         "literal":    {"recall": 1.00, "mrr": 1.00},
         "paraphrase": {"recall": 1.00, "mrr": 0.87},
         "linked":     {"recall": 0.83, "mrr": 0.44},
+        # 感受回忆（第三份反馈保留项）：如实入档的首测值，不是目标值
+        "感受回忆":    {"recall": 0.85, "mrr": 0.67},
         "absent_远主题": {"correct_empty": 1.00},
         # ⚠ **这个 0.16 是当前真实水平，不是笔误**：日常口吻的编造查询几乎全部
         # 穿透防线。基线记"不得低于"，修完防线该往上走——这一格就是 P0 那单
@@ -291,12 +324,33 @@ BASELINE = {
         # 也没被 max_df 挡掉，但图谱路在 RRF 里只有一票，压不过那些在两条词面路
         # 里都排前几名的闲词块。**没有据此改检索层**——理由见 docstring 末尾。
         "linked":     {"recall": 0.66, "mrr": 0.40},
+        # 感受回忆：规模一上来同样掉（cold 0.85 → 0.71），跟 paraphrase 一个走向——
+        # 这类问法本来就落在最弱的归纳式一档，掉了不意外，记着别再往下掉。
+        # ⚠ **这一格的 recall 没有分辨力，有分辨力的是 MRR**（2026.08.02 验收方三组
+        # 路消融实测：只留 bm25／关图谱／去掉 bm25，recall 一律 0.71 与默认完全相同，
+        # 只有 MRR 动，0.64 → 0.46）。同"合成集给出一片平台不代表'取哪都行'，可能
+        # 只是尺子在这个维度分辨率不够"——将来别拿这格 recall 论证"归纳式检索改好了"。
+        "感受回忆":    {"recall": 0.71, "mrr": 0.64},
         "absent_远主题": {"correct_empty": 1.00},
         # ⚠ **0.00——一条都没挡住**，与第一份外部内测反馈的 D 类 0/3 完全吻合。
         "absent_日常":   {"correct_empty": 0.00},
     },
 }
 TOPN = 5
+
+# 登记基线那一刻，各类各有多少条查询。**跟 BASELINE 一起维护**：加了查询就把数字
+# 一起改，并重跑 --report 重登基线（条数变了分数本来就要重登）。
+#
+# 为什么不写成"手写一个宽松下限"（2026.08.02 验收打回后改）：`感受回忆` 7 条却
+# 只守 `>= 6`，松的那一格恰好够删掉唯一一条两档都落空的难查询——删完 cold 从
+# R0.86 升到 1.00、established 从 0.71 升到 0.83，**基线是"不得低于"，于是全绿**。
+# 这条闸声称要挡的正是这个形态，方向却反了：对"删容易题"有效、对"删难题"无效，
+# 而删难题恰恰是分数会变好、最不会被人察觉的那种。手写的下限一定会跟实际条数
+# 脱节（写的时候就松一格，此后再没人对过），所以改成跟基线绑定的登记值。
+REGISTERED_SIZES = {
+    "literal": 5, "paraphrase": 4, "linked": 12, "感受回忆": 7,
+    "absent_远主题": 4, "absent_日常": 6,
+}
 
 # 真 embedding 路径的实测基线（2026.08.01，bge-small-zh-v1.5）。
 # **只在装了 fastembed 的环境里检查**——自检不能强依赖可选件，否则零依赖主干就名存实亡。
@@ -443,9 +497,18 @@ def score(idx, cases=CASES, topN=TOPN, routes=None):
     return out
 
 
+# 查询类的显示顺序。**只此一份**——报表、分层消融都从这里取，别再各抄一份
+# （`absent` 拆成两个子类那次就是抄了第二份、漏改一处，把 --report 跑崩了）。
+QUERY_KINDS = ("literal", "paraphrase", "linked", "感受回忆",
+               "absent_远主题", "absent_日常")
+# 分层消融只印非 absent 的类 + absent_日常（远主题在两档都是 1.00，印出来一列常数，
+# 占宽度不带信息）
+ABLATION_KINDS = ("literal", "paraphrase", "linked", "感受回忆", "absent_日常")
+
+
 def _fmt(scores):
     lines = []
-    for kind in ("literal", "paraphrase", "linked", "absent_远主题", "absent_日常"):
+    for kind in QUERY_KINDS:
         s = scores.get(kind)
         if not s:
             continue
@@ -487,9 +550,15 @@ def report():
     for off in ("bm25", "vector", "graph", "weight"):
         s = score(build_index(), routes=full - {off})
         parts = []
-        for kind in ("literal", "paraphrase", "linked"):
-            parts.append(f"{kind} R{s[kind]['recall']:.2f}/M{s[kind]['mrr']:.2f}")
-        parts.append(f"absent 空手{s['absent']['correct_empty']:.2f}")
+        # 类名统一走 _fmt 那张表，不在这里另抄一份——`absent` 拆成
+        # `absent_远主题`／`absent_日常` 之后，这里漏改了一处，`--report` 跑到这节
+        # 直接 KeyError 崩掉（模块 docstring 里"改动检索层后重跑 --report"这条
+        # 动作因此是断的）。抄第二份类名清单就会有第二次漏改，所以只留一份。
+        for kind in ABLATION_KINDS:
+            if kind.startswith("absent"):
+                parts.append(f"{kind} 空手{s[kind]['correct_empty']:.2f}")
+            else:
+                parts.append(f"{kind} R{s[kind]['recall']:.2f}/M{s[kind]['mrr']:.2f}")
         print(f"  关掉 {off:<7} " + "  ".join(parts))
 
     # 实体槽的价值：这是 2026.07.31 加的槽，一直没量过补回多少关联
@@ -616,14 +685,38 @@ def _selftest():
     #       ② **每条都必须在"纯 bm25>0"的朴素闸下真有候选**——这正是"日常口吻"
     #          的操作化定义：它跟语料共享足够多的功能词，能穿透朴素闸。
     #          一条穿不透的，就是外星查询冒充日常查询，测不出真实威胁。
+    #     ①的"不许缩水"以 REGISTERED_SIZES 为准，不手写下限——见那张表的注释。
+    got = Counter(k for k, _, _ in CASES)
+    for kind, n in REGISTERED_SIZES.items():
+        assert got[kind] >= n, \
+            f"{kind} 查询缩水了：登记 {n} 条，现在 {got[kind]} 条。" \
+            f"删查询会让分数上升、基线照样绿——要减必须同时改 REGISTERED_SIZES 并重登基线"
+    assert set(got) == set(REGISTERED_SIZES), \
+        f"查询类与 REGISTERED_SIZES 对不上：{set(got) ^ set(REGISTERED_SIZES)}"
     daily = [q for k, q, _ in CASES if k == "absent_日常"]
-    assert len(daily) >= 6, f"absent_日常 查询不许缩水（当前 {len(daily)} 条）"
     est = build_index(scale="established")
     for q in daily:
         bm = est._bm25.scores(tokenize(q))
         assert sum(1 for x in bm if x > 0) > 0, \
             f"这条编造查询在朴素闸（bm25>0）下就没有候选，说明它是'外星'风格、" \
             f"测不出真实威胁，不该算进 absent_日常：{q!r}"
+
+    # 5d2.【感受回忆的成色闸——照 absent_日常 那套】基线只守"不得低于"，而**删掉
+    #      一条难查询、或把查询写得跟答案词面重合**都会让分数上升、照样绿。所以
+    #      三条一起守：
+    #        ① 数量不许缩水（走上面的 REGISTERED_SIZES，全类一起守）；
+    #        ② 期望片段必须真的在语料里（有真实候选，不是无解题）；
+    #        ③ 查询里不许出现期望片段本身——那就成了词面直给，考的是 BM25，
+    #           这一类想量的"用抽象词汇问、语料里写的是具体事实"当场消失。
+    feel = [(q, e) for k, q, e in CASES if k == "感受回忆"]
+    corpus_text = "\n".join(t for _, _, _, t in CORPUS)
+    for q, expect in feel:
+        for frag in expect:
+            assert frag in corpus_text, f"期望片段不在语料里，这是道无解题：{frag!r}"
+            assert frag not in q, \
+                f"查询里带了期望片段，这就成了词面直给、量不到归纳式的难处：{q!r}"
+        assert query_style(q) == "归纳式", \
+            f"感受回忆整类都该记在归纳式档（漏进 ABSTRACT_QUERIES 了）：{q!r}"
 
     # 5e.【缺失率信号的**方向**成立——只守方向，不守标度】
     #     我们的合成语料词汇窄，缺失率绝对值整体虚高（伪影⑤），35% 阈值在这里几乎
@@ -637,6 +730,17 @@ def _selftest():
         f"编造查询 {rows['absent_日常']:.0%}"
     assert rows["present·具名式"] <= rows["present·归纳式"], \
         "归纳式提问的缺失率该不低于具名式——这是'误杀集中在归纳式'那条结论的前提"
+
+    # 5f.【--report 自己得跑得完】模块 docstring 把"改动检索层后重跑 --report"写成
+    #     规定动作，而这条动作一直是断的：absent 拆成两个子类时分层消融那节漏改一处，
+    #     `--report` 跑到那里 KeyError 崩掉，**自检却全绿**——因为没有任何断言走过
+    #     report()。规定动作不被自检覆盖，等于没规定。这里整段跑一遍（输出吞掉，
+    #     只看跑不跑得完），它同时替分层消融那节的类名清单守着。
+    import contextlib, io
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        report()
+    assert "分层消融" in buf.getvalue() and "更正闭环" in buf.getvalue(), \
+        "--report 没跑到底（分层消融/更正闭环那几节缺了）"
 
     # 6.【语料代表性三道闸——今晚三个伪影各对应一条】
     #    这三条守的不是检索层，是**这把尺子本身准不准**。今晚三轮返工的教训：
@@ -673,7 +777,7 @@ def _selftest():
         f"established 档规模不足，量出来的'图谱连不上'会是规模伪影而不是机制缺陷"
 
     print(f"selftest ok（回归集：{len(idx.chunks)} 块语料 / {len(CASES)} 条查询，"
-          f"12 项断言：两档不低于基线 / 门槛没松 / 实体槽增益状态 / 消融走真实路径 / 更正闭环 / embed门槛 / absent日常成色 / 缺失率方向 / 留出集纪律 / 语料代表性三道闸）")
+          f"14 项断言：两档不低于基线 / 门槛没松 / 实体槽增益状态 / 消融走真实路径 / 更正闭环 / embed门槛 / absent日常成色 / 感受回忆成色 / 缺失率方向 / --report 跑得完 / 留出集纪律 / 语料代表性三道闸）")
 
 
 if __name__ == "__main__":

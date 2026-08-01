@@ -12,3 +12,9 @@ AGENTS.md
 memory/
 mcp-config.json
 问卷prompt.txt
+# generic 档（自建前端）的产出：人格文件叫 persona.md，随货还多一份契约副本。
+# 契约那条**必须锚在根目录**——不锚的话会连仓库自己的 docs/注入契约.md 一起忽略掉
+/persona.md
+/注入契约.md
+# 换客户端档时旧人格文件退役成的 .bak，同样是用户的私人内容
+*.bak

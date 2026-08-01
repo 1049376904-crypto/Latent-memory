@@ -42,7 +42,8 @@ import time
 from pathlib import Path
 
 # 同目录模块，import 不触发各自的 CLI
-from memory_retrieval import MemoryIndex, load_corpus, append_record
+from memory_retrieval import (MemoryIndex, load_corpus, append_record,
+                              query_miss_rate, miss_rate_note, annotate_block)
 from session_recall import SessionRecall, format_recall_block, SELF_CHECK_FOOTER  # noqa: F401
 from session_thread import ThreadStore, close_thread
 
@@ -216,14 +217,22 @@ class MemoryServer:
             # 用进落盘：retrieve 的副作用是命中块 +weight_boost，不落盘的话
             # server 一重启就归零——权重持久化的"存"这半就在这一行
             self.index.save_weights(self.weights_path)
+        note = miss_rate_note(query_miss_rate(self.index, query))
         if not results:
             # 可靠命中门槛（验收反馈）：低相关不硬凑。这句要同时做两件事——
             # 说清"查过了、真没有"，并明确解锁如实回答（instructions 堵的是
             # "没查就说没记录"，查过之后的"没有"是诚实，不是那句被堵的话术）
             raise ToolError("没有可靠命中：记忆库里没有与这个说法词面或语义相关的"
                             "记录。你已经查过了——如实告诉对方没找到/记不清即可；"
-                            "也可以换个说法再查一次（人名、地点、当时的用词）。")
-        return format_recall_block(results)  # 复用召回层的格式化，外壳不另写一套
+                            "也可以换个说法再查一次（人名、地点、当时的用词）。"
+                            + (" " + note if note else ""))
+        # 缺失率标注（2026.08.01，第二份外部反馈标定）：**不改变返回什么**，
+        # 只在结果后面附一句可核对的话。真实威胁是"库里没有却返回了五条真记忆、
+        # 模型拿去圆"，而这个判断只有读到内容的模型能下——机制层负责把不确定性
+        # 摆到台面上，不负责替它拒绝。
+        # 拼接走 annotate_block（库函数），外壳仍然只是转发+组合调用，不自己拼字符串
+        return annotate_block(format_recall_block(results),
+                              query_miss_rate(self.index, query))
 
     def _tool_session_start(self, args, now=None):
         block = self.recall.on_session_start(now=now)
@@ -459,9 +468,14 @@ def _selftest():
     # 4.【变异靶心·薄适配层】外壳输出必须逐字等于底层库返回——谁在适配层里重新
     #    实现格式化，这条立刻红。这正是"分得清是接口问题还是底层库问题"的保证
     idx2 = _build_server(now).index
-    expected_search = format_recall_block(idx2.retrieve("咖啡机坏了", topN=5))
+    expected_search = annotate_block(
+        format_recall_block(idx2.retrieve("咖啡机坏了", topN=5)),
+        query_miss_rate(idx2, "咖啡机坏了"))
+    #    2026.08.01 随缺失率标注放宽了一格，但**纪律没放松**：比对的仍是"底层库
+    #    函数的组合结果"（annotate_block(format_recall_block(...), 缺失率)），
+    #    外壳只要自己拼一个字都会红
     assert call("memory_search", {"query": "咖啡机坏了"}, mid=10)["result"]["content"][0]["text"] \
-        == expected_search, "memory_search 必须原样返回 format_recall_block 的结果"
+        == expected_search, "memory_search 必须原样返回底层库函数的组合结果，外壳不许自拼"
     srv2 = _build_server(now)
     expected_start = srv2.recall.on_session_start(now=now)
     assert srv2.handle({"jsonrpc": "2.0", "id": 11, "method": "tools/call",
@@ -613,6 +627,33 @@ def _selftest():
         assert s12b.index.retraction_log, "重启后撤回账本该从盘上回来"
         assert json.loads(rp.read_text(encoding="utf-8")), "账本文件要真在盘上（可追溯）"
 
+    # 12b.【缺失率标注接线：两条路径都要带上】高缺失率查询无论"查到了"还是
+    #      "没查到"，都该把那句可核对的话交给模型——空结果那条尤其重要，它是
+    #      模型决定"如实说没找到"还是"拿沾边的记录去圆"的分水岭
+    from memory_retrieval import query_miss_rate as _qmr0, MISS_RATE_FLAG as _F0
+    srv12b = _build_server(now)
+    hit12b = call(srv12b, "memory_search", {"query": "咖啡机 保险丝 熔断 通电"}, now)
+    miss12b = call(srv12b, "memory_search", {"query": "量子对撞机的运行日志"}, now)
+    assert miss12b["isError"] is True and "核对提示" in miss12b["content"][0]["text"], \
+        "空结果那条必须带缺失率标注——它是'如实说没找到'与'拿沾边记录去圆'的分水岭"
+    #      **最要紧的一条：高缺失率不许硬拒**。这是本信号定性（专名缺席检测器，
+    #      不是事件存在性检测器）直接推出来的纪律——它的误杀全部落在"抽象归纳式
+    #      提问"那一档，而那是陪伴场景最有价值的一类问题。有人把标注改成拒绝返回，
+    #      行为上是"专门惩罚最该被答好的提问"，而在此之前没有任何断言守着这件事
+    #      （变异检查抓出来的缺口）
+    mixed = "咖啡机 量子对撞机 报税"          # 高缺失率，但确实有真命中
+    assert _qmr0(srv12b.index, mixed) >= _F0, "测试前提：这条要真的触发标注"
+    r_mixed = call(srv12b, "memory_search", {"query": mixed}, now)
+    assert r_mixed["isError"] is False, \
+        "高缺失率查询**不许硬拒**——它只该带标注，判断权留给读得到内容的模型"
+    assert "保险丝" in r_mixed["content"][0]["text"], "真命中必须照常返回"
+    assert "核对提示" in r_mixed["content"][0]["text"], "同时要带上那句可核对的标注"
+
+    #      有结果时按缺失率决定带不带，不硬加噪声
+    from memory_retrieval import query_miss_rate as _qmr, MISS_RATE_FLAG as _F
+    if _qmr(srv12b.index, "咖啡机 保险丝 熔断 通电") < _F:
+        assert "核对提示" not in hit12b["content"][0]["text"], "低缺失率不该加标注"
+
     # 13.【图谱实体可插拔·接线靶心（变异：__init__ 不接 entities_path 必红）】
     #     语料目录下有 .entities.json 时 server 要接上并重建——换了说法的关联块
     #     经图谱进结果
@@ -633,9 +674,9 @@ def _selftest():
         assert r13["isError"] is False and "阳台" in r13["content"][0]["text"], \
             "server 接上 .entities.json 后，换了说法的关联块该被图谱带回"
 
-    print("selftest ok（14项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层 / "
+    print("selftest ok（15项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层 / "
           "完整链路 / stdio / UTF-8 / 写回当场可查 / 用进撑过重启 / "
-          "无可靠命中明确说 / 撤回更正闭环 / 实体标注接线）")
+          "无可靠命中明确说 / 撤回更正闭环 / 缺失率标注接线 / 实体标注接线）")
 
 
 if __name__ == "__main__":

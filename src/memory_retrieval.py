@@ -105,6 +105,30 @@ GRAPH_RRF_K = 5
 # 余弦是另一套标度），所以它只在 self.embed 为真时生效。
 EMBED_HIT_FLOOR = 0.45
 
+# 查询缺失率的标注阈值（2026.08.01，第二份外部反馈在其真实语料上标定，60 条样本）。
+#
+# **这个信号的定性比阈值重要得多：它是"专名缺席检测器"，不是"事件存在性检测器"。**
+# 标定数据（present 30 条分三档 / absent_日常 30 条，全部穿透 bm25>0 的朴素闸）：
+#     present 专名直问 4.2% / 日常问法 14.6% / 抽象归纳 23.1%（中位）
+#     absent_日常 47.7%（中位）
+#     两个分布重叠 27.5 个百分点——**不是干净分离**（测试者作废了自己第一份报告里
+#     "3pp 重叠"的说法，那是 25 条小样本的假象；别再引用旧数）
+# 按"误杀代价 = 3 × 漏判代价"加权的最优阈值是 35%：拦下 90% 的编造、误杀 6.7%。
+#
+# 两条形态结论决定了它**只能标注、不能硬拒**：
+#   误杀全部来自**抽象归纳式**提问（"她最近在焦虑什么"），用户用自己的抽象词汇问
+#     语料里用具体叙事写的事，词面天然不重合——而这恰恰是陪伴场景最有价值的一类
+#     提问。把它拒掉，等于专门惩罚最该被答好的问题。
+#   漏判全部来自**不含专名的日常编造**（"上个月搬家搬了几趟"12.5%），整句高频常用
+#     词，原理上就挡不住，调阈值救不回来。
+# 所以机制层的职责收窄成：**把明显的挡掉、把不确定的标出来**；"这五段跟你问的对不上"
+# 这个判断只有读到内容的模型能下，留给行为层（引导指南里那句"检索返回了东西不等于
+# 答案，别拿沾边的记录去圆"因此从止血升格为长期方案的主体）。
+#
+# **35% 是单一语料上的观测值，不是普适常数**——换语料（换语言、换记录风格、换规模）
+# 必须重量，同 EMBED_HIT_FLOOR 换模型要重量的先例。
+MISS_RATE_FLAG = 0.35
+
 
 def tokenize(text: str):
     """BM25 用的中文零依赖分词：清标点/空白后取字符 bigram 当词。"""
@@ -195,6 +219,7 @@ class MemoryIndex:
         self.graph_seeds = graph_seeds
         self.chunks, self.meta, self.weights = [], [], []
         self._bm25 = self._cvecs = self._ccounts = None
+        self._df_cache = {}
         self._neighbors = {}
         # 撤回集（2026.07.31 验收反馈"记错以后怎么办"闭环）：被撤回的块不再被
         # retrieve/recall 返回，但原文件与 chunks 本体都不动——时间线是档案，
@@ -218,6 +243,11 @@ class MemoryIndex:
         else:
             self._ccounts = [bigram_counts(c) for c in self.chunks]
         self._neighbors = self._build_graph()
+        # 文档频次缓存，供 query_miss_rate 用（零依赖，建库时顺手算一次）
+        self._df_cache = {}
+        for d in self._bm25.docs:
+            for t in set(d):
+                self._df_cache[t] = self._df_cache.get(t, 0) + 1
         return self
 
     def _build_graph(self):
@@ -613,6 +643,47 @@ def entities_from_answer(index, numbered, offset=0):
         if ents:
             out[_chunk_key(index.chunks[i])] = sorted(set(ents))
     return out
+
+
+def query_miss_rate(index, query):
+    """查询里有多少比例的词，在这个记忆库里从未出现过（去重 token 中 df==0 的占比）。
+
+    零依赖，只用现成的 BM25 文档频次。返回 0.0~1.0；查询切不出 token 时返回 1.0
+    （切不出词＝没有任何可对照的信号，按"完全陌生"处理，偏保守）。
+
+    **这是标注用的信号，不是门槛**——理由见 MISS_RATE_FLAG 的注释。调用方拿它
+    生成一句可核对的话给模型，不拿它拒绝返回结果。"""
+    tokens = set(tokenize(query))
+    if not tokens:
+        return 1.0
+    docs = getattr(index, "_bm25", None)
+    if docs is None:
+        return 1.0
+    df = index._df_cache
+    missing = sum(1 for t in tokens if df.get(t, 0) == 0)
+    return missing / len(tokens)
+
+
+def miss_rate_note(rate, threshold=None):
+    """把缺失率变成一句**可核对**的标注（模型能自己对着查询复核这句话对不对）。
+    低于阈值返回 None——不给噪声。"""
+    threshold = MISS_RATE_FLAG if threshold is None else threshold
+    if rate < threshold:
+        return None
+    return (f"【核对提示】这次查询里约 {rate:.0%} 的词在这个记忆库里从未出现过。"
+            f"这**不代表**这件事一定没发生过——你用的词跟记录里的写法不一样时也会这样"
+            f"（尤其是问'她最近在焦虑什么'这类归纳性问题）。"
+            f"但如果下面这些片段跟你问的对不上，**优先考虑库里确实没记过这件事**，"
+            f"如实说没找到，不要拿沾边的记录去圆。")
+
+
+def annotate_block(block, rate, threshold=None):
+    """把检索结果块与缺失率标注拼在一起。**拼接这一步也放在库里，不放 MCP 外壳**——
+    外壳的硬性约束是"返回值逐字等于底层库函数的返回值"，让它自己拼字符串就等于
+    在适配层里长逻辑，真机出问题时又分不清是谁的锅了（同 mcp_server 顶部那条纪律）。
+    低于阈值时原样返回，不加噪声。"""
+    note = miss_rate_note(rate, threshold)
+    return block + ("\n" + note if note else "")
 
 
 def _chunk_key(text):
@@ -1109,6 +1180,28 @@ def _selftest(embed=False):
         "零依赖路径不该有数值门槛——bigram 余弦是另一套标度，套上会掐死向量路"
     assert MemoryIndex(embed=True).vec_floor == EMBED_HIT_FLOOR, \
         "真 embedding 路径必须带数值门槛，否则 absent 类的正确空手率会归零"
+
+    # 14c.【缺失率标注：**只标注、不硬拒**】这是本信号的核心纪律——它的误杀全部
+    #      落在"抽象归纳式提问"那一档（陪伴场景最有价值的一类），拿它去拒绝返回
+    #      等于专门惩罚最该被答好的问题。所以断言两件事：标注该出现时出现；
+    #      **出现与否都不改变 retrieve 返回什么**
+    idx14c = _build_synth(embed=embed)
+    low = query_miss_rate(idx14c, "咖啡机 保险丝")
+    high = query_miss_rate(idx14c, "量子对撞机的运行日志")
+    assert low < high, f"库里有的词该比库里没有的词缺失率低（{low:.2f} vs {high:.2f}）"
+    assert miss_rate_note(high) and "核对提示" in miss_rate_note(high), "高缺失率该给标注"
+    assert miss_rate_note(0.0) is None, "低缺失率不该加噪声"
+    #      标注里必须留一句"这不代表一定没发生"——信号是专名缺席检测器，
+    #      不是事件存在性检测器，措辞不许把它说成后者
+    assert "不代表" in miss_rate_note(high), \
+        "标注必须写明高缺失率≠这件事没发生（它只是专名缺席检测器），否则会诱导模型误判"
+    #      不硬拒：同一个查询，检索结果与标注无关
+    r_before = [x["id"] for x in _build_synth(embed=embed).retrieve("量子对撞机的运行日志", topN=5)]
+    r_after = [x["id"] for x in _build_synth(embed=embed).retrieve("量子对撞机的运行日志", topN=5)]
+    assert r_before == r_after, "缺失率标注不该改变检索返回什么（只标注、不硬拒）"
+    #      拼接放在库里（外壳不许自拼，见 mcp_server 薄适配层纪律）
+    assert annotate_block("正文", 0.0) == "正文", "低缺失率原样返回"
+    assert annotate_block("正文", high).startswith("正文\n"), "高缺失率把标注追加在后面"
 
     # 15.【可靠命中门槛靶心（2026.07.31 验收反馈；变异：去掉 scored_ok 过滤必红）】
     #     词面/语义都零信号的 query → 空手而归，且一个块都不加权——不设门槛的话

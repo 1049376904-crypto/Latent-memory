@@ -98,7 +98,8 @@
 
 import argparse
 
-from memory_retrieval import MemoryIndex, _chunk_key, tokenize
+from memory_retrieval import (MemoryIndex, _chunk_key, tokenize,
+                              query_miss_rate, MISS_RATE_FLAG)
 
 # ---------- 合成语料（全部虚构；结构仿真实：多窗口、跨月、双层） ----------
 #
@@ -212,6 +213,51 @@ HELDOUT_CASES = [
     ("absent_日常", "那天下大雨我们困在路上的事", []),
     ("absent_日常", "我们一起养的那只狗叫什么来着", []),
 ]
+
+# ---------- present 查询的第二条轴：具名式 / 归纳式（2026.08.01，第二份外部反馈建议） ----------
+#
+# 现有的 literal/paraphrase/linked 分类是**按机制**分的（考哪一路）。测试者的标定
+# 数据显示还有一条**按提问方式**的轴，而且它决定缺失率信号的成色：
+#     具名式（问里带专名/原话）  真实语料上缺失率中位 4.2%~14.6%
+#     归纳式（用自己的抽象词汇问）真实语料上缺失率中位 23.1%
+# **缺失率信号的误杀全部落在归纳式这一档**——用户拿抽象词汇问语料里用具体叙事写的
+# 事，词面天然不重合，而这恰是陪伴场景最有价值的一类提问。所以两档必须分开记账：
+# 合成一个平均数会把"我们专门坑了最该答好的那类问题"这件事盖掉。
+#
+# 这是**记账**不是守门：不为它设基线断言（我们的合成语料词汇窄，缺失率整体虚高，
+# 见伪影⑤；阈值标定归外部真实语料）。`--report` 打出来给人看。
+ABSTRACT_QUERIES = {
+    "厨房采光怎么样", "她那阵子很晚回家", "阳台上种的那盆草为什么没活",
+    "那本小说的叙事结构", "她加班那个项目最后怎么样了", "项目交付之后她怎么休息的",
+    "她终于能好好休息了吗", "两盆植物现在的状态",
+}
+
+
+def query_style(q):
+    """具名式 / 归纳式。判据就一条：问句里带不带语料中的专名或原话片段。"""
+    return "归纳式" if q in ABSTRACT_QUERIES else "具名式"
+
+
+def miss_rate_table(scale="established"):
+    """缺失率分档记账：四档各自的缺失率分布与触发标注的比例。
+    **不是守门，是记账**——数字给人看，别拿它当断言。"""
+    idx = build_index(scale=scale)
+    buckets = {}
+    for kind, q, _ in CASES + HELDOUT_CASES:
+        if kind.startswith("absent"):
+            tag = kind
+        else:
+            tag = f"present·{query_style(q)}"
+        buckets.setdefault(tag, []).append(query_miss_rate(idx, q))
+    rows = []
+    for tag in ("present·具名式", "present·归纳式", "absent_日常", "absent_远主题"):
+        v = sorted(buckets.get(tag, []))
+        if not v:
+            continue
+        flagged = sum(1 for x in v if x >= MISS_RATE_FLAG)
+        rows.append((tag, len(v), v[0], v[len(v) // 2], v[-1], flagged / len(v)))
+    return rows
+
 
 # 实体标注（模拟用户跑过一次抽取任务书的结果）：把"望远镜"这条线的三块连起来，
 # 其中第 11 窗根本不含"望远镜"三个字，纯靠实体边
@@ -426,6 +472,15 @@ def report():
                                               cases=HELDOUT_CASES)).strip().replace("\n", "  "))
     print()
 
+    print("【缺失率分档记账】（记账不守门；阈值 %.0f%% 由外部真实语料标定，"
+          "我们的合成语料词汇窄、整体虚高，见伪影⑤）" % (MISS_RATE_FLAG * 100))
+    print(f"  {'档':<16}{'n':>3}  {'最低':>6}{'中位':>7}{'最高':>7}   触发标注")
+    for scale in ("cold", "established"):
+        print(f"  —— {scale} ——")
+        for tag, n, lo, mid, hi, fr in miss_rate_table(scale):
+            print(f"  {tag:<16}{n:>3}  {lo:>6.0%}{mid:>7.0%}{hi:>7.0%}   {fr:>7.0%}")
+    print()
+
     # 分层消融：每次只关掉一路，看分数掉多少 —— 这就是"量得出各层贡献"
     print("\n【分层消融】关掉某一路后的变化（跑的是真实 retrieve 路径，不是脚本自拼）")
     full = {"bm25", "vector", "graph", "weight"}
@@ -570,6 +625,19 @@ def _selftest():
             f"这条编造查询在朴素闸（bm25>0）下就没有候选，说明它是'外星'风格、" \
             f"测不出真实威胁，不该算进 absent_日常：{q!r}"
 
+    # 5e.【缺失率信号的**方向**成立——只守方向，不守标度】
+    #     我们的合成语料词汇窄，缺失率绝对值整体虚高（伪影⑤），35% 阈值在这里几乎
+    #     全触发，**所以不拿标度做断言**（阈值标定归外部真实语料，任务卡 4' 已降级）。
+    #     但排序必须成立，否则说明信号本身坏了：
+    #         present·具名式 < present·归纳式 < absent_日常
+    #     真实语料实测同序（4.2%/14.6% < 23.1% < 47.7%），这条是它在我们这边的回归锚。
+    rows = {r[0]: r[3] for r in miss_rate_table("established")}   # tag -> 中位
+    assert rows["present·具名式"] < rows["absent_日常"], \
+        f"缺失率信号方向坏了：具名式提问 {rows['present·具名式']:.0%} 不该 ≥ " \
+        f"编造查询 {rows['absent_日常']:.0%}"
+    assert rows["present·具名式"] <= rows["present·归纳式"], \
+        "归纳式提问的缺失率该不低于具名式——这是'误杀集中在归纳式'那条结论的前提"
+
     # 6.【语料代表性三道闸——今晚三个伪影各对应一条】
     #    这三条守的不是检索层，是**这把尺子本身准不准**。今晚三轮返工的教训：
     #    断言写错了会红，**语料不真实什么都不会红，只会给出很像回事的错误结论**。
@@ -605,7 +673,7 @@ def _selftest():
         f"established 档规模不足，量出来的'图谱连不上'会是规模伪影而不是机制缺陷"
 
     print(f"selftest ok（回归集：{len(idx.chunks)} 块语料 / {len(CASES)} 条查询，"
-          f"11 项断言：两档不低于基线 / 门槛没松 / 实体槽增益状态 / 消融走真实路径 / 更正闭环 / embed门槛 / absent日常成色 / 留出集纪律 / 语料代表性三道闸）")
+          f"12 项断言：两档不低于基线 / 门槛没松 / 实体槽增益状态 / 消融走真实路径 / 更正闭环 / embed门槛 / absent日常成色 / 缺失率方向 / 留出集纪律 / 语料代表性三道闸）")
 
 
 if __name__ == "__main__":

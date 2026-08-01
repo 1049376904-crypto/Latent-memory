@@ -44,6 +44,7 @@ from pathlib import Path
 # 同目录模块，import 不触发各自的 CLI
 from memory_retrieval import (MemoryIndex, load_corpus, append_record,
                               query_miss_rate, miss_rate_note, annotate_block)
+from embedding_provider import resolve_provider
 from session_recall import SessionRecall, format_recall_block, SELF_CHECK_FOOTER  # noqa: F401
 from session_thread import ThreadStore, close_thread
 
@@ -684,13 +685,21 @@ if __name__ == "__main__":
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--corpus", help="md 语料目录")
     ap.add_argument("--threads", help="会话线索 jsonl 路径（省略则内存态）")
-    ap.add_argument("--embed", action="store_true", help="用真 embedding（需 fastembed）")
+    ap.add_argument("--embed", action="store_true", help="用真 embedding")
+    ap.add_argument("--embed-provider", dest="embed_provider",
+                    help="embedding 提供方：local（默认，需 fastembed）/ local:<模型> / "
+                         "cloud（云端 HTTP，endpoint 与模型走 MEMORY_EMBED_* 环境变量，"
+                         "key 只从环境变量读；**语料会发到那家服务商**）")
     args = ap.parse_args()
     if args.selftest:
         _selftest()
     elif args.corpus:
         # 权重文件放语料目录下，起点号不带 .md——不会被 load_corpus 当语料吃进去
-        MemoryServer(index=load_corpus(args.corpus, embed=args.embed),
+        # 块向量缓存（.embed_cache.json）同理，由 load_corpus 默认落在这里：
+        # 没有它，云端档每次起服务都要把全库重算一遍
+        MemoryServer(index=load_corpus(args.corpus, embed=args.embed,
+                                       provider=(resolve_provider(args.embed_provider)
+                                                 if args.embed else None)),
                      thread_store=ThreadStore(args.threads),
                      corpus_dir=args.corpus,
                      weights_path=Path(args.corpus) / ".weights.json",

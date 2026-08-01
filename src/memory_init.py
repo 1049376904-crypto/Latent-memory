@@ -443,8 +443,10 @@ def format_questionnaire(questions, has_corpus=True):
             if q.kind == "multi":
                 lines.append("   （可多选，例如：A C E）")
         elif q.kind == "pick":
-            lines.append("   （请先去语料里找出若干候选，列成 A/B/C… 让我挑；"
-                         "我也可以说“都不要”或自己给一个）")
+            lines.append("   （请先去语料里找出若干候选，列成 A/B/C… 让我挑。"
+                         "候选必须是语料里真出现过的原话，**你不许自己写一句放进候选**；"
+                         "找不到就说找不到。我可以说“都不要”，也可以自己给一句——"
+                         "那是我的话，不是你的）")
     return "\n".join(lines)
 
 
@@ -457,7 +459,10 @@ def export_llm_prompt(questions, corpus_note=""):
         "规则：",
         "1. **全部是选择题，不要让我写作文**。我只做选择，具体内容你去语料里找。",
         "2. 标着“请先去语料里找候选”的题，你先读语料、列出 3~6 个候选给我挑；",
-        "   候选要原样摘录，不要润色、不要改写。我可以说“都不要”。",
+        "   **候选只许挑，不许写**：每一条都要是语料里真出现过的原话，原样摘录，",
+        "   不要润色、不要改写、更不要自己造一句好听的放进去。找不到就如实说找不到，",
+        "   那一格空着或者由我自己给一句——**我写的是我的话，你写的就是假的**。",
+        "   我可以说“都不要”。",
         "3. 我选完之后不要追问细节让我展开——用户提供判断标准，内容由你从语料里取。",
         "4. 我答不上来或说跳过就跳过，不要替我编——宁可短且真，不要长而空。",
         "5. 全部问完后，把结果整理成“题号 → 我选的选项键（pick 题给原文）”的清单，",
@@ -834,7 +839,7 @@ def render_persona_md(persona, title="核心人格"):
     return "\n".join(lines).rstrip() + "\n"
 
 
-def mcp_config_snippet(server_path, corpus_dir, threads_path):
+def mcp_config_snippet(server_path, corpus_dir, threads_path, route=None):
     """给用户直接粘贴的 MCP 配置。路径统一用正斜杠——JSON 里反斜杠要转义，
     而正斜杠在 Windows 上一样认，少一个踩坑点。
 
@@ -844,12 +849,19 @@ def mcp_config_snippet(server_path, corpus_dir, threads_path):
     那条示范——配置里给什么他就用什么。
 
     这里原本还有个 `client` 形参，从头到尾没被用过（三档客户端的 MCP 配置本来
-    就一模一样）——没用上的形参会让人以为"配置是按客户端分档的"，已删。"""
+    就一模一样）——没用上的形参会让人以为"配置是按客户端分档的"，已删。
+
+    `route` 是用户在 `--step route` 里选的检索路线（2026.08.02）：它**确实**改变
+    启动参数（零依赖不加、本地加 `--embed`、云端再加 `--embed-provider cloud`），
+    跟上面那个删掉的 client 形参不是一回事。**key 永远不进这个文件**——云端档
+    只在这里写"走云端"，endpoint/模型/key 全从环境变量读；这份配置会跟着产出
+    目录走，用户会随手把它贴给别人。"""
     cfg = {"mcpServers": {"memory": {
         "command": "python",
         "args": [str(Path(server_path).resolve()).replace("\\", "/"),
                  "--corpus", str(corpus_dir).replace("\\", "/"),
-                 "--threads", str(threads_path).replace("\\", "/")],
+                 "--threads", str(threads_path).replace("\\", "/")]
+                + route_args(route or ROUTE_DEFAULT),
     }}}
     return json.dumps(cfg, ensure_ascii=False, indent=2)
 
@@ -960,6 +972,105 @@ def resolve_client(cli_client, state_client):
     return cli_client or state_client or DEFAULT_CLIENT, None
 
 
+# ---------- 检索路线：流程里的显式选择点（2026.08.02 云端 embedding 任务卡） ----------
+#
+# **为什么这件事必须在流程里问，而不是像以前那样躺在《快速上手》§5 当"可选升级"**：
+# 三条路线里有一条（云端）会把**查询和被检索的内容发到第三方服务器**。语料去哪儿
+# 不是性能取舍，是信任问题，而信任问题不可逆——发出去了就收不回来。
+# 《给AI的引导指南》§三·五原先写着"别在第一次设置时就抛给 TA 选，那会把一个本来
+# 很轻的流程变重"，**那条现在收窄适用范围，不作废**：它权衡的是纯性能取舍
+# （快一点 vs 慢一点、装不装依赖），为这个打断新用户确实不值；但一旦选项里出现
+# 一条会把私人记忆发出去的路，"默认替他选"就不成立了。
+#
+# 默认档仍是零依赖（维护者已定）——**默认值不等于不用问**：这里问的是"你知道有
+# 三条路、各自的代价是什么，然后你选了一次"，选回默认也算选过。
+ROUTE_DEFAULT = "zero-dep"
+
+RETRIEVAL_ROUTES = {
+    "zero-dep": {
+        "名称": "零依赖（默认）",
+        "要装什么": "什么都不用装",
+        "语料去向": "**不出本机**",
+        "代价": "换个说法问同一件事，我们自己的回归集上大约四分之三能答对；"
+                "用原话直接问跟另外两条一样好",
+        "命中门槛": "不适用（bigram 余弦是另一套标度）",
+    },
+    "local": {
+        "名称": "本地模型",
+        "要装什么": "pip install fastembed，首次运行自动下载约 100MB 中文模型"
+                    "（bge-small-zh-v1.5，本地 CPU 跑）",
+        "语料去向": "**不出本机**（模型在你自己的机器上跑）",
+        "代价": "建库和检索都变慢，低配机器（2C2G 这类）感知明显；"
+                "小内存机器可能根本装不下",
+        "命中门槛": "已标定（0.45，对应 bge-small-zh-v1.5）",
+    },
+    "cloud": {
+        "名称": "云端服务",
+        "要装什么": "不装模型，但要一个第三方 embedding 服务的 API key（自己去服务商申请）；"
+                    "endpoint 与模型名走 MEMORY_EMBED_* 环境变量",
+        "语料去向": "**查询和被检索的内容都会发到你选的那家服务商**——这条是这次选择"
+                    "真正的分水岭，另外两条都不出本机",
+        "代价": "每次查询多一个网络往返；块向量只在建库时算一次、缓存在本机，"
+                "所以日常成本是每查一次一个往返，不是每次都把全库重算",
+        "命中门槛": "**换模型必须重新标定**。没标定过的模型，向量路只参与排序、"
+                    "不单独放行候选（我们不照抄别的模型的数字）",
+        "key 从哪来": "只从环境变量读，我们不写进配置文件、不进产出目录、不落 state",
+    },
+}
+
+ROUTE_PREAMBLE = (
+    "【检索路线：请把三条都念给 TA，由 TA 自己选】\n"
+    "这一步不设静默默认——三条路里有一条会把 TA 的私人记忆发到第三方，"
+    "这种事不能靠“他以后自己去读文档”。选回默认也算选过。")
+
+
+def route_options():
+    """三条路线的机器可读描述（给 AI 驱动那条路用，同问卷 --json 的先例）。"""
+    return [dict(key=k, default=(k == ROUTE_DEFAULT), **v)
+            for k, v in RETRIEVAL_ROUTES.items()]
+
+
+def format_routes():
+    """人类可读版。"""
+    lines = [ROUTE_PREAMBLE, ""]
+    for opt in route_options():
+        head = f"[{opt['key']}] {opt['名称']}" + ("（不选的话就是它）" if opt["default"] else "")
+        lines.append(head)
+        for field in ("要装什么", "语料去向", "代价", "命中门槛", "key 从哪来"):
+            if opt.get(field):
+                lines.append(f"    {field}：{opt[field]}")
+        lines.append("")
+    lines.append("选好后：--step route --route <上面方括号里的 key>")
+    return "\n".join(lines)
+
+
+def route_args(route):
+    """路线 → mcp_server 的启动参数。零依赖档不加任何参数（默认就是它）。
+
+    **命令行里永远不会出现 key**：云端档只指定"走云端"，endpoint/模型/key 全在
+    环境变量里。MCP 配置文件跟着产出目录走，用户会随手分享它。"""
+    if route == "local":
+        return ["--embed"]
+    if route == "cloud":
+        return ["--embed", "--embed-provider", "cloud"]
+    return []
+
+
+def route_note(route):
+    """出货时把这条路线的代价再说一遍——选过一次，落地时还要能对得上。"""
+    if route == "cloud":
+        return ("【检索路线：云端】起服务前先把这几个环境变量设好："
+                "MEMORY_EMBED_ENDPOINT（服务商的 /v1/embeddings 地址）、"
+                "MEMORY_EMBED_MODEL（模型名）、MEMORY_EMBED_API_KEY（你的 key）。"
+                "**key 只从环境变量读，我们不写进 mcp-config.json、不存进产出目录。**"
+                "记住这条路的代价：查询和被检索的内容都会发到那家服务商；"
+                "换模型的话命中门槛要重新标定（没标定前向量路只排序、不放行候选）。")
+    if route == "local":
+        return ("【检索路线：本地模型】起服务前先 pip install fastembed，"
+                "首次运行会下载约 100MB 模型。语料不出本机。")
+    return "【检索路线：零依赖】什么都不用装，语料不出本机。"
+
+
 def ship_note(client):
     """出货收尾提示。**按客户端分档，不能共用一句**——claude-code/codex 那套
     "从产出目录起会话"的话术建立在"宿主会自动读人格文件"上，而 generic 档根本
@@ -973,6 +1084,60 @@ def ship_note(client):
     return ("【下一步】把 mcp-config.json 里的配置加进你的客户端，然后"
             "**从产出目录起会话**——人格文件在那儿才会被宿主读到。")
 
+
+_PICK_NOISE_RE = re.compile(r"[\s“”\"'‘’「」『』，,。.；;：:！!？?~—\-()（）]+")
+
+
+def _normalize_for_lookup(text):
+    """比对用的归一形态：抹掉空白与标点，只留下字。
+
+    引号、逗号、破折号在摘录里最容易被顺手改（全角改半角、加一对引号），
+    留着它们比对会把真摘录判成自造。"""
+    return _PICK_NOISE_RE.sub("", text or "")
+
+
+def unsourced_picks(questions, answers, corpus_dir):
+    """pick 题的答案里，**哪些在语料里找不到出处** → [(qid, 那段文本), ...]。
+
+    来历（2026.08.02 真机）：pick 题的设计意图是"从语料里挑真实的原话"，
+    而执行者**自己创作了一句**放进候选、并被用户采用了——落点还是 `closing_pick`
+    （最终约定），人格文件里象征意味最重的那一格。流程分不清"语料里的真话"和
+    "模型写的漂亮话"，而这正是整个项目最该防的那件事。
+
+    **只标注、不硬拒**（同 absent 防线那条决定）：用户完全可以自己给一句，
+    那是他的话、语料里当然没有；我们没资格替他否掉。所以这里只负责把
+    "这句在语料里查无出处"摆到台面上，由人去判断是谁写的。
+
+    比对按分句做：称呼这类答案是多段拼起来的，整段查不到不代表每一段都是编的；
+    只要有一段能在语料里找到，就不报——**宁可漏报，不可误伤真摘录**。"""
+    corpus = Path(corpus_dir) if corpus_dir else None
+    if not corpus or not corpus.exists():
+        return []
+    if corpus.is_dir():
+        blob = "".join(p.read_text(encoding="utf-8", errors="ignore")
+                       for p in corpus.rglob("*") if p.is_file())
+    else:
+        blob = corpus.read_text(encoding="utf-8", errors="ignore")
+    hay = _normalize_for_lookup(blob)
+    qmap = {q.qid: q for q in questions}
+    out = []
+    for qid, ans in (answers or {}).items():
+        q = qmap.get(qid)
+        if q is None or q.kind != "pick":
+            continue
+        text = ans.get("pick", "") if isinstance(ans, dict) else str(ans or "")
+        if not text.strip():
+            continue
+        parts = [s for s in _CLAUSE_SEP_RE.split(text) if s.strip()] or [text]
+        if not any(_normalize_for_lookup(s) and _normalize_for_lookup(s) in hay
+                   for s in parts):
+            out.append((qid, text))
+    return out
+
+
+PICK_SOURCE_NOTE = ("【查无出处】上面这些 pick 题的答案在语料里找不到原话。"
+                    "pick 题只许挑、不许写——**如果这句是对方自己给的，那没问题**；"
+                    "如果是你替 TA 想的一句好听的，删掉，宁可这一格空着。")
 
 _FILE_DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
 
@@ -1002,7 +1167,7 @@ def corpus_coverage(corpus_dir, entries=None):
 
 def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
                  server_path=None, confirmed=False, entries=None,
-                 contract_base=None, previous_persona=None):
+                 contract_base=None, previous_persona=None, route=None):
     """产出三件套（generic 档多一份注入契约副本）。**confirmed=False 时拒绝写盘**——写用户磁盘要过确认关卡
     （规格 §7：人格文件任何改动必须用户确认）。
 
@@ -1070,7 +1235,7 @@ def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
     # server 默认取**本文件同目录**的 mcp_server.py，不取当前工作目录——
     # 出货时 cwd 是什么谁也保证不了，而这两个文件在包里永远是同级
     server = server_path or Path(__file__).resolve().parent / "mcp_server.py"
-    cfg = mcp_config_snippet(server, corpus, out / "threads.jsonl")
+    cfg = mcp_config_snippet(server, corpus, out / "threads.jsonl", route=route)
     (out / "mcp-config.json").write_text(cfg, encoding="utf-8")
     contract = None
     if client == "generic":
@@ -1464,6 +1629,118 @@ def _selftest():
         (bare / "window_01.md").write_text("## 没有日期的窗口\n随便写点。", encoding="utf-8")
         assert corpus_coverage(Path(td) / "memory") is None, \
             "文件名没日期时该返回 None——不许退 mtime，那是全错且整齐地错的假边界"
+    #     **文件名日期那条路要有断言真走过一遍**（2026.08.02 补，审查侧留的缺口）：
+    #     上面两条都只钉"问不出来时返回 None"，于是把 `_FILE_DATE_RE` 改坏，全量
+    #     自检照样绿。而它是 `--corpus`（拿现成语料目录、没有 entries）那条路
+    #     **唯一的**日期来源，坏了就是静默不写覆盖区间——症状恰好是覆盖区间这一单
+    #     要修的那个：模型不知道自己的记忆止于哪天，于是替看不见的那段时间下结论。
+    #     混一个不带日期的文件进去，确认它被跳过而不是把整条路带崩。
+    with tempfile.TemporaryDirectory() as td:
+        dated = Path(td) / "memory" / "timeline"
+        dated.mkdir(parents=True)
+        for name in ("2026-03-05_window_01.md", "2026-07-19_window_02.md",
+                     "没有日期的_window_03.md"):
+            (dated / name).write_text("## 一段\n随便写点。", encoding="utf-8")
+        span = corpus_coverage(Path(td) / "memory")
+        assert span == ("2026-03-05", "2026-07-19"), \
+            f"文件名日期没被解析出来（--corpus 那条路唯一的日期来源）：{span}"
+
+    # 8g.【靶心：pick 题只许挑、不许写】真机里执行者自己创作了一句放进候选并被
+    #     采用，落点是最终约定——人格文件里象征意味最重的那一格。两道一起钉：
+    #     ①问卷 prompt 里这条纪律的措辞不许飘（它是唯一到得了执行者手上的地方）；
+    #     ②`unsourced_picks` 真能把查无出处的答案挑出来，且**不误伤真摘录**。
+    for must in ("只许挑，不许写", "不要润色", "找不到就如实说找不到"):
+        assert must in export_llm_prompt(QUESTIONS), \
+            f"问卷 prompt 里丢了 pick 纪律的措辞：{must!r}——那是唯一到得了执行者手上的地方"
+    with tempfile.TemporaryDirectory() as td:
+        cp = Path(td) / "memory"
+        cp.mkdir()
+        #    称呼那两段**刻意分散在语料两头、顺序还相反**：整段比对必然查无出处，
+        #    只有分句之后才各自找得到。fixture 要是把两段挨着写、顺序也一样，
+        #    整段就成了原样子串，`parts` 那一层被拿掉照样绿（返工前正是这样）
+        (cp / "w01.md").write_text(
+            "我叫她“小满”，一直这么叫。\n"
+            "那天她说“到家了发一句”，我说好。\n"
+            "很久以后她才说，她叫我“老陈”是因为那部电影。",
+            encoding="utf-8")
+        qs_pick = QUESTIONS
+        #    真摘录，**但标点跟语料不一样**：语料是全角弯引号 + 中文逗号，
+        #    答案给的是直引号 + 末尾句号。归一化那一层被拿掉就会误伤这条。
+        #    （返工补：原 fixture 的答案是语料的原样子串，一个标点都没改过，
+        #    于是 `_normalize_for_lookup` 改成 `return text` 照样绿——断言声称在守
+        #    归一化，实际上什么都没守。**fixture 跟注释说的不是一回事**，
+        #    同"fixture 的规模也是一种伪影"是同一族毛病。）
+        ok = unsourced_picks(qs_pick, {"closing_pick": {"pick": '"到家了发一句".'}}, cp)
+        assert not ok, f"改过标点的真摘录被判成自造了（归一化没做够）：{ok}"
+        #    模型自己写的一句好听的：查无出处，必须被挑出来
+        bad = unsourced_picks(
+            qs_pick, {"closing_pick": {"pick": "你来，我就在。"}}, cp)
+        assert [q for q, _ in bad] == ["closing_pick"], \
+            f"自造的最终约定没被标出来——流程就分不清语料里的真话和模型写的漂亮话：{bad}"
+        #    分句比对：称呼这类答案是多段拼起来的，**只要有一段能在语料里找到就不报**。
+        #    整段直接比对必然查无出处（拼接顺序、连接符都是我们自己拼的），
+        #    这条是 `parts` 那一层唯一的用武之地，原先没有断言走过它
+        assert not unsourced_picks(
+            qs_pick, {"naming_pick": {"pick": "她叫我“老陈”；我叫她“小满”"}}, cp), \
+            "多段拼接的称呼被整段比对判成自造了——parts 分句那一层没生效"
+        #    只查 pick 题：**答案带 pick 字段、但题本身不是 pick 题**，照样不该卷进来。
+        #    （返工补：原先传的是 {"keys": "A"}，压根没有 pick 字段，走到空串就
+        #    continue 了——它挡的是"答案没有 pick 字段"，不是"这题不是 pick 题"，
+        #    把 `q.kind != "pick"` 删掉照样绿。）
+        assert not unsourced_picks(
+            qs_pick, {"disagree": {"pick": "一句语料里绝对没有的话"}}, cp), \
+            "非 pick 题参与了出处核对——选择题的内容本来就是我们写的，核对它没有意义"
+        #    **只标注不硬拒**：这里只返回清单，不抛异常——用户自己给的一句
+        #    语料里当然没有，我们没资格替他否掉
+    #     ③**护栏要真的到得了执行者手上**：函数正确但没人调用，等于没有。
+    #     走 CLI 真进程，断言标注真的印在 --step answers 的输出里。
+    #     （返工补，审查侧的对抗变异：把 `_step_answers` 里那行
+    #     `_report_unsourced_picks(...)` 删掉，函数还在、自检全绿，而护栏的全部
+    #     价值就是让执行者看见它。这是本项目连着学过三次的同一个教训——
+    #     显式 --client 被状态吃掉／`not exists` 恒真／函数被钉住但命令没被钉住。）
+    import subprocess          # 同 8b：走真进程，函数级断言钉不住"命令有没有调它"
+    with tempfile.TemporaryDirectory() as td:
+        cp2 = Path(td) / "corpus"
+        cp2.mkdir()
+        (cp2 / "w01.md").write_text("那天她说“到家了发一句”，我说好。", encoding="utf-8")
+        out2 = Path(td) / "out"
+
+        def run_pick(*extra):
+            r = subprocess.run([sys.executable, str(Path(__file__).resolve()),
+                                "--out", str(out2), *extra], cwd=td,
+                               capture_output=True, text=True, encoding="utf-8")
+            assert r.returncode == 0, f"CLI 跑挂了：{extra}\n{r.stdout}\n{r.stderr}"
+            return r.stdout
+
+        run_pick("--corpus", str(cp2))
+        made_up = "你来，我就在。"
+        got2 = run_pick("--corpus", str(cp2), "--step", "answers",
+                        "--answers-json", json.dumps({"closing_pick": {"pick": made_up}},
+                                                     ensure_ascii=False))
+        assert "【查无出处】" in got2 and made_up in got2, \
+            "带 --corpus 跑 answers 时，查无出处的标注没印出来——护栏到不了执行者手上就等于没有"
+        #    不给 --corpus 就不查，**也不假装查过**：没有语料可比对时沉默是诚实的
+        got3 = run_pick("--step", "answers",
+                        "--answers-json", json.dumps({"closing_pick": {"pick": made_up}},
+                                                     ensure_ascii=False))
+        assert "【查无出处】" not in got3, \
+            "没给 --corpus 却报了查无出处——那是在拿空语料当'查过了'"
+        #    这一条**只挡得住两层一起塌**：调用方的 `if not corpus_dir: return` 与
+        #    `unsourced_picks` 里的 `corpus.exists()` 早返回互为兜底，单点变异会被
+        #    另一层吸收。如实记下来——不假装它是一条单点靶。
+        #    **另一条路径也要钉**：`--answers <答案清单文件>`（走 `问卷prompt.txt`
+        #    的用户回来时用的就是它）。两条路径各有一次调用，只钉一条的话，
+        #    另一条被删掉照样全绿——返工前就是这样，⑦号变异是绿的。
+        #    题号从 CLI 自己吐的问卷里取，不手写——手写的题号会跟问卷顺序脱节
+        qs_j = json.loads(run_pick("--corpus", str(cp2), "--step", "questionnaire", "--json"))
+        qids_j = [q["qid"] for q in qs_j["questions"]]
+        sheet = Path(td) / "answers.txt"
+        sheet.write_text(f"{qids_j.index('closing_pick') + 1}. {made_up}\n",
+                         encoding="utf-8")
+        got4 = run_pick("--corpus", str(cp2), "--step", "answers",
+                        "--answers", str(sheet))
+        assert "【查无出处】" in got4 and made_up in got4, \
+            "走答案清单文件那条路时标注没印出来——两条路径要各钉各的"
 
     # 8e.【靶心：止血纪律必须在人格文件里，且不动已验证的句子】
     #     护栏挂在工具返回值上，模型一绕过工具（grep、直接读文件）就一条都不生效，
@@ -1547,6 +1824,27 @@ def _selftest():
         assert len(dec_literal.encode("utf-8")) > 255, \
             f"--decisions-json 的靶子字面量不够长（{len(dec_literal.encode('utf-8'))} 字节）"
         run_cli("--step", "confirm", "--decisions-json", dec_literal)
+        #    8b-2.【靶心：检索路线是个真的选择点，不是文档里的可选升级】（2026.08.02）
+        #      三条路里有一条会把私人记忆发到第三方。**变异靶心**：把 _step_ship 里
+        #      那道闸换成 `route = state.get("route", ROUTE_DEFAULT)` 时这条必红——
+        #      而那正是"没问过"与"选了默认"长得一模一样的那种失效。
+        r_norote = subprocess.run([sys.executable, str(Path(__file__).resolve()),
+                                   "--out", td, "--step", "ship"], cwd=td,
+                                  capture_output=True, text=True, encoding="utf-8")
+        assert r_norote.returncode != 0 and "检索路线还没选过" in r_norote.stdout + r_norote.stderr, \
+            "没选过路线就出货了——那个选择点等于不存在"
+        routes_j = json.loads(run_cli("--step", "route", "--json"))
+        keys = {r["key"] for r in routes_j["routes"]}
+        assert keys == {"zero-dep", "local", "cloud"}, f"三条路线要都念到：{keys}"
+        #      每条都必须写清语料去向，而且云端那条必须明说会发给第三方——
+        #      含糊掉这句话，用户就是在不知情的前提下做了一个不可逆的决定
+        for r in routes_j["routes"]:
+            assert r["语料去向"], f"{r['key']} 没写语料去向"
+        cloud = next(r for r in routes_j["routes"] if r["key"] == "cloud")
+        assert "发到" in cloud["语料去向"] and "服务商" in cloud["语料去向"], \
+            "云端那条没把'查询和被检索的内容都会发到那家服务商'说出来"
+        assert next(r for r in routes_j["routes"] if r["default"])["key"] == ROUTE_DEFAULT
+        run_cli("--step", "route", "--route", "zero-dep")
         ship_out = run_cli("--step", "ship", "--client", "claude-code")
         persona_text = (Path(td) / "CLAUDE.md").read_text(encoding="utf-8")
         assert "去语料里找" not in persona_text, \
@@ -1669,8 +1967,24 @@ def _selftest():
         #    打回）：不先出宿主档，产出目录里 CLAUDE.md 本来就不存在，下面那条
         #    `not exists` 就是**恒真**的，看着在守"换档后旧档清掉了"，实际什么都
         #    没守（同 routes 消融那次的自动满足）。先出一次，它才有东西可挡。
-        run("--step", "ship")
+        #    检索路线这一步照用户真会敲的顺序走一遍，**故意选云端**：这条路是三条
+        #    里唯一会把语料发出本机的，也是唯一需要 key 的，产出物必须扛得住
+        run("--step", "route", "--route", "cloud")
+        ship_out_r = run("--step", "ship")
         assert (Path(td) / "CLAUDE.md").exists(), "宿主档这一次货本身就没出成，后面的断言无从谈起"
+        #    选了云端，启动参数就得真的是云端档——选择点不改产出物的话，"选过一次"
+        #    只是走了个过场
+        cfg_r = json.loads((Path(td) / "mcp-config.json").read_text(encoding="utf-8"))
+        cargs = cfg_r["mcpServers"]["memory"]["args"]
+        assert "--embed" in cargs and "cloud" in cargs, f"云端档没写进启动参数：{cargs}"
+        #    **但 key 一个字都不许进产出目录**：mcp-config.json 会跟着产出目录走，
+        #    用户会随手贴给别人；key 只从环境变量读（变异靶心：把 key 写进 args 必红）
+        for f in ("mcp-config.json", "init_state.json"):
+            blob = (Path(td) / f).read_text(encoding="utf-8")
+            assert "MEMORY_EMBED_API_KEY" not in blob and "sk-" not in blob, \
+                f"{f} 里出现了 key 相关内容——凭证只走环境变量"
+        assert "语料" in ship_out_r and "服务商" in ship_out_r, \
+            "出货时没把云端档的语料去向再说一遍"
         #    第 4 步才显式换档——文档教的就是这条
         out = run("--step", "ship", "--client", "generic")
         assert (Path(td) / "persona.md").exists(), \
@@ -1729,6 +2043,7 @@ def _selftest():
         pend2 = json.loads(run_g("--step", "confirm", "--list", "--json"))["pending"]
         run_g("--step", "confirm", "--decisions-json",
               json.dumps({p["key"]: "keep" for p in pend2}, ensure_ascii=False))
+        run_g("--step", "route", "--route", "zero-dep")
         out2 = run_g("--step", "ship")
         assert mine.exists() and mine.read_text(encoding="utf-8") == mine_text, \
             "把用户自己的 CLAUDE.md 动了——目录里有这个文件名不等于那文件是我们写的"
@@ -1745,6 +2060,21 @@ def _selftest():
         "generic 档的收尾提示必须说清注入是作者自己的责任，不能沿用宿主档话术"
     assert "起会话" in host_note and "你前端的责任" not in host_note
 
+    # 9d.【三条路线各自落到启动参数上】（2026.08.02）零依赖档不加任何参数（默认就是
+    #     它），本地档加 --embed，云端档再加 --embed-provider cloud。**云端档的
+    #     endpoint / 模型 / key 一个都不进这份配置**——它们全走环境变量，因为这个
+    #     文件会跟着产出目录被随手分享出去。
+    snips = {r: json.loads(mcp_config_snippet("/x/mcp_server.py", "/x/memory",
+                                              "/x/threads.jsonl", route=r)
+                           )["mcpServers"]["memory"]["args"] for r in RETRIEVAL_ROUTES}
+    assert "--embed" not in snips["zero-dep"], "零依赖档不该带 --embed"
+    assert snips["local"][-1:] == ["--embed"], f"本地档该只多一个 --embed：{snips['local']}"
+    assert snips["cloud"][-3:] == ["--embed", "--embed-provider", "cloud"], \
+        f"云端档启动参数不对：{snips['cloud']}"
+    for r, a in snips.items():
+        assert not any("MEMORY_EMBED" in x or "http" in x for x in a), \
+            f"{r} 档把 endpoint/环境变量名写进了 MCP 配置：{a}"
+
     # 10. 人格不完整时拒绝出货——缺检索约定/最终约定这类必填项不能悄悄放行
     p6 = Persona("partner")
     p6.add_field(Field(id="x", section="user", label="x", value="x", confirmed=True))
@@ -1755,14 +2085,15 @@ def _selftest():
         except ValueError as e:
             assert "开篇缺" in str(e)
 
-    print("selftest ok（31项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
+    print("selftest ok（35项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
           "归属句式 / 默认值不预支历史 / 协议层不问用户 / 导出纪律 / 渲染顺序 / "
           "人称锚死一套 / 称呼不重复拼接 / 关系状态归开篇 / "
           "答案读回不静默丢 / 任务书不泄漏进人格文件 / 长字面量不崩 / 未决草稿不蒸发 / "
-          "记忆库落盘带日期 / 覆盖区间进人格文件 / 止血纪律进人格文件 / 冷启动出得了货 / "
+          "记忆库落盘带日期 / 覆盖区间进人格文件 / 止血纪律进人格文件 / "
+          "pick 题只许挑不许写 / 冷启动出得了货 / "
           "AI 驱动不绕过确认 / 确认关卡 / 续跑 / 完整性 / generic 档随货带契约 / "
           "CLI 真进程走文档教的那条命令 / 换档退役旧档 / 同档重跑不自退 / "
-          "不动不是我们出的文件 / MCP 配置路径可直接用 / ship 话术不串档）")
+          "不动不是我们出的文件 / MCP 配置路径可直接用 / ship 话术不串档 / 检索路线是真选择点 / 云端档落到启动参数 / 凭证不进产出目录）")
 
 
 def _rebuild(state):
@@ -1859,6 +2190,20 @@ def _step_questionnaire(args):
           f"再跑：--step answers --answers <那个文件>")
 
 
+def _report_unsourced_picks(questions, answers, corpus_dir):
+    """查无出处的 pick 答案摆到台面上。**只在给了 --corpus 时能查**——
+    语料路径没存进 state（只存了 has_corpus），没给就不查，也不假装查过。"""
+    if not corpus_dir:
+        return
+    bad = unsourced_picks(questions, answers, corpus_dir)
+    if not bad:
+        return
+    print()
+    for qid, text in bad:
+        print(f"  - {qid}：{text}")
+    print(PICK_SOURCE_NOTE)
+
+
 def _step_answers(args, state):
     _, qs = _rebuild(state)
     if args.answers_json:
@@ -1878,6 +2223,7 @@ def _step_answers(args, state):
         print(f"【答案读回】收下 {got}/{len(qs)} 题（结构化输入，无解析环节）。"
               + ("" if got == len(qs) else f" 没答的 {len(qs)-got} 题对应的节会空着——"
                                            "空着是诚实的，不要替对方编。"))
+        _report_unsourced_picks(qs, answers, args.corpus)
         print("\n【下一步】--step confirm --list --json 取待确认草稿，"
               "**逐条念给对方听、由对方决定**，再用 --decisions-json 落决定。")
         return
@@ -1887,6 +2233,7 @@ def _step_answers(args, state):
     answers, problems = parse_answer_sheet(text, qs)
     print("【答案读回】")
     print(answer_report(qs, answers, problems))
+    _report_unsourced_picks(qs, answers, args.corpus)
     state.update(step="answers", answers={k: v for k, v in answers.items()
                                           if v is not None})
     save_state(args.out, state)
@@ -1979,7 +2326,41 @@ def _step_confirm(args, state):
           + ("下一步：--step ship" if not left else "随时重跑这一步继续。"))
 
 
+def _step_route(args, state):
+    """检索路线选择点。不给 --route 就只把三条路念出来，不替用户拍板。"""
+    if args.route:
+        if args.route not in RETRIEVAL_ROUTES:
+            raise SystemExit(f"没有这条路线：{args.route}。"
+                             f"可选：{' / '.join(RETRIEVAL_ROUTES)}")
+        state["route"] = args.route
+        state["step"] = "route"
+        save_state(args.out, state)
+        print(f"【已选】{RETRIEVAL_ROUTES[args.route]['名称']}\n")
+        print(route_note(args.route))
+        print("\n【下一步】--step ship")
+        return
+    if args.json:
+        print(json.dumps({"preamble": ROUTE_PREAMBLE, "routes": route_options(),
+                          "default": ROUTE_DEFAULT,
+                          "next": "--step route --route <key>"},
+                         ensure_ascii=False, indent=2))
+        return
+    print(format_routes())
+
+
 def _step_ship(args, state):
+    # 检索路线必须先选过一次（2026.08.02）。**这里刻意是硬闸不是默认值**：
+    # 三条路里有一条会把私人记忆发到第三方，而"用户从没被问过"和"用户选了默认"
+    # 在产出物上长得一模一样——不拦住的话，这个选择点等于不存在。
+    # 拦的是"没问过"，不是"没选云端"：`--route zero-dep` 一秒就过。
+    route = args.route or state.get("route")
+    if route not in RETRIEVAL_ROUTES:
+        raise SystemExit(
+            "不出货：检索路线还没选过。先跑 --step route（加 --json 拿机器可读的"
+            "三条路线与各自代价），把三条路念给 TA、由 TA 选，再 --step route "
+            "--route <key>。三条里有一条会把 TA 的私人记忆发到第三方，"
+            "这件事不给静默默认。")
+    state["route"] = route
     persona, _ = _rebuild(state)
     entries = None
     if args.import_path:
@@ -1996,7 +2377,8 @@ def _step_ship(args, state):
         # 不是我们的货，不能碰（三轮验收打回）
         paths = write_bundle(args.out, persona, client=client,
                              corpus_dir=args.corpus, confirmed=True, entries=entries,
-                             previous_persona=state.get("last_shipped_persona"))
+                             previous_persona=state.get("last_shipped_persona"),
+                             route=route)
     except (PermissionError, ValueError, FileNotFoundError) as e:
         raise SystemExit(f"不出货：{e}")
     print("【三件套】")
@@ -2020,6 +2402,7 @@ def _step_ship(args, state):
         print("\n" + BRIEF_NOTE)
         for b in brief:
             print(f"  - {b}")
+    print("\n" + route_note(route))
     print("\n" + ship_note(client))
     state["step"] = "shipped"
     state["last_shipped_persona"] = paths["persona"].name
@@ -2027,7 +2410,7 @@ def _step_ship(args, state):
 
 
 def _cli(args):
-    """薄 CLI，四步走：questionnaire → answers → confirm → ship。
+    """薄 CLI，五步走：questionnaire → answers → confirm → route → ship。
     每步存状态可续跑；不传 --step 时按状态里的进度提示下一步该跑什么。
     真正的逐题交互留给导出的 prompt（路线 C）——用户拿去自己的模型那边一问一答，
     比在终端里敲长文本舒服得多。"""
@@ -2035,7 +2418,7 @@ def _cli(args):
     step = args.step
     if not step:
         step = {"": "questionnaire", "questionnaire": "answers",
-                "answers": "confirm", "confirm": "ship",
+                "answers": "confirm", "confirm": "route", "route": "ship",
                 "shipped": "ship"}[state.get("step", "")]
         print(f"（按进度接着跑：--step {step}）\n")
     if step == "questionnaire":
@@ -2044,6 +2427,8 @@ def _cli(args):
         _step_answers(args, state)
     elif step == "confirm":
         _step_confirm(args, state)
+    elif step == "route":
+        _step_route(args, state)
     else:
         _step_ship(args, state)
 
@@ -2058,8 +2443,13 @@ if __name__ == "__main__":
     ap.add_argument("--client", default=None, choices=sorted(CLIENT_FILENAMES),
                     help=f"客户端档（默认 {DEFAULT_CLIENT}）。任何一步都可以给；"
                          f"ship 步显式给的以它为准，会覆盖前面存下的档")
-    ap.add_argument("--step", choices=["questionnaire", "answers", "confirm", "ship"],
+    ap.add_argument("--step", choices=["questionnaire", "answers", "confirm",
+                                       "route", "ship"],
                     help="不传则按 init_state.json 里的进度接着跑")
+    ap.add_argument("--route", choices=sorted(RETRIEVAL_ROUTES),
+                    help="route 步：TA 选的检索路线（zero-dep 默认 / local 本地模型 / "
+                         "cloud 云端——**云端会把语料发到第三方**）。不给就只把三条"
+                         "路线和各自代价打出来，不替 TA 拍板")
     ap.add_argument("--answers", help="answers 步：模型整理好的答案清单文件（人工路径）")
     # --- 以下三个是给「AI 驱动」用的程序接口（人自己敲命令时用不上）---
     # 产品事实：多数用户不会开终端敲 python，真实形态是把仓库交给 AI、AI 边问边跑。

@@ -10,7 +10,9 @@ bigram，给 RRF 的排序与词面路高度重合，消融掉它两档所有分
 
 接 chunking 实验切好的块，实现 retrieve(query, topN) → [相关片段+元数据]：
   第一层 BM25 关键词：Okapi BM25，字符 bigram 当词（中文零依赖分词的常规做法）
-  第二层 向量语义：bge-small-zh-v1.5（fastembed，--embed）；零依赖时退回 bigram 余弦代理
+  第二层 向量语义：**提供方可插拔**（`embedding_provider`）——本地 fastembed
+    或云端 HTTP 服务，`--embed` 开、`--embed-provider` 选哪一档；零依赖时退回
+    bigram 余弦代理。检索层不认识任何一家，换服务商不改这里的代码
   第三层 关系图谱：零依赖词面代理版（任务卡"检索层关系图谱"）——共享显著词
     （低 df 的 bigram，"望远镜"这类专名的碎片）即相连，链接强度=Σidf；检索时
     把种子命中的关联块按强度排成第三路名次 append 进 RRF，融合逻辑不改。
@@ -28,7 +30,11 @@ recall_recent(topN)——换新窗口/context 压缩这两个场景没有 query 
 两个触发点的接线在同目录 session_recall.py。
 
 零依赖优先：BM25 层、RRF、用进废退、时间戳解析全是 stdlib；只有真 embedding 走
-fastembed。selftest 不需要装任何东西。
+提供方（本地档需要 fastembed，云端档只用 stdlib 的 urllib）。selftest 不需要装任何东西。
+
+**语料去哪儿，按档不一样，这件事不许含糊**：零依赖与本地模型档语料不出本机；
+云端档**查询和被检索的内容都会发到你选的那家服务商**。所以它在初始化流程里是一个
+显式选择点（memory_init 的 `--step route`），不是一个静默默认。
 
 用法：
   python memory_retrieval.py --selftest                      # 零依赖自检
@@ -50,8 +56,12 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
-# 复用 chunking 实验里已验证的切块与 embedding（同目录模块，import 不触发它的 CLI）
-from chunking_experiment import chunk_heading, bigram_counts, cosine, embed_texts
+# 复用 chunking 实验里已验证的切块（同目录模块，import 不触发它的 CLI）
+from chunking_experiment import chunk_heading, bigram_counts, cosine
+# 真 embedding 走可插拔提供方层：本地 fastembed／云端 HTTP 都从这里进来，
+# 检索层不认识任何一家（同 draft_extraction.llm_call 的口子）
+from embedding_provider import (VectorCache, embed_with_cache, resolve_provider,
+                                DEFAULT_LOCAL_MODEL, get_hit_floor)
 
 # recall_recent 的半衰期默认值（天）：经验值——timeline 语料按天/窗口推进，一周前的
 # 上下文对"接上刚才"基本没用了。跟 +0.05/k=60 同一待遇，等真实评估再调。
@@ -103,7 +113,12 @@ GRAPH_RRF_K = 5
 # **这个数与 embedding 模型绑定**（当前是 bge-small-zh-v1.5，512 维）——换模型
 # 余弦标度就变了，必须重新量，不能照抄。真实语料复核已做（2026.08.01）。零依赖路径**不适用**这个阈值（bigram
 # 余弦是另一套标度），所以它只在 self.embed 为真时生效。
-EMBED_HIT_FLOOR = 0.45
+#
+# **2026.08.02（云端档）：这个常数不再是"真 embedding 路径的门槛"，只是
+# bge-small-zh-v1.5 这一档的标定值。** 提供方可插拔之后，门槛按模型查
+# `embedding_provider.HIT_FLOOR_BY_MODEL`；查不到就是**未标定**（None），
+# 走下面 `vec_floor is None` 那条保守路径，**绝不照抄这个 0.45**。
+EMBED_HIT_FLOOR = get_hit_floor(DEFAULT_LOCAL_MODEL)
 
 # 查询缺失率的标注阈值（2026.08.01，第二份外部反馈在其真实语料上标定，60 条样本）。
 #
@@ -201,20 +216,36 @@ class MemoryIndex:
     """记忆检索索引：add 片段 → build → retrieve。权重随命中浮沉（用进废退）。"""
 
     def __init__(self, embed=False, weight_boost=0.05, rrf_k=60,
-                 graph_topK=5, graph_seeds=3, graph_rrf_k=None):
+                 graph_topK=5, graph_seeds=3, graph_rrf_k=None,
+                 provider=None, cache_path=None):
         # graph_topK/graph_seeds 是经验值（每块存几个邻居/两路各取几个种子扩展），
         # 跟 +0.05/k=60 同一待遇，等真实检索质量评估再调
         self.embed = embed
         self.weight_boost = weight_boost
         self.rrf_k = rrf_k
         self.graph_rrf_k = GRAPH_RRF_K if graph_rrf_k is None else graph_rrf_k
-        # 向量层"算不算有信号"的门槛，**两条路径两套标度**：零依赖的字符 bigram
-        # 余弦对不相干文本会给 0，>0 就够；真 embedding 的余弦几乎恒正，必须用
-        # 数值门槛（见 EMBED_HIT_FLOOR）。在构造时定死成属性而不是在 retrieve 里
-        # 现算，是为了能被直接断言——这条的失效形态（门槛误用到零依赖路径）
-        # **行为测试抓不到**：零依赖下 cosine>0 必然 bm25>0（同一套 bigram），
-        # 误用门槛今天是无害的，但等哪天语义代理换好了就会变成静默的坑
-        self.vec_floor = EMBED_HIT_FLOOR if embed else 0.0
+        # embedding 提供方（本地 fastembed／云端 HTTP，见 embedding_provider）。
+        # 只在 embed=True 时解析——零依赖档不该因为解析配置就报错。
+        self.provider = (provider or resolve_provider()) if embed else None
+        self.cache_path = cache_path
+        # 向量层"算不算有信号"的门槛，**三种情形三套处理**：
+        #   零依赖（embed=False）：bigram 余弦对不相干文本真会给 0，>0 就够 → 0.0
+        #   真 embedding 且**该模型标定过**：用标定值（如 bge-small-zh-v1.5 的 0.45）
+        #   真 embedding 但**没标定过**：None ＝ 未标定，**不许照抄别的模型的数字**
+        # 在构造时定死成属性而不是在 retrieve 里现算，是为了能被直接断言——这条的
+        # 失效形态（门槛误用到零依赖路径）**行为测试抓不到**：零依赖下 cosine>0
+        # 必然 bm25>0（同一套 bigram），误用门槛今天是无害的，但等哪天语义代理
+        # 换好了就会变成静默的坑
+        self.vec_floor = (self.provider.hit_floor() if embed else 0.0)
+        # 未标定档的保守取舍（2026.08.02 云端档）：**向量路不再有资格单独把一个块
+        # 送进候选**，只能给词面路已经认下的候选排序。理由——没有标定就没法分辨
+        # "0.3 分是弱相关还是纯噪声"，而真 embedding 的余弦几乎恒正；放它独立开闸
+        # 等于把 absent 类的正确空手率直接送成 0（bge-small-zh 上实测过这个形态）。
+        # 收窄成"只排序不开闸"是两害相权：漏掉一些只有语义路找得到的块，好过
+        # 每个查询都端回四条不相干的记忆——后者接着的就是编造。
+        # **这不是新的默认门槛，是"没量过"的诚实形态**；量过了就填进
+        # HIT_FLOOR_BY_MODEL，这段自动失效。
+        self.vec_calibrated = (not embed) or (self.vec_floor is not None)
         self.graph_topK = graph_topK
         self.graph_seeds = graph_seeds
         self.chunks, self.meta, self.weights = [], [], []
@@ -239,7 +270,11 @@ class MemoryIndex:
     def build(self):
         self._bm25 = BM25([tokenize(c) for c in self.chunks])
         if self.embed:
-            self._cvecs = embed_texts(self.chunks)          # 单位化向量矩阵
+            # 块向量：缓存里有的不重算（见 embedding_provider.VectorCache）。
+            # **云端档的成本模型全靠这一条**——不缓存的话每次起服务都是全库一遍。
+            cache = (VectorCache(self.cache_path, self.provider.id)
+                     if self.cache_path else None)
+            self._cvecs = embed_with_cache(self.provider, self.chunks, cache)
         else:
             self._ccounts = [bigram_counts(c) for c in self.chunks]
         self._neighbors = self._build_graph()
@@ -300,8 +335,10 @@ class MemoryIndex:
 
     def _vector_scores(self, query):
         if self.embed:
-            qv = embed_texts([query], is_query=True)[0]
-            return list(self._cvecs @ qv)                   # 已单位化，点积即余弦
+            # **每次查询只算一个查询向量**：块那边已经缓存住了（build），查询这边
+            # 按次算——云端档一次检索就是一个往返，不是全库一遍
+            qv = self.provider.embed([query], is_query=True)[0]
+            return [sum(a * b for a, b in zip(cv, qv)) for cv in self._cvecs]
         q = bigram_counts(query)
         return [cosine(q, cc) for cc in self._ccounts]
 
@@ -399,13 +436,20 @@ class MemoryIndex:
         # 路径下这道门槛基本不起作用，待真实评估再调。
         # 撤回的块（self.retracted）在这里一并出局：不进候选、不进种子、不被
         # 图谱带回、不加权。
-        vec_ok = lambda i: vec_scores[i] > self.vec_floor
+        # 门槛未标定时（换了 embedding 模型、还没在这个模型上量过分布）：向量路
+        # **只排序、不开闸**——见 __init__ 里 vec_calibrated 那段。开闸与排序在这里
+        # 是两个判据，不是一个：能不能单独把一个块送进候选，跟已经进来的块之间怎么
+        # 排先后，本来就是两件事。
+        vec_admit = (lambda i: vec_scores[i] > self.vec_floor) if self.vec_calibrated \
+            else (lambda i: False)
+        vec_rank_ok = (lambda i: vec_scores[i] > self.vec_floor) if self.vec_calibrated \
+            else (lambda i: True)
         scored_ok = [i for i in range(len(self.chunks))
                      if i not in self.retracted
-                     and (bm_scores[i] > 0 or vec_ok(i))]
+                     and (bm_scores[i] > 0 or vec_admit(i))]
         ok = set(scored_ok)
         bm_ranks = [i for i in ranked(bm_scores) if i in ok]
-        vec_ranks = [i for i in ranked(vec_scores) if i in ok and vec_ok(i)]
+        vec_ranks = [i for i in ranked(vec_scores) if i in ok and vec_rank_ok(i)]
         rank_lists, route_ks = [], []
         for r, on in ((bm_ranks, "bm25" in routes), (vec_ranks, "vector" in routes)):
             if on:
@@ -826,8 +870,13 @@ def layer_of(path):
     return "index" if Path(path).parent.name.lower() == "index" else "timeline"
 
 
-def load_corpus(corpus_dir, embed=False, recursive=True):
+def load_corpus(corpus_dir, embed=False, recursive=True, provider=None, cache_path=None):
     """语料目录（可传多个）→ 建好的 MemoryIndex。
+
+    embed 档下**默认把块向量缓存落在语料目录里**（`.embed_cache.json`，同
+    `.weights.json` 的先例，已进 .gitignore）——不缓存的话每次起服务都要把全库
+    重算一遍，云端档就是每次开机几百个往返。传 cache_path 可以改地方，传空字符串
+    可以关掉。语料目录传的是多个时不猜落点，得显式给。
 
     每块 meta：source/heading/chunk_index/timestamp/timestamp_source
               + window（窗口号，解析不出为 None）+ layer（index/timeline）。
@@ -839,7 +888,9 @@ def load_corpus(corpus_dir, embed=False, recursive=True):
         纯段落、文件名也不带日期，本来 34/37 块落 mtime；但它跟 timeline 层同名
         同窗口号，是同一次会话的两种写法，借它的日期是有据可依的，不是猜
       > mtime（最后兜底，全新 clone 会把全目录刷成同一时刻，基本没有排序信号）"""
-    index = MemoryIndex(embed=embed)
+    if embed and cache_path is None and isinstance(corpus_dir, (str, Path)):
+        cache_path = Path(corpus_dir) / ".embed_cache.json"
+    index = MemoryIndex(embed=embed, provider=provider, cache_path=cache_path or None)
     files = corpus_files(corpus_dir, recursive=recursive)
 
     # 第一趟：解析每个文件的文件级日期与窗口号，供第二趟跨层继承用
@@ -1181,6 +1232,66 @@ def _selftest(embed=False):
     assert MemoryIndex(embed=True).vec_floor == EMBED_HIT_FLOOR, \
         "真 embedding 路径必须带数值门槛，否则 absent 类的正确空手率会归零"
 
+    # 14b-2.【靶心：换了模型就得重新标定，不许照抄】（2026.08.02 云端档）
+    #      失效形态跟 14b 是一对：14b 防的是"门槛套到不该用它的路径上"，这里防的是
+    #      "门槛跟着到了不该用它的模型上"。后者更危险——0.45 是 bge-small-zh-v1.5
+    #      的余弦标度，换个模型标度就变了，照抄不会报错、只会让"库里没有就说没有"
+    #      无声失灵（那正是通往编造的那条流水线）。
+    from embedding_provider import (HTTPCloudProvider, LocalProvider,
+                                    _fake_transport, get_hit_floor)
+    _env = {"MEMORY_EMBED_API_KEY": "k"}
+    uncal = HTTPCloudProvider("https://api.example.com/v1/embeddings", "BAAI/bge-m3",
+                              transport=_fake_transport(), env=_env)
+    assert get_hit_floor("BAAI/bge-m3") is None, "这条断言的前提：bge-m3 还没标定过"
+    idx_uncal = MemoryIndex(embed=True, provider=uncal)
+    assert idx_uncal.vec_floor is None and not idx_uncal.vec_calibrated, \
+        "未标定的模型必须如实是 None，不许退回 0.45"
+    assert MemoryIndex(embed=True, provider=LocalProvider()).vec_calibrated, \
+        "标定过的模型该走标定值那条路"
+    #      未标定档的行为约定：向量路只排序、不单独放行候选。**变异靶心**——
+    #      把 vec_admit 写成 vec_rank_ok（即恢复"恒真开闸"）时这条必红：
+    #      假向量对任何查询都给正分，词面零信号的查询会被向量路放进候选。
+    idx_uncal2 = MemoryIndex(embed=True, provider=uncal)
+    for text, meta in SYNTH:
+        idx_uncal2.add(text, meta)
+    idx_uncal2.build()
+    assert idx_uncal2.retrieve("量子对撞机的运行日志", topN=3) == [], \
+        "门槛未标定时向量路不该独立放行候选——否则每个查询都端回几条不相干的记忆"
+    assert idx_uncal2.retrieve("咖啡机", topN=3), "词面有信号的查询仍该正常返回"
+
+    # 14b-3.【靶心：块向量建库算一次，查询只付一个往返】（2026.08.02 云端档）
+    #      这条决定了云端档的成本模型：不缓存的话每次起服务都是全库一遍，600 块
+    #      就是 600 次云端调用，**而这件事在"单查耗时"那张表上完全看不见**。
+    with tempfile.TemporaryDirectory() as td:
+        cpath = Path(td, ".embed_cache.json")
+        pv1 = HTTPCloudProvider("https://api.example.com/v1/embeddings", "BAAI/bge-m3",
+                                transport=_fake_transport(), env=_env)
+        i1 = MemoryIndex(embed=True, provider=pv1, cache_path=cpath)
+        for text, meta in SYNTH:
+            i1.add(text, meta)
+        i1.build()
+        assert pv1.texts_embedded == len(SYNTH), "建库该把每块算一次"
+        i1.retrieve("咖啡机", topN=3)
+        assert pv1.texts_embedded == len(SYNTH) + 1, \
+            "一次查询只该多算一个查询向量，不是把全库重算一遍"
+        #   换窗开场召回（recall_recent）**一个 embedding 都不该花**：它按时间
+        #   新鲜度×权重排序，压根没有 query 向量可算。这是云端档最该单独算账的
+        #   地方（每开一次新会话都要付、用户正等着第一句话），实测代价是零。
+        before = pv1.texts_embedded
+        i1.recall_recent(topN=3)
+        assert pv1.texts_embedded == before, "开场召回不该触发任何 embedding 调用"
+        #   重启（重新建库）：块向量全部命中缓存，一次都不重算
+        pv2 = HTTPCloudProvider("https://api.example.com/v1/embeddings", "BAAI/bge-m3",
+                                transport=_fake_transport(), env=_env)
+        i2 = MemoryIndex(embed=True, provider=pv2, cache_path=cpath)
+        for text, meta in SYNTH:
+            i2.add(text, meta)
+        i2.build()
+        assert pv2.texts_embedded == 0 and pv2.calls == 0, \
+            f"重启后块向量该全部走缓存，实际又算了 {pv2.texts_embedded} 条"
+        #   缓存文件里只有提供方标识和向量——key 这类凭证一个字都不许落盘
+        assert set(json.loads(cpath.read_text(encoding="utf-8"))) == {"provider", "vectors"}
+
     # 14c.【缺失率标注：**只标注、不硬拒**】这是本信号的核心纪律——它的误杀全部
     #      落在"抽象归纳式提问"那一档（陪伴场景最有价值的一类），拿它去拒绝返回
     #      等于专门惩罚最该被答好的问题。所以断言两件事：标注该出现时出现；
@@ -1390,10 +1501,18 @@ def _selftest(embed=False):
     print("selftest ok" + ("（含真embedding路径）" if embed else "（零依赖）"))
 
 
-def run(corpus_dir, query, topN=5, embed=False):
-    index = load_corpus(corpus_dir, embed=embed)
-    retriever = "BM25 + bge-small-zh-v1.5" if embed else "BM25 + bigram代理"
-    print(f"索引 {len(index.chunks)} 块，检索器={retriever}\n查询：{query}\n")
+def run(corpus_dir, query, topN=5, embed=False, provider_spec=None):
+    provider = resolve_provider(provider_spec) if embed else None
+    index = load_corpus(corpus_dir, embed=embed, provider=provider)
+    retriever = f"BM25 + {provider.id}" if embed else "BM25 + bigram代理"
+    print(f"索引 {len(index.chunks)} 块，检索器={retriever}")
+    if embed:
+        # 语料去向按档不同，这句话每次都要说出来——它是用户选这条路时的代价
+        print(f"提供方：{provider.describe()}")
+        if not index.vec_calibrated:
+            print("⚠ 这个模型的命中门槛**未标定**：向量路只参与排序、不单独放行候选"
+                  "（不照抄别的模型的 0.45，见 embedding_provider）")
+    print(f"查询：{query}\n")
     for i, r in enumerate(index.retrieve(query, topN), 1):
         head = r["meta"].get("heading") or r["meta"].get("source", "")
         preview = r["text"].replace("\n", " ")[:60]
@@ -1403,7 +1522,10 @@ def run(corpus_dir, query, topN=5, embed=False):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
-    ap.add_argument("--embed", action="store_true", help="用真 embedding（需 fastembed）")
+    ap.add_argument("--embed", action="store_true", help="用真 embedding")
+    ap.add_argument("--embed-provider", dest="embed_provider",
+                    help="embedding 提供方：local（默认，需 fastembed）/ local:<模型> / "
+                         "cloud（云端，其余走 MEMORY_EMBED_* 环境变量；**语料会发到服务商**）")
     ap.add_argument("--corpus", help="md 语料目录")
     ap.add_argument("--query", help="检索词")
     ap.add_argument("--topN", type=int, default=5)
@@ -1411,6 +1533,7 @@ if __name__ == "__main__":
     if args.selftest:
         _selftest(embed=args.embed)
     elif args.corpus and args.query:
-        run(args.corpus, args.query, args.topN, embed=args.embed)
+        run(args.corpus, args.query, args.topN, embed=args.embed,
+            provider_spec=args.embed_provider)
     else:
         ap.print_help()

@@ -386,12 +386,41 @@ REGISTERED_SIZES = {
     "越界提问": 4,
 }
 
+# 留出集的同款登记值（2026.08.02 补）。上面那段论证**原样适用于留出集，而它一直
+# 没有守备**：`HELDOUT_CASES` 12 条，闸却是手写的 `len(held) >= 6`，注释还停在
+# "当前 8 条"——正是上面骂过的"写的时候就松一格、此后再没人对过"，只是发生在
+# 另一个文件位置。而留出集比调参集更该守：**它不进基线、不参与调参，是判断
+# 一次改动是真迁移还是过拟合的唯一仪器**。调完参把没涨的那几条删掉，报表会
+# "看起来迁移了"，基线全绿，没有任何东西会报警。
+HELDOUT_REGISTERED_SIZES = {
+    "paraphrase": 2, "linked": 6, "absent_日常": 4,
+}
+
 # 真 embedding 路径的实测基线（2026.08.01，bge-small-zh-v1.5）。
 # **只在装了 fastembed 的环境里检查**——自检不能强依赖可选件，否则零依赖主干就名存实亡。
 EMBED_BASELINE = {
     "cold":        {"literal": 1.00, "paraphrase": 1.00, "linked": 0.83, "absent_远主题": 1.00},
     "established": {"literal": 1.00, "paraphrase": 1.00, "linked": 0.75, "absent_远主题": 1.00},
 }
+
+# 云端档基线（2026.08.02 云端 embedding 任务卡）：**空的，因为还没在这把尺子上跑过。**
+#
+# 空着不是漏了，是这一栏只能由**跑过的人**来填：跑云端档要一个第三方服务的 API key，
+# 而 key 只走环境变量、不进仓库，所以在没有 key 的环境里（包括我们的 CI 与自检）
+# 这一档跑不了，也**不该编一个数字占位**。
+#
+# **内测那张 20 题对照表不能代替这一栏**：它是别人在自己的私人语料上、用自己的 20 条
+# 问题量的命中数——样本量分不出 16/20 与 18/20 的差别（差 2 题就是差 2 个样本），
+# 类别构成也跟这里六类分开算分的口径对不上。拿它填进来会得到一份看起来很专业、
+# 实际没人跑过的基线，那比空着危险。
+#
+# 怎么填：装好环境变量后跑
+#   MEMORY_EMBED_PROVIDER=cloud MEMORY_EMBED_ENDPOINT=... MEMORY_EMBED_MODEL=... \
+#   MEMORY_EMBED_API_KEY=... python regression_set.py --report --embed --embed-provider cloud
+# 把打出来的分数按模型名登记进来（**分模型登记**，不同模型的分数不能互相顶替，
+# 同 HIT_FLOOR_BY_MODEL 的道理）。顺便：那个模型的命中门槛也要在这一步一并标定，
+# 没标定前它的向量路只排序、不放行候选（见 memory_retrieval.vec_calibrated）。
+CLOUD_BASELINE = {}     # 模型名 → {scale: {类别: 分数}}；空＝还没跑过，如实空着
 
 
 # ---------- 填充语料（把语料撑到真实规模，并且**词频分布也要真实**） ----------
@@ -457,7 +486,8 @@ def _filler(i):
             f"{_TAILS[(i // 4) % len(_TAILS)]}")
 
 
-def build_index(scale="established", with_entities=True, with_correction=True, embed=False):
+def build_index(scale="established", with_entities=True, with_correction=True,
+                embed=False, provider=None):
     """建回归用的索引。with_* 关掉可以单独看某个机制的影响。
 
     scale 两档，**都是真实的用户状态，不是"对照组"**：
@@ -468,7 +498,7 @@ def build_index(scale="established", with_entities=True, with_correction=True, e
                     那把尺子；拿 cold 档去判断机制有没有缺陷会得出错误结论
                     （深夜那两个伪影就是这么来的）。
     """
-    idx = MemoryIndex(embed=embed)
+    idx = MemoryIndex(embed=embed, provider=provider)
     for window, layer, date, text in CORPUS:
         idx.add(text, {"source": f"window_{window:02d}_{date}.md",
                        "window": window, "layer": layer,
@@ -564,19 +594,40 @@ def _fmt(scores):
     return "\n".join(lines)
 
 
-def report():
+def report(embed=False, provider_spec=None):
+    """分数表 + 分层消融。
+
+    embed=True 时检索走真向量（本地或云端，由 provider_spec 决定）——**云端档的
+    分数必须在这里重跑**，不许拿外部那张 20 题对照表代替（口径、样本量、类别构成
+    全都对不上，理由见 CLOUD_BASELINE 那段）。"""
+    provider = None
+    if embed:
+        from embedding_provider import resolve_provider
+        provider = resolve_provider(provider_spec)
+        print(f"【检索档】{provider.id}\n  {provider.describe()}")
+        if provider.hit_floor() is None:
+            print("  ⚠ 该模型命中门槛**未标定**：向量路只排序、不单独放行候选。"
+                  "absent 各类的分数要照这个前提读。")
+        print()
+    else:
+        print("【检索档】零依赖（默认）\n")
     print(f"查询 {len(CASES)} 条；两档语料都跑——cold 是第一天的用户，"
           f"established 是跑了几个月的用户\n")
+    def mk(**kw):
+        try:
+            return build_index(embed=embed, provider=provider, **kw)
+        except RuntimeError as e:      # 缺 key／服务商响应形状不对：说人话，不甩栈
+            raise SystemExit(f"跑不了这一档：{e}")
     for scale in ("cold", "established"):
-        idx = build_index(scale=scale)
+        idx = mk(scale=scale)
         print(f"【{scale} 档 · {len(idx.chunks)} 块】")
         print(_fmt(score(idx)))
         print()
-    idx = build_index()
+    idx = mk()
 
     print("【留出集】不参与基线守门，只用来回答\"改动是真的还是拟合了那几条查询\"")
     for scale in ("cold", "established"):
-        print(f"  {scale:<12} " + _fmt(score(build_index(scale=scale),
+        print(f"  {scale:<12} " + _fmt(score(mk(scale=scale),
                                               cases=HELDOUT_CASES)).strip().replace("\n", "  "))
     print()
 
@@ -593,7 +644,7 @@ def report():
     print("\n【分层消融】关掉某一路后的变化（跑的是真实 retrieve 路径，不是脚本自拼）")
     full = {"bm25", "vector", "graph", "weight"}
     for off in ("bm25", "vector", "graph", "weight"):
-        s = score(build_index(), routes=full - {off})
+        s = score(mk(), routes=full - {off})
         parts = []
         # 类名统一走 _fmt 那张表，不在这里另抄一份——`absent` 拆成
         # `absent_远主题`／`absent_日常` 之后，这里漏改了一处，`--report` 跑到这节
@@ -609,12 +660,12 @@ def report():
     # 实体槽的价值：这是 2026.07.31 加的槽，一直没量过补回多少关联
     print("\n【实体槽价值】(linked 类，换了说法的那条全靠它)")
     for tag, ent in (("有实体标注", True), ("无实体标注", False)):
-        s = score(build_index(with_entities=ent))
+        s = score(mk(with_entities=ent))
         print(f"  {tag}  linked Recall {s['linked']['recall']:.2f}  MRR {s['linked']['mrr']:.2f}")
 
     # 更正闭环对检索的影响：撤回后旧的记错记录不该再出现
     print("\n【更正闭环】")
-    idx2 = build_index()
+    idx2 = mk()
     hits = [r["text"] for r in idx2.retrieve("奖金什么时候发", topN=TOPN)]
     print(f"  查'奖金什么时候发' → {len(hits)} 条；"
           f"旧的错记录还在？{'是 ✗' if any('八月才发' in h for h in hits) else '否 ✓'}；"
@@ -720,7 +771,18 @@ def _selftest():
     tuned = {q for _, q, _ in CASES}
     held = {q for _, q, _ in HELDOUT_CASES}
     assert not (tuned & held), f"留出集与调参集重合：{tuned & held}"
-    assert len(held) >= 6, "留出集太小就说明不了问题（当前 8 条）"
+    #     数量按登记值守，**不手写下限**——理由与 REGISTERED_SIZES 那段一字不差地
+    #     适用：手写下限会跟实际条数脱节，而"删掉没涨的那几条"恰恰是分数变好、
+    #     最不会被察觉的作弊形态。留出集尤其要守：它是判断真迁移还是过拟合的
+    #     唯一仪器，被削了之后没有任何基线会报警。
+    held_got = Counter(k for k, _, _ in HELDOUT_CASES)
+    for kind, n in HELDOUT_REGISTERED_SIZES.items():
+        assert held_got[kind] >= n, \
+            f"留出集 {kind} 缩水了：登记 {n} 条，现在 {held_got[kind]} 条。" \
+            f"要减必须同时改 HELDOUT_REGISTERED_SIZES，并说明为什么这条不该留着"
+    assert set(held_got) == set(HELDOUT_REGISTERED_SIZES), \
+        f"留出集查询类与 HELDOUT_REGISTERED_SIZES 对不上：" \
+        f"{set(held_got) ^ set(HELDOUT_REGISTERED_SIZES)}"
 
     # 5d.【absent_日常 的成色闸——查询侧的第四伪影守门】
     #     光有基线守不住这一格：基线是"不得低于"，而**删掉一条难查询会让分数上升**，
@@ -843,10 +905,14 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--report", action="store_true", help="打分数表与分层消融")
+    ap.add_argument("--embed", action="store_true",
+                    help="report 走真向量档（默认零依赖档）")
+    ap.add_argument("--embed-provider", dest="embed_provider",
+                    help="local / local:<模型> / cloud（云端其余配置走 MEMORY_EMBED_* 环境变量）")
     args = ap.parse_args()
     if args.selftest:
         _selftest()
     elif args.report:
-        report()
+        report(embed=args.embed, provider_spec=args.embed_provider)
     else:
         ap.print_help()

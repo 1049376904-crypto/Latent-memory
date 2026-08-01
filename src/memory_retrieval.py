@@ -1647,8 +1647,16 @@ def _selftest(embed=False):
         _mk(td, "b.md", "# 记录\n> 3/5/2026 09:00:00\n\n## 早上\n煮了粥。\n")
         c = load_corpus(td)
         assert c.date_order == "mdy", f"语料里有 7/22 这条决定性证据：{c.date_order}"
-        got = {datetime.fromtimestamp(m["timestamp"]).strftime("%Y-%m-%d")
-               for m in c.meta if "粥" in c.chunks[c.meta.index(m)]}
+        amb = [m for m in c.meta if m["source"] == "b.md"]
+        #      **来源也要钉**：只断言最终日期的话，万一那条歧义日期是被别的来源解出来的
+        #      （标题行短日期／文件名日期／同窗口号邻层继承），断言照样绿，而
+        #      `date_order == "mdy"` 那半个分支还是裸的。
+        #      （同一文件里后续块拿的是 file_head——继承的正是首块那个 slash 解，
+        #      所以要求"至少有一块走了斜杠路"，不是每块都走。）
+        assert any(m["timestamp_source"] == "chunk_head_slash" for m in amb), \
+            f"歧义日期不是走斜杠那条路解出来的，这条断言就没在守它：" \
+            f"{[m['timestamp_source'] for m in amb]}"
+        got = {datetime.fromtimestamp(m["timestamp"]).strftime("%Y-%m-%d") for m in amb}
         assert got == {"2026-03-05"}, f"有证据时歧义日期该按月/日序解：{got}"
 
     #   d) **歧义 + 没有任何证据**：必须退到下一级兜底，**不许默认按美式猜**。
@@ -1668,6 +1676,26 @@ def _selftest(embed=False):
         c = load_corpus(td)
         assert c.date_order == "dmy"
         assert datetime.fromtimestamp(c.meta[0]["timestamp"]).strftime("%Y-%m-%d") == "2026-07-22"
+
+    #   e2) **欧式 + 歧义**：`date_order == "dmy"` 那半个分支**唯一的用武之地**。
+    #      前面 c) 只钉了美式那半边，而这两半是对称的——审查侧实测：把 dmy 那两行
+    #      删掉，全量自检照样全绿，也就是说它一直是裸的。失效方向虽然安全
+    #      （退到 mtime、不会判错），但静默，重构时很容易被顺手简化掉。
+    #      **两份日期要分在两个文件里**：同文件的话，文件级日期继承那一级会把歧义
+    #      那条盖过去（它会直接继承 22/7 的日期），靶子当场作废。
+    with tempfile.TemporaryDirectory() as td:
+        _mk(td, "a.md", "# 记录\n> 22/7/2026 08:00:00\n\n## 早上\n出门散步。\n")
+        _mk(td, "b.md", "# 记录\n> 3/5/2026 09:00:00\n\n## 早上\n煮了粥。\n")
+        c = load_corpus(td)
+        assert c.date_order == "dmy", \
+            f"语料里有 22/7 这条决定性证据，该推断成日/月序：{c.date_order}"
+        amb = [m for m in c.meta if m["source"] == "b.md"]
+        assert any(m["timestamp_source"] == "chunk_head_slash" for m in amb), \
+            f"歧义日期不是走斜杠那条路解出来的，这条断言就没在守它：" \
+            f"{[m['timestamp_source'] for m in amb]}"
+        got = {datetime.fromtimestamp(m["timestamp"]).strftime("%Y-%m-%d") for m in amb}
+        assert got == {"2026-05-03"}, \
+            f"欧式语料里的 3/5 该解成 5 月 3 日（日/月序），不是 3 月 5 日：{got}"
 
     #   f) **正文里的 7/11 与 3.5 倍不许被命中**——只扫 head 那条约束的靶子。
     #      要放宽"只在 _head_lines 里查"必须先有断言证明不引入误判，这就是那条断言

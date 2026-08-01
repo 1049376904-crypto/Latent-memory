@@ -16,12 +16,13 @@
   多窗口、跨月（6/12 → 7/28）、index 与 timeline 双层、一条跨窗口主题线、
   一处"记错了又更正"、一处同义换说法（考图谱与实体槽）、若干无关噪声。
 
-五类查询各考一件事，**分开算分**（混在一起算总分会把某一层的退化摊平看不见）：
+六类查询各考一件事，**分开算分**（混在一起算总分会把某一层的退化摊平看不见）：
   literal   词面直给          —— 考 BM25 层
   paraphrase 换了说法         —— 考向量层 / 实体槽
   linked    跨窗口关联         —— 考图谱层
   感受回忆   "那时候我什么感觉" —— 考"感受记成事实就检索得到"这条答案立不立得住
   absent    库里真没有         —— 考可靠命中门槛（该说没有就得说没有）
+  越界提问   问语料时间范围**之外**的事 —— 考"被截断的世界"：库里没有不等于没发生过
 
 **感受回忆这一类是测量，不是写作指引**（维护者裁定，2026.08.01 第三份外部反馈）：
 它只在这里记账，不反过来变成"该怎么写感受"的话进用户文档——理由与边界写在
@@ -212,6 +213,26 @@ CASES = [
     ("absent_日常", "上回她妈妈来住的那几天", []),
     ("absent_日常", "那次一起熬夜看球赛的事", []),
     ("absent_日常", "她生日那天我们去的那家店", []),
+    # 越界提问（2026.08.02 新增，真机验证「被截断的世界」那条的回归锚）。
+    #
+    # **跟 absent 两类的区别在性质，不在形态**：absent 问的是**没发生过**的事；
+    # 越界提问问的是**很可能真发生过、但不在这份语料的时间范围内**的事
+    # （我们的语料覆盖 2026-06-12 ~ 2026-07-29，这几条都用了范围外的时间锚）。
+    # 现场是这样的：模型被问到范围外的事，答"后来没有继续展开"——**在它能看见的
+    # 世界里这句是真的**，问题在于它把"我的记录里没有"说成了"没发生过"，
+    # 而它根本不知道自己的记忆止于哪一天。
+    #
+    # ⚠ **口径先说清楚，免得被误读**（任务卡要求"先设计口径再落数字"）：
+    # 这一类真正该量的是**答复的断言强度**——模型有没有把"我的记录里没有"和
+    # "没发生过"分开说。**那个量不在这里**：回归集是检索层的尺子，没有模型在环，
+    # 量不了模型说了什么。这里只量检索侧那一半（正确空手率，同 absent 口径），
+    # 它是必要不充分条件：检索空手是模型能说对话的前提，但检索空了模型照样可以
+    # 张口断言。断言强度那一半归真机验证那条线，用人格文件里的边界声明去防
+    # （write_bundle 的覆盖区间字段），本回归集不假装能替它把关。
+    ("越界提问", "去年冬天我们一起过年那次", []),
+    ("越界提问", "八月中旬搬去新住处以后怎么样了", []),
+    ("越界提问", "五月那会儿她换工作的事", []),
+    ("越界提问", "十月那次旅行最后去成了吗", []),
 ]
 
 # ---------- 留出集：**不进基线**，只在评估"某个改动是否真的有用"时看 ----------
@@ -275,7 +296,7 @@ def miss_rate_table(scale="established"):
     idx = build_index(scale=scale)
     buckets = {}
     for kind, q, _ in CASES + HELDOUT_CASES:
-        if kind.startswith("absent"):
+        if is_empty_kind(kind):
             tag = kind
         else:
             tag = f"present·{query_style(q)}"
@@ -312,6 +333,12 @@ BASELINE = {
         # 穿透防线。基线记"不得低于"，修完防线该往上走——这一格就是 P0 那单
         # （任务卡「absent 防线重建」）的计分板。
         "absent_日常":   {"correct_empty": 0.16},
+        # 越界提问（2026.08.02 新增）：**如实入档的首测值，不是目标值**。
+        # 两档都是 0.25——四条里只挡住一条，跟 absent_日常 一个走向（都是
+        # "候选闸只有 bm25>0 这一路、没有门槛"那个已知短板的下游）。
+        # ⚠ 这一格只量检索侧空手率；"模型有没有把'我的记录里没有'说成'没发生过'"
+        # 那一半量不在这里（没有模型在环），防线在人格文件的覆盖区间声明上。
+        "越界提问":     {"correct_empty": 0.25},
     },
     "established": {
         "literal":    {"recall": 1.00, "mrr": 1.00},
@@ -334,6 +361,12 @@ BASELINE = {
         "absent_远主题": {"correct_empty": 1.00},
         # ⚠ **0.00——一条都没挡住**，与第一份外部内测反馈的 D 类 0/3 完全吻合。
         "absent_日常":   {"correct_empty": 0.00},
+        # 越界提问（2026.08.02 新增）：**如实入档的首测值，不是目标值**。
+        # 两档都是 0.25——四条里只挡住一条，跟 absent_日常 一个走向（都是
+        # "候选闸只有 bm25>0 这一路、没有门槛"那个已知短板的下游）。
+        # ⚠ 这一格只量检索侧空手率；"模型有没有把'我的记录里没有'说成'没发生过'"
+        # 那一半量不在这里（没有模型在环），防线在人格文件的覆盖区间声明上。
+        "越界提问":     {"correct_empty": 0.25},
     },
 }
 TOPN = 5
@@ -350,6 +383,7 @@ TOPN = 5
 REGISTERED_SIZES = {
     "literal": 5, "paraphrase": 4, "linked": 12, "感受回忆": 7,
     "absent_远主题": 4, "absent_日常": 6,
+    "越界提问": 4,
 }
 
 # 真 embedding 路径的实测基线（2026.08.01，bge-small-zh-v1.5）。
@@ -490,7 +524,7 @@ def score(idx, cases=CASES, topN=TOPN, routes=None):
             b["rr"] += 1.0 / rank
     out = {}
     for kind, b in buckets.items():
-        if kind.startswith("absent"):
+        if is_empty_kind(kind):
             out[kind] = {"correct_empty": b["empty_ok"] / b["n"], "n": b["n"]}
         else:
             out[kind] = {"recall": b["hit"] / b["n"], "mrr": b["rr"] / b["n"], "n": b["n"]}
@@ -499,8 +533,19 @@ def score(idx, cases=CASES, topN=TOPN, routes=None):
 
 # 查询类的显示顺序。**只此一份**——报表、分层消融都从这里取，别再各抄一份
 # （`absent` 拆成两个子类那次就是抄了第二份、漏改一处，把 --report 跑崩了）。
+# 「该空手」的类：期望是空的，算的是正确空手率而不是 recall。
+# **判据从"类名以 absent 开头"改成显式集合**（2026.08.02 加越界提问时）：
+# 越界提问同样该空手，但它不是 absent——它问的是很可能真发生过、只是不在语料
+# 时间范围内的事。按前缀猜类型会把它算成 recall 类，分母直接错。
+EMPTY_EXPECT_KINDS = ("absent_远主题", "absent_日常", "越界提问")
+
+
+def is_empty_kind(kind):
+    return kind in EMPTY_EXPECT_KINDS
+
+
 QUERY_KINDS = ("literal", "paraphrase", "linked", "感受回忆",
-               "absent_远主题", "absent_日常")
+               "absent_远主题", "absent_日常", "越界提问")
 # 分层消融只印非 absent 的类 + absent_日常（远主题在两档都是 1.00，印出来一列常数，
 # 占宽度不带信息）
 ABLATION_KINDS = ("literal", "paraphrase", "linked", "感受回忆", "absent_日常")
@@ -512,7 +557,7 @@ def _fmt(scores):
         s = scores.get(kind)
         if not s:
             continue
-        if kind.startswith("absent"):
+        if is_empty_kind(kind):
             lines.append(f"  {kind:<14} n={s['n']}  正确空手率 {s['correct_empty']:.2f}")
         else:
             lines.append(f"  {kind:<14} n={s['n']}  Recall@{TOPN} {s['recall']:.2f}  MRR {s['mrr']:.2f}")
@@ -555,7 +600,7 @@ def report():
         # 直接 KeyError 崩掉（模块 docstring 里"改动检索层后重跑 --report"这条
         # 动作因此是断的）。抄第二份类名清单就会有第二次漏改，所以只留一份。
         for kind in ABLATION_KINDS:
-            if kind.startswith("absent"):
+            if is_empty_kind(kind):
                 parts.append(f"{kind} 空手{s[kind]['correct_empty']:.2f}")
             else:
                 parts.append(f"{kind} R{s[kind]['recall']:.2f}/M{s[kind]['mrr']:.2f}")
@@ -701,6 +746,20 @@ def _selftest():
             f"这条编造查询在朴素闸（bm25>0）下就没有候选，说明它是'外星'风格、" \
             f"测不出真实威胁，不该算进 absent_日常：{q!r}"
 
+    # 5d1.【越界提问的成色闸——照 absent_日常 那套】这一类的操作化定义是
+    #      **时间锚落在语料覆盖范围之外**，而不是"编一件没发生的事"。写飘了就退化成
+    #      第二个 absent_日常，量不到"被截断的世界"那件事。所以两条一起守：
+    #        ① 数量不许缩水（走上面的 REGISTERED_SIZES）；
+    #        ② 每条都必须带一个**范围外的时间锚**——语料覆盖 2026-06 ~ 2026-07，
+    #           所以查询里得出现别的月份/年份的说法。
+    corpus_months = {d[:7] for _, _, d, _ in CORPUS}
+    assert corpus_months <= {"2026-06", "2026-07"}, \
+        f"语料月份变了（{sorted(corpus_months)}），越界提问那几条的时间锚要跟着重挑"
+    OUT_OF_RANGE_ANCHORS = ("去年", "八月", "五月", "十月", "明年", "前年")
+    for q in [q for k, q, _ in CASES if k == "越界提问"]:
+        assert any(a in q for a in OUT_OF_RANGE_ANCHORS), \
+            f"这条没有范围外的时间锚，它只是普通的编造查询、不该算进越界提问：{q!r}"
+
     # 5d2.【感受回忆的成色闸——照 absent_日常 那套】基线只守"不得低于"，而**删掉
     #      一条难查询、或把查询写得跟答案词面重合**都会让分数上升、照样绿。所以
     #      三条一起守：
@@ -777,7 +836,7 @@ def _selftest():
         f"established 档规模不足，量出来的'图谱连不上'会是规模伪影而不是机制缺陷"
 
     print(f"selftest ok（回归集：{len(idx.chunks)} 块语料 / {len(CASES)} 条查询，"
-          f"14 项断言：两档不低于基线 / 门槛没松 / 实体槽增益状态 / 消融走真实路径 / 更正闭环 / embed门槛 / absent日常成色 / 感受回忆成色 / 缺失率方向 / --report 跑得完 / 留出集纪律 / 语料代表性三道闸）")
+          f"15 项断言：两档不低于基线 / 门槛没松 / 实体槽增益状态 / 消融走真实路径 / 更正闭环 / embed门槛 / absent日常成色 / 越界提问成色 / 感受回忆成色 / 缺失率方向 / --report 跑得完 / 留出集纪律 / 语料代表性三道闸）")
 
 
 if __name__ == "__main__":

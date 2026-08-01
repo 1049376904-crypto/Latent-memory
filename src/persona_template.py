@@ -234,7 +234,9 @@ class Persona:
             if fid not in active_ids:
                 missing.append(f"开篇缺：{label}")
         if CURRENT_STATE_FIELD not in active_ids:
-            missing.append("“我是谁”节缺：当前关系状态")
+            # 这条只查字段在不在，不查它归哪一节——2026.08.02 它从"我是谁"挪到
+            # 开篇（关系状态不是 AI 的身份），提示语跟着改，校验逻辑本来就不依赖节
+            missing.append("缺：当前关系状态（这段关系此刻是什么状态）")
         if RETRIEVAL_CONVENTION_FIELD not in active_ids:
             missing.append("“技术架构”节缺：检索约定——不写这句，模型默认不会主动查记忆库")
         if not any(f.section == "closing" for f in self.active_fields()):

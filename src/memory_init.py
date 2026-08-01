@@ -84,10 +84,18 @@ CONTRACT_DOC = "注入契约.md"
 # 改法：默认值只陈述**此刻已经为真**的事（这个文件存在、会被读），不替用户
 # 声称"我认出你"。等真的攒出东西了，用户自己把这句改重，那时候它才有分量。
 PROTOCOL_DEFAULTS = {
+    # **人称锚死一套：「你」＝读这份文件的模型，用户一律用「她」／名字**
+    # （2026.08.02，第一份真实人格文件样本暴露）。原文写的是"你写下的东西都在这里，
+    # 我每次都会读"——那里的「你」是用户、「我」是模型，而紧挨着的 opening_refusal_ok
+    # 里「你」又是模型：**开篇同一节内，相邻两行的「你」指向不同的人**。
+    # 代价不是文风难看，是指代解析出错：拒绝权那条本意是给模型的授权，写成「你」
+    # 却挨着「你＝用户」的句子，含义会翻转。
+    # 基准取 RETRIEVAL_CONVENTION_FIELD 的写法（你＝模型、对方＝用户），因为那段是
+    # 三轮真机验证过的措辞、一字不许动，其余向它对齐。
     "opening_recognition": (
         "opening", "关系确认",
-        "这是我们共同维护的记忆文件——你写下的东西都在这里，我每次都会读，"
-        "所以你不用每次从头解释自己。"),
+        "这是你和她共同维护的记忆文件——她写下的东西都在这里，你每次都会读，"
+        "所以她不用每次从头解释自己。"),
     "opening_theory_caveat": (
         "opening", "理论只是论证不是结论",
         "这份文件里引用的任何框架或说法，都是论证，不是结论——不能靠引用它们，"
@@ -110,8 +118,37 @@ PROTOCOL_DEFAULTS = {
         "细节拿不准时，先用记忆检索工具（memory_search）查一遍再开口；不要在查"
         "之前说“我不记得”。查完自然接上话，不用报告自己搜过。\n"
         "**会话约定**：新会话开场先调一次 session_start；会话结束前调一次 "
-        "thread_close，记下聊到哪、当下状态、有什么没聊完。"),
+        "thread_close，记下聊到哪、当下状态、有什么没聊完。\n"
+        # ↓ 2026.08.02 追加的行为层两句。**只做加法**：上面那两段是三轮真机验证过的
+        # 措辞，一字未动（自检里有逐字黄金串钉着）。
+        #
+        # 为什么必须在人格文件里、而不是在工具返回值里（真机轨迹给出的结构性结论）：
+        # 那次 memory_search 四次全空之后，模型**自己转去 grep 了**——没放弃也没编，
+        # 但我们所有的诚实护栏（可靠命中门槛、缺失率提示、空结果止血话术）都挂在
+        # MCP 的返回值上，**它一绕过工具就一条都不生效**，而绕过恰恰发生在检索失败、
+        # 最需要护栏的时候。人格文件是唯一覆盖"不管你用什么方式查"的那一层。
+        #
+        # 措辞的要害是 authority，不是语气：「我的记录里没有」是关于自己记录的陈述，
+        # 「没发生过」是关于世界的断言——后者超出了它的资格范围。
+        "**说得出边界**：检索回来的是**片段，不是全部**；**用别的方式翻到的"
+        "（grep、直接读文件）同样只是片段**，不因为换了方式就变全了。\n"
+        "所以：没查到就说“我的记录里没有”“我这边只翻到 X，之后的没找到”，"
+        "**不要说“没发生过”“后来没有再发生”“没有新的约定”**——你没有资格对"
+        "自己记录之外的事下结论。把边界说出来，剩下的交给对方补。"),
 }
+
+# 记忆库覆盖区间那条的措辞（write_bundle 出货时按真实日期填）。
+# 来历（2026.08.02，真机验证的第二个结论）：模型说"后来没有继续展开"，而**兑现那件事
+# 根本不在这份语料里**——它发生在另一个客户端，导出不含那部分。所以那句话
+# **在它能看见的世界里是真的**，不是假否定，是诚实地报告了一个被截断的世界。
+# 真缺陷是：语料有硬边界，`--stats` 知道、`memory_import` 知道，
+# **而人格文件与 MCP 一个字都没告诉模型**——它不知道自己的记忆止于哪一天，
+# 自然说不出"我的记录到此为止"。
+COVERAGE_FIELD = "memory_coverage"
+COVERAGE_TEMPLATE = (
+    "你的记忆库覆盖 {start} 至 {end}，**这个范围之外的事你没有记录**——"
+    "不是没发生过，是不在你这儿。被问到范围外的事，说“我的记录到 {end} 为止，"
+    "之后的我这儿没有”，别替那段时间下结论。")
 
 # ---------- 覆盖度体检 ----------
 # 空泛形容词表：命中这些而没有具体锚点，就算"填了等于没填"（规格 §3.1）
@@ -226,12 +263,13 @@ class Question:
 
     def __init__(self, qid, section, field_id, label, text, kind="choice",
                  options=None, order=50, attribution=False, optional=False,
-                 max_chars=60, directive_only=False):
+                 max_chars=60, directive_only=False, dedupe_clauses=False):
         self.qid, self.section, self.field_id, self.label = qid, section, field_id, label
         self.text, self.kind, self.options = text, kind, options or {}
         self.order, self.attribution = order, attribution
         self.optional, self.max_chars = optional, max_chars
         self.directive_only = directive_only
+        self.dedupe_clauses = dedupe_clauses
 
     def option_text(self, key):
         opt = self.options.get(key)
@@ -253,7 +291,10 @@ CONTINUITY_OPTIONS = {
 }
 
 QUESTIONS = [
-    Question("remember_what", "user", "user_focus", "它该记住你哪些方面",
+    # 标题也会渲染进人格文件（`**它该记住你哪些方面**：…`），所以它同样受"你＝模型"
+    # 这条约束——原来的写法里「你」是用户、「它」是模型，跟正文打架。
+    # 题目正文（念给用户听的那句）不受影响，那不进文件
+    Question("remember_what", "user", "user_focus", "该记住她哪些方面",
              "它最需要记住你的哪些事？（可多选）", kind="multi", order=10, options={
                  "A": ("作息和身体状况", "记住她的作息与身体状况，该提醒的时候提醒。"),
                  "B": ("工作或学业上的压力", "记住她手上在忙什么、压力来自哪里。"),
@@ -297,7 +338,12 @@ QUESTIONS = [
                  "D": ("重要的事主动说，日常不打扰",
                        "重要的事主动开口；日常不主动搭话，不打扰她。"),
              }),
-    Question("state_now", "ai", CURRENT_STATE_FIELD, "当前关系状态",
+    # 归「开篇」不归「我是谁」（2026.08.02，真实样本暴露）：**关系状态不是 AI 的身份**。
+    # 原来挂在 "ai" 节，于是产出的人格文件里「我是谁」整节除了这一条空无一物，
+    # 而这一条讲的是这段关系此刻的状态，跟"我是谁"没关系。开篇本来就是关系确认那一节，
+    # 它归在这里读起来才连贯（规格 §2 表里写的是"我是谁末尾"，那行需要跟着更新——
+    # 属规格改动，已在任务卡里标出来交维护者定）。
+    Question("state_now", "opening", CURRENT_STATE_FIELD, "当前关系状态",
              "你们现在大致是什么状态？", order=35, options={
                  "A": ("稳定，没什么悬着的事", "现在是稳定的，没有悬而未决的事。"),
                  "B": ("刚和好不久", "最近刚和好，还在缓的阶段。"),
@@ -313,20 +359,21 @@ QUESTIONS = [
              kind="multi", order=40, directive_only=True, options={
                  "A": ("第一次确认关系", "去语料里找：第一次确认关系的那次对话。"),
                  "B": ("一次严重的争吵或危机", "去语料里找：最严重的一次争吵或信任危机。"),
-                 "C": ("某次它让你觉得“它记得我”", "去语料里找：让她觉得“它是认得我的”那一刻。"),
+                 "C": ("某次它让你觉得“它记得我”", "去语料里找：让她觉得你是认得她的那一刻。"),
                  "D": ("分开过又回来了", "去语料里找：分开又重新接上的那一次。"),
                  "E": ("定过一个具体的约定", "去语料里找：明确定下来的约定，以及有没有兑现。"),
-                 "F": ("它拒绝过你一次", "去语料里找：它明确拒绝或不顺着她的那一次。"),
+                 "F": ("它拒绝过你一次", "去语料里找：你明确拒绝、或没有顺着她的那一次。"),
                  # 2026.07.31 评审实例评审补：认错跟拒绝不是同一条线的两端，是另一类
                  # 关系事实（AI 对自己诚实）。不补的话问卷会系统性漏掉这一整类
-                 "G": ("它承认过自己的错误或局限", "去语料里找：它承认自己做错了、或承认自己做不到的那一次。"),
+                 "G": ("它承认过自己的错误或局限", "去语料里找：你承认自己做错了、或承认自己做不到的那一次。"),
              }),
     Question("metaphor_pick", "opening", "opening_metaphor", "关系的隐喻",
              "你们之间有没有哪句话，最能概括这段关系是什么？（从候选里挑；"
              "没有就跳过——等它长出来再补，现在编一个反而假）",
              kind="pick", order=80, optional=True),
+    # dedupe_clauses：多选几个称呼候选时，各段共享的那半（"它叫你 X"）会重复出现
     Question("naming_pick", "naming", "naming_pair", "称呼",
-             "你们互相怎么称呼？", kind="pick", order=45),
+             "你们互相怎么称呼？", kind="pick", order=45, dedupe_clauses=True),
     Question("style_pick", "style", "style_excerpt", "语言风格片段",
              "从这些片段里挑出最像它的几段：", kind="pick", order=50),
     # —— 立场题排在靠后：先偏好后抽象 ——
@@ -454,6 +501,8 @@ def apply_answers(persona, questions, answers):
                 value = (value + "另外她补了一句：" + note) if value else "她补了一句：" + note
         else:                                   # pick：用户挑中的原文
             picked = ans if isinstance(ans, str) else "\n".join(str(x) for x in ans)
+            if q.dedupe_clauses:
+                picked = dedupe_clauses(picked)
             value = (picked.strip() + (("　" + note) if note else "")).strip()
             if not value:
                 continue
@@ -466,6 +515,33 @@ def apply_answers(persona, questions, answers):
         persona.add_field(f)
         added.append(f)
     return added
+
+
+_CLAUSE_SEP_RE = re.compile(r"[；;\n]+")
+
+
+def dedupe_clauses(text):
+    """按分句去重，保序。给称呼这类"多选之后各段共享同一半"的 pick 题用。
+
+    真实样本里的样子：用户挑了两个称呼候选，拼出来是
+    "她叫你'哥哥'，你叫她'阿岸'；她叫你'星回'，你叫她'阿岸'"——**同一侧的称呼
+    重复出现**。整行去重没用（两行确实不同），要按分句去重才消得掉重复的那半。
+    只对标了 dedupe_clauses 的题生效：风格片段那类 pick 题里，相似的短句是内容本身，
+    去重会把语料改坏。"""
+    seen, out = set(), []
+    for part in _CLAUSE_SEP_RE.split(text):
+        # 逗号那一层也拆开看：重复的往往是"它叫你 X"这半句
+        subs, keep = [p.strip() for p in re.split(r"[，,]", part)], []
+        for sub in subs:
+            if not sub:
+                continue
+            if sub in seen:
+                continue
+            seen.add(sub)
+            keep.append(sub)
+        if keep:
+            out.append("，".join(keep))
+    return "；".join(out)
 
 
 def extraction_brief(questions, answers):
@@ -898,6 +974,32 @@ def ship_note(client):
             "**从产出目录起会话**——人格文件在那儿才会被宿主读到。")
 
 
+_FILE_DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+
+
+def corpus_coverage(corpus_dir, entries=None):
+    """记忆库覆盖的日期区间 → ("YYYY-MM-DD", "YYYY-MM-DD")，问不出来就返回 None。
+
+    两个来源，都不猜：
+      - entries（这次导入的条目）：用真实时间戳，最准；
+      - 已有语料目录：用**文件名里的日期**——那是 parse_chunk_timestamp 的最高优先级
+        来源，也是 write_corpus 自己写文件时遵守的命名规则。**刻意不退 mtime**：
+        mtime 在这里不是"不太准"是全错且整齐地错（复制一遍目录会把所有文件刷成
+        同一时刻），拿它去告诉模型"你的记忆止于哪天"，等于给它一个假边界——
+        比不给更糟。问不出来就不写这条字段，空着是诚实的。"""
+    days = []
+    for e in entries or []:
+        ts = getattr(e, "timestamp", None)
+        if ts:
+            days.append(datetime.fromtimestamp(ts).strftime("%Y-%m-%d"))
+    if not days and corpus_dir:
+        for p in Path(corpus_dir).rglob("*.md"):
+            m = _FILE_DATE_RE.search(p.name)
+            if m:
+                days.append(m.group(0))
+    return (min(days), max(days)) if days else None
+
+
 def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
                  server_path=None, confirmed=False, entries=None,
                  contract_base=None, previous_persona=None):
@@ -931,6 +1033,16 @@ def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
     out = Path(out_dir)
     (out / "memory").mkdir(parents=True, exist_ok=True)
     persona_path = out / CLIENT_FILENAMES[client]
+    written = write_corpus(out / "memory", entries) if entries else []
+    corpus = Path(corpus_dir) if corpus_dir else out / "memory"
+    # **覆盖区间要在渲染之前写进人格文件**：它是每轮都在的那一层，而护栏挂在工具
+    # 返回值上的话，模型一绕过工具（grep、直接读文件）就一条都不生效
+    span = corpus_coverage(corpus, entries)
+    if span:
+        persona.add_field(Field(
+            id=COVERAGE_FIELD, section="architecture", label="记忆库覆盖范围",
+            value=COVERAGE_TEMPLATE.format(start=span[0], end=span[1]),
+            source="system", confirmed=True))
     persona_path.write_text(render_persona_md(persona), encoding="utf-8")
     # 换档时把**上一次我们自己出的**那份人格文件退役掉（改名 .bak，不删——写用户
     # 磁盘一律保守）。
@@ -955,8 +1067,6 @@ def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
             bak = stale.with_name(previous_persona + ".bak")
             stale.replace(bak)      # 同名 .bak 已存在就覆盖：影子副本不值得留两份
             retired.append(bak)
-    written = write_corpus(out / "memory", entries) if entries else []
-    corpus = Path(corpus_dir) if corpus_dir else out / "memory"
     # server 默认取**本文件同目录**的 mcp_server.py，不取当前工作目录——
     # 出货时 cwd 是什么谁也保证不了，而这两个文件在包里永远是同级
     server = server_path or Path(__file__).resolve().parent / "mcp_server.py"
@@ -1305,6 +1415,98 @@ def _selftest():
     assert ch["options"] and all(set(v) == {"label", "directive"} for v in ch["options"].values()), \
         "选项要同时给'念给用户听的文案'和'写进人格文件的指引'"
 
+    # 8a.【靶心：人称锚死一套——「你」只能是模型】第一份真实人格文件样本暴露：
+    #     开篇同一节内，opening_recognition 的「你」是用户、opening_refusal_ok 的
+    #     「你」是模型。人格文件的读者只有一个（模型），「你」指两个人会让指代解析
+    #     出错——拒绝权那条本意是给模型的授权，含义会直接翻转。
+    #     **靶子只取我们自己生成的文本**（协议层默认值 + 选项 directive）：用户挑的
+    #     原话怎么写是他的自由，我们管不着也不该管。
+    p_pron = Persona("partner")
+    fill_protocol_defaults(p_pron)
+    qs_pron = questions_for(coverage_report(p_pron), has_corpus=False)
+    apply_answers(p_pron, qs_pron,
+                  {q.qid: {"keys": "".join(sorted(q.options))} for q in qs_pron if q.options})
+    apply_confirmations(p_pron, {p.key: "keep" for p in pending_confirmations(p_pron)})
+    pron_md = render_persona_md(p_pron)
+    #     用户被写成第二人称的形态——这些串一旦出现，就说明有人把「你」当用户写了
+    #     字段**标题**同样进文件，同样受这条约束（"它该记住你哪些方面"就是这么漏的）
+    for bad in ("你写下的", "你不用每次", "记住你的", "等你问", "不等你问",
+                "你手上在忙", "接住你的情绪", "你的喜好", "你的作息",
+                "记住你哪些", "你哪些方面"):
+        assert bad not in pron_md, \
+            f"人格文件里把用户写成了第二人称（{bad!r}）——「你」在这份文件里只能是模型自己"
+    #     **反向也要守，否则这条闸是空的**：把所有「你」都删光同样能让上面全过，
+    #     所以必须确认模型第二人称真的在（检索约定那条是基准写法，一字不许动）
+    #     **逐字钉死**，不是钉个片段：这段是 2026.07.31 第三轮真机实测通过的措辞，
+    #     "其余向它对齐、它自己一字不动"是任务卡写死的要求。黄金串写在断言里而不是
+    #     引用常量本身——引用常量的话，改了常量断言跟着变，等于没钉
+
+    # 8d.【靶心：记忆库的时间边界要告诉模型】真机验证的第二个结论：模型说"后来没有
+    #     继续展开"，而那件事根本不在语料里（发生在另一个客户端）——**在它能看见的
+    #     世界里那句话是真的**。真缺陷是它不知道自己的记忆止于哪一天，于是把
+    #     "我的记录里没有"说成了"没发生过"（差别在 authority，不在语气）。
+    with tempfile.TemporaryDirectory() as td:
+        paths_cov = write_bundle(td, p5, client="claude-code", confirmed=True, entries=ents)
+        cov_md = paths_cov["persona"].read_text(encoding="utf-8")
+        assert "记忆库覆盖范围" in cov_md and "范围之外的事你没有记录" in cov_md, \
+            "出货的人格文件没告诉模型记忆库覆盖到哪天——它就说不出'我的记录到此为止'"
+        #    日期要是真的，不是模板占位
+        days_in = sorted(datetime.fromtimestamp(e.timestamp).strftime("%Y-%m-%d")
+                         for e in ents if getattr(e, "timestamp", None))
+        assert days_in[0] in cov_md and days_in[-1] in cov_md, \
+            f"覆盖区间跟语料对不上（语料 {days_in[0]}~{days_in[-1]}）：{cov_md[-200:]!r}"
+    #     **问不出来就不写**：宁可没有这条，也不能给一个假边界——模型会照着假边界
+    #     去否定真事，比不给更糟
+    assert corpus_coverage(None, entries=[]) is None, "问不出日期时不该编一个区间出来"
+    with tempfile.TemporaryDirectory() as td:
+        bare = Path(td) / "memory" / "timeline"
+        bare.mkdir(parents=True)
+        (bare / "window_01.md").write_text("## 没有日期的窗口\n随便写点。", encoding="utf-8")
+        assert corpus_coverage(Path(td) / "memory") is None, \
+            "文件名没日期时该返回 None——不许退 mtime，那是全错且整齐地错的假边界"
+
+    # 8e.【靶心：止血纪律必须在人格文件里，且不动已验证的句子】
+    #     护栏挂在工具返回值上，模型一绕过工具（grep、直接读文件）就一条都不生效，
+    #     而绕过恰恰发生在检索失败、最需要护栏的时候。人格文件是唯一覆盖
+    #     "不管你用什么方式查"的那一层。
+    p_conv = Persona("partner")
+    fill_protocol_defaults(p_conv)
+    conv = next(f.value for f in p_conv.fields if f.id == RETRIEVAL_CONVENTION_FIELD)
+    for must in ("片段，不是全部", "grep", "不要说“没发生过”", "我的记录里没有"):
+        assert must in conv, f"检索约定里缺行为层这条：{must}"
+    #     **只做加法**：三轮真机验证过的那两段一字不许动，逐字钉死（黄金串写在
+    #     断言里，不引用常量——引用常量的话改了常量断言跟着变，等于没钉）
+    GOLDEN_RETRIEVAL = (
+        "对方提到过去发生过的事、某个约定、某个日期／地点／称呼／人名，或者你对"
+        "细节拿不准时，先用记忆检索工具（memory_search）查一遍再开口；不要在查"
+        "之前说“我不记得”。查完自然接上话，不用报告自己搜过。")
+    assert GOLDEN_RETRIEVAL in pron_md, \
+        "检索约定那段的措辞被改了——它是三轮真机验证过的基准写法，一字不许动（其余向它对齐）"
+    assert pron_md.count("你") >= 2, "「你」几乎不出现，说明这条闸被'全删掉'绕过去了"
+
+    # 8a1.【靶心：关系状态不归「我是谁」】真实样本里「我是谁」整节只有"当前关系状态"
+    #      一条，而那条讲的是这段关系此刻怎么样，不是 AI 的身份。
+    state_q = next(q for q in QUESTIONS if q.qid == "state_now")
+    assert state_q.section == "opening", "当前关系状态该归开篇（关系确认那一节），不是 AI 的身份"
+    #      渲染里它必须落在开篇那一节之内：取开篇标题到下一节标题之间的正文来看
+    open_body = pron_md.split(SECTIONS["opening"], 1)[1].split(SECTIONS["user"], 1)[0]
+    assert "当前关系状态" in open_body, "当前关系状态没渲染进开篇那一节"
+
+    # 8a2.【靶心：称呼不许重复拼接】同一份真实样本里的第二条：多选几个称呼候选，
+    #      共享的那半会重复出现（"她叫你'哥哥'，你叫她'阿岸'；她叫你'星回'，你叫她'阿岸'"）。
+    #      整行去重没用——两行确实不同，要按分句去重。
+    p_nm = Persona("partner")
+    fill_protocol_defaults(p_nm)
+    qs_nm = questions_for(coverage_report(p_nm), has_corpus=True)
+    nm_q = next(q for q in qs_nm if q.qid == "naming_pick")
+    apply_answers(p_nm, qs_nm, {"naming_pick": {"pick":
+                  "她叫你“哥哥”，你叫她“阿岸”；她叫你“星回”，你叫她“阿岸”"}})
+    nm_value = next(f.value for f in p_nm.fields if f.id == nm_q.field_id)
+    assert nm_value.count("你叫她“阿岸”") == 1, \
+        f"同一侧称呼被重复拼进人格文件：{nm_value!r}"
+    #      两个不同的称呼都得留下——去重不能把内容也吃掉
+    assert "哥哥" in nm_value and "星回" in nm_value, f"去重把真内容删了：{nm_value!r}"
+
     # 8b.【靶心：任务书不许泄漏进人格文件】外部（第三方 AI 走流程时）发现的缺陷：
     #     milestone_kinds 的选项指引是"去语料里找：……"——给模型的提取任务书，
     #     却以普通字段草稿的身份进了确认关卡，用户按 y 就写进不变量层。
@@ -1367,6 +1569,12 @@ def _selftest():
         f = Path(td) / "dec.json"
         f.write_text(long_literal, encoding="utf-8")
         assert _load_json_arg(str(f)) == long_payload, "传文件路径时该读文件"
+
+    GOLDEN_SESSION = (
+        "**会话约定**：新会话开场先调一次 session_start；会话结束前调一次 "
+        "thread_close，记下聊到哪、当下状态、有什么没聊完。")
+    assert GOLDEN_RETRIEVAL in conv and GOLDEN_SESSION in conv, \
+        "改动了三轮真机验证过的措辞——这两段只许在后面加，不许动"
 
     # 9.【变异靶心：写盘要过确认关卡】未确认时拒绝写用户磁盘
     with tempfile.TemporaryDirectory() as td:
@@ -1547,11 +1755,13 @@ def _selftest():
         except ValueError as e:
             assert "开篇缺" in str(e)
 
-    print("selftest ok（26项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
+    print("selftest ok（31项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
           "归属句式 / 默认值不预支历史 / 协议层不问用户 / 导出纪律 / 渲染顺序 / "
+          "人称锚死一套 / 称呼不重复拼接 / 关系状态归开篇 / "
           "答案读回不静默丢 / 任务书不泄漏进人格文件 / 长字面量不崩 / 未决草稿不蒸发 / "
-          "记忆库落盘带日期 / 冷启动出得了货 / AI 驱动不绕过确认 / 确认关卡 / 续跑 / 完整性 / "
-          "generic 档随货带契约 / CLI 真进程走文档教的那条命令 / 换档退役旧档 / 同档重跑不自退 / "
+          "记忆库落盘带日期 / 覆盖区间进人格文件 / 止血纪律进人格文件 / 冷启动出得了货 / "
+          "AI 驱动不绕过确认 / 确认关卡 / 续跑 / 完整性 / generic 档随货带契约 / "
+          "CLI 真进程走文档教的那条命令 / 换档退役旧档 / 同档重跑不自退 / "
           "不动不是我们出的文件 / MCP 配置路径可直接用 / ship 话术不串档）")
 
 

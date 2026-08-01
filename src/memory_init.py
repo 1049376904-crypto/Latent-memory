@@ -1468,7 +1468,28 @@ def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
             id=COVERAGE_FIELD, section="architecture", label="记忆库覆盖范围",
             value=COVERAGE_TEMPLATE.format(start=span[0], end=span[1]),
             source="system", confirmed=True))
-    persona_path.write_text(render_persona_md(persona), encoding="utf-8")
+    # **覆盖自己之前那份人格文件前，先备份**（2026.08.01，维护者在场时实测撞出来）：
+    # 老用户升级只需重跑一次 ship，人格文件就会按新版协议层重放一遍——这是对的，
+    # 但**手改过的内容不在 state 里，重放等于把它删掉，而且原来一声不吭**。
+    #
+    # 这条的分量在于：《给AI的引导指南》明写着"人格文件是 TA 的，随时可以自己改"
+    # ——**我们鼓励了他改，然后在升级时悄悄替他删掉**。而换档退役旧档那条我们都
+    # 留了 `.bak`，**自己覆盖自己反而不留**，前后不一致。
+    #
+    # 做两件事，都只加不减：
+    #   ① 磁盘上已有同名人格文件就先备份成 `<名>.bak`（同换档退役的命名与保守原则）；
+    #   ② **比对磁盘那份与本次重放的结果**，不一致就说明它被改过（手改，或旧版本
+    #      出的），把这件事明确说出来——沉默地覆盖才是最坏的形态。
+    #      注意判据取"内容不同"而不是"有没有 .bak"：第一次出货时磁盘上没有旧文件，
+    #      那不是"被改过"，不该报。
+    previous_text = persona_path.read_text(encoding="utf-8") if persona_path.exists() else None
+    rendered = render_persona_md(persona)
+    overwritten = None
+    if previous_text is not None and previous_text != rendered:
+        backup = persona_path.with_name(persona_path.name + ".bak")
+        backup.write_text(previous_text, encoding="utf-8")
+        overwritten = backup
+    persona_path.write_text(rendered, encoding="utf-8")
     # 换档时把**上一次我们自己出的**那份人格文件退役掉（改名 .bak，不删——写用户
     # 磁盘一律保守）。
     #
@@ -1508,7 +1529,8 @@ def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
         contract.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
     return {"persona": persona_path, "memory_dir": out / "memory",
             "mcp_config": out / "mcp-config.json", "corpus_files": written,
-            "contract": contract, "retired": retired}
+            "contract": contract, "retired": retired,
+            "overwritten_backup": overwritten}
 
 
 def save_state(out_dir, state):
@@ -2535,6 +2557,52 @@ def _selftest():
         assert not (Path(td) / "persona.md.bak").exists(), "同档重跑不该产生 .bak"
         assert "已退役" not in out_again, "没换档却报退役"
 
+    # 9b4.【靶心：覆盖自己之前那份人格文件前必须备份，并且说出来】
+    #      2026.08.01 维护者在场时实测撞出来的真缺陷：老用户升级只要重跑一次 ship，
+    #      人格文件就按新版协议层重放一遍——**手改过的段落不在 state 里，
+    #      重放等于删掉它，而且原来一声不吭、连 .bak 都不留**。
+    #      分量在于《给AI的引导指南》明写着"人格文件是 TA 的，随时可以自己改"：
+    #      **我们鼓励了他改，又在升级时悄悄替他删掉**；而换档退役旧档那条我们
+    #      留了 .bak，自己覆盖自己反而不留，前后不一致。
+    #      **靶子走 CLI 真进程**——函数级断言钉不住"用户真敲的那条命令会不会提醒他"。
+    with tempfile.TemporaryDirectory() as td:
+        def ship_run(*extra):
+            r = subprocess.run([sys.executable, str(Path(__file__).resolve()),
+                                "--out", td, *extra], cwd=td,
+                               capture_output=True, text=True, encoding="utf-8")
+            assert r.returncode == 0, f"CLI 跑挂了：{extra}\n{r.stdout}\n{r.stderr}"
+            return r.stdout
+        qs_up = json.loads(ship_run("--step", "questionnaire", "--json"))["questions"]
+        ship_run("--step", "answers", "--answers-json", json.dumps(
+            {q["qid"]: ({"keys": "".join(sorted(q["options"]))} if q["options"]
+                        else {"pick": "说好了就算数。"}) for q in qs_up}, ensure_ascii=False))
+        pend_up = json.loads(ship_run("--step", "confirm", "--list", "--json"))["pending"]
+        ship_run("--step", "confirm", "--decisions-json",
+                 json.dumps({p_["key"]: "keep" for p_ in pend_up}, ensure_ascii=False))
+        ship_run("--step", "route", "--route", ROUTE_DEFAULT)
+        first = ship_run("--step", "ship", "--client", "claude-code")
+        md_path = Path(td) / "CLAUDE.md"
+        #      第一次出货：磁盘上本来没有旧文件，**不该报"被改过"**，也不该留 .bak
+        assert "已备份成" not in first, "第一次出货就报'原来那份不一样'——那是恒真的噪音"
+        assert not md_path.with_name("CLAUDE.md.bak").exists(), "第一次出货不该产生 .bak"
+        #      同档原样重跑：内容一致，同样不该报、不该备份
+        again = ship_run("--step", "ship", "--client", "claude-code")
+        assert "已备份成" not in again and not md_path.with_name("CLAUDE.md.bak").exists(), \
+            "内容没变也报覆盖，用户会学会忽略这条提醒"
+        #      **用户手改之后再重跑**：必须备份 + 必须说出来
+        hand = md_path.read_text(encoding="utf-8") + "\n\n## 我自己加的一节\n她怕黑，睡觉留一盏灯。\n"
+        md_path.write_text(hand, encoding="utf-8")
+        upgraded = ship_run("--step", "ship", "--client", "claude-code")
+        bak_path = md_path.with_name("CLAUDE.md.bak")
+        assert bak_path.exists(), \
+            "手改过的人格文件被直接覆盖、连备份都没有——升级会静默吃掉用户自己写的内容"
+        assert bak_path.read_text(encoding="utf-8") == hand, \
+            "备份的不是手改前那份，等于备份了个寂寞"
+        assert "她怕黑" not in md_path.read_text(encoding="utf-8"), \
+            "这条断言的前提：重放本来就带不动手改内容（带得动就不需要这套机制了）"
+        for must in ("已备份成", "手改的段落不会被自动带过来", "贴回"):
+            assert must in upgraded, f"覆盖了手改内容却没说清怎么办，缺：{must!r}"
+
     # 9b3.【靶心：不许动不是我们出的文件】三轮验收打回的洞：退役逻辑原本按
     #      "别的档的文件名"匹配，而 CLAUDE.md 是 Claude Code 的项目约定文件，
     #      自建前端作者目录里躺一份他自己写的太正常了。全程只用 generic、从没换过
@@ -2602,7 +2670,7 @@ def _selftest():
         except ValueError as e:
             assert "开篇缺" in str(e)
 
-    print("selftest ok（46项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
+    print("selftest ok（47项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
           "归属句式 / 默认值不预支历史 / 协议层不问用户 / 导出纪律 / 渲染顺序 / "
           "人称锚死一套 / 用户只有一种称呼形态 / 中性档不丢主语 / 人称从语料读出来 / 中性写法不许漏 / 语料侧判定不许猜 / 全文零它 / 称呼不重复拼接 / 关系状态归开篇 / "
           "答案读回不静默丢 / 任务书不泄漏进人格文件 / 长字面量不崩 / 未决草稿不蒸发 / "
@@ -2610,7 +2678,7 @@ def _selftest():
           "pick 题只许挑不许写 / 冷启动出得了货 / "
           "AI 驱动不绕过确认 / 确认关卡 / 续跑 / 完整性 / generic 档随货带契约 / "
           "CLI 真进程走文档教的那条命令 / 换档退役旧档 / 同档重跑不自退 / "
-          "不动不是我们出的文件 / MCP 配置路径可直接用 / ship 话术不串档 / 检索路线是真选择点 / 云端档落到启动参数 / 凭证不进产出目录）")
+          "不动不是我们出的文件 / 覆盖手改的人格文件前必先备份并说出来 / MCP 配置路径可直接用 / ship 话术不串档 / 检索路线是真选择点 / 云端档落到启动参数 / 凭证不进产出目录）")
 
 
 def _rebuild(state):
@@ -2949,6 +3017,17 @@ def _step_ship(args, state):
         # 拼错了会变成"确认过的更新不生效"，而那是最难自查的一种坏法
         print(f"  已退役：{bak.with_suffix('').name} → {bak.name}"
               f"（换档后旧档的人格文件不再更新，别再拼它）")
+    if paths.get("overwritten_backup"):
+        # **沉默地覆盖才是最坏的形态**：老用户升级重跑 ship 是对的做法，但他手改过
+        # 的段落不在 state 里、重放不出来。所以这里必须说出来，并指向那份备份。
+        bak = paths["overwritten_backup"]
+        print(f"\n⚠ 磁盘上原来那份人格文件**跟这次重新生成的不一样**，"
+              f"已备份成：{bak}")
+        print("   多半是两种情况：你后来手改过它，或者它是旧版本出的。"
+              "**手改的段落不会被自动带过来**——问卷答案和确认结果存在 "
+              "init_state.json 里、能重放，你自己写的那几行不在里面。")
+        print("   对着那份备份看一眼，把你自己加的内容贴回新文件里。"
+              "（人格文件本来就是你的，改它是对的——只是升级这一步带不动它。）")
     for s in persona.suggestions():
         print(f"  建议（不阻塞）：{s}")
     # 任务书在这里再给一次：ship 是最后一个出口，第二阶段的活儿从这儿接

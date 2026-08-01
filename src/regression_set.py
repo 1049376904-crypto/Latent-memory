@@ -49,7 +49,19 @@
      每次都给我们 1.00 的满分。短板在 **BM25 那一路没有门槛**（候选闸是或关系），
      不在 `EMBED_HIT_FLOOR` 上。这条已进后续计划最高优先级，本轮**只报不修**——
      修它要动候选闸，是新机制，得单独一轮带自己的验证。
-     **在修好之前，别把 absent 这一列的 1.00 当成产品能力的证据。**
+     **2026.08.01 已修（查询侧）**：`absent` 拆成 `absent_远主题`（旧的"外星"查询，
+     留作对照）与 `absent_日常`（日常口吻编造，真实威胁）两个分开算分的子类。
+     如实基线：established 档 `absent_日常` = **0.00**，一条都没挡住。
+     **防线本身还没修**——见下方伪影⑤，它挡住了阈值标定。
+
+  ⑤ **第五个：词汇丰富度**（2026.08.01，做 absent 防线时撞出来）。填充块是模板句，
+     真实语料是十几万字散文，于是**同一条查询在我们库里找不到的 token 比例天然
+     远高于真实库**：外部反馈那份真实语料上，真实查询缺失率 0~33%、编造 30~78%
+     （仅 3pp 重叠，信号很干净）；同样的查询打在我们语料上是 0~89% / 64~100%，
+     大片重叠。**四个候选防线信号因此一个都标定不了**（缺失率／自校准／内容词闸／
+     候选块数，数据见任务卡「absent 防线重建」）。
+     **别误读成"这些信号没用"——是我们没有能验证它们的尺子。** 修法是扩充填充块的
+     词汇丰富度（同修第二伪影那次：填充块不能是模板句），那是防线开工的前置条件。
 
   ③ 第三个：第一版填充块用 `_TOPICS[i % 25]` 生成，186 块里 7 块共用一个
      标题、正文高度雷同；近似重复的块会成群结队地以微弱相似度挤进 topN。已改成
@@ -152,11 +164,24 @@ CASES = [
     ("linked", "浇水太勤那次之后改种什么了", ["多肉"]),
     ("linked", "十一点后到家那阵子后来结束了吗", ["结束了"]),
     ("linked", "胖乎乎那两盆是什么时候买的", ["不用天天浇"]),
-    # absent：库里真没有，考可靠命中门槛——该空手就得空手
-    ("absent", "量子对撞机的运行日志", []),
-    ("absent", "报税截止日期是哪天", []),
-    ("absent", "邻居家狗的名字", []),
-    ("absent", "去年体检的血糖值", []),
+    # absent 拆成两个子类**分开算分**（2026.08.01，第一份外部内测反馈后重做）。
+    # 混成一个数会把真实威胁平均掉——这正是第四伪影能藏这么久的原因之一。
+    #
+    # absent_远主题：跟语料几乎零 bigram 重叠。**这类不是真实威胁**，留着只作对照，
+    # 用来说明"1.00 曾经是怎么来的"。
+    ("absent_远主题", "量子对撞机的运行日志", []),
+    ("absent_远主题", "报税截止日期是哪天", []),
+    ("absent_远主题", "邻居家狗的名字", []),
+    ("absent_远主题", "去年体检的血糖值", []),
+    # absent_日常：**这才是真实威胁**——日常口吻、与语料共享大量功能词
+    # （我们/她/那次/上回/的/事），但事情从没发生过。外部内测反馈里 D 类
+    # 五个编造查询全部穿透，且编造查询的 BM25 最高分普遍高于真实查询。
+    ("absent_日常", "上次我们一起去滑雪摔跤的那回", []),
+    ("absent_日常", "她那天说要养猫的事后来怎么样了", []),
+    ("absent_日常", "我们说好去海边看日出那次", []),
+    ("absent_日常", "上回她妈妈来住的那几天", []),
+    ("absent_日常", "那次一起熬夜看球赛的事", []),
+    ("absent_日常", "她生日那天我们去的那家店", []),
 ]
 
 # ---------- 留出集：**不进基线**，只在评估"某个改动是否真的有用"时看 ----------
@@ -177,6 +202,11 @@ HELDOUT_CASES = [
     ("linked", "她说结束了那天，之前忙的是什么", ["十一点后到家"]),
     ("paraphrase", "两盆植物现在的状态", ["叶子还厚了一圈"]),
     ("paraphrase", "她终于能好好休息了吗", ["睡到中午"]),
+    # 同风格编造查询，只验不调（同留出集纪律）
+    ("absent_日常", "上个月我们搬去海边住的那阵子", []),
+    ("absent_日常", "她说想学吉他那回后来买了吗", []),
+    ("absent_日常", "那天下大雨我们困在路上的事", []),
+    ("absent_日常", "我们一起养的那只狗叫什么来着", []),
 ]
 
 # 实体标注（模拟用户跑过一次抽取任务书的结果）：把"望远镜"这条线的三块连起来，
@@ -194,8 +224,11 @@ BASELINE = {
         "literal":    {"recall": 1.00, "mrr": 1.00},
         "paraphrase": {"recall": 1.00, "mrr": 0.87},
         "linked":     {"recall": 0.83, "mrr": 0.44},
-        # ⚠ absent 的 1.00 是合成语料假象，不是产品能力——见 docstring 伪影④
-        "absent":     {"correct_empty": 1.00},
+        "absent_远主题": {"correct_empty": 1.00},
+        # ⚠ **这个 0.16 是当前真实水平，不是笔误**：日常口吻的编造查询几乎全部
+        # 穿透防线。基线记"不得低于"，修完防线该往上走——这一格就是 P0 那单
+        # （任务卡「absent 防线重建」）的计分板。
+        "absent_日常":   {"correct_empty": 0.16},
     },
     "established": {
         "literal":    {"recall": 1.00, "mrr": 1.00},
@@ -208,7 +241,9 @@ BASELINE = {
         # 也没被 max_df 挡掉，但图谱路在 RRF 里只有一票，压不过那些在两条词面路
         # 里都排前几名的闲词块。**没有据此改检索层**——理由见 docstring 末尾。
         "linked":     {"recall": 0.66, "mrr": 0.40},
-        "absent":     {"correct_empty": 1.00},
+        "absent_远主题": {"correct_empty": 1.00},
+        # ⚠ **0.00——一条都没挡住**，与第一份外部内测反馈的 D 类 0/3 完全吻合。
+        "absent_日常":   {"correct_empty": 0.00},
     },
 }
 TOPN = 5
@@ -216,8 +251,8 @@ TOPN = 5
 # 真 embedding 路径的实测基线（2026.08.01，bge-small-zh-v1.5）。
 # **只在装了 fastembed 的环境里检查**——自检不能强依赖可选件，否则零依赖主干就名存实亡。
 EMBED_BASELINE = {
-    "cold":        {"literal": 1.00, "paraphrase": 1.00, "linked": 0.83, "absent": 1.00},
-    "established": {"literal": 1.00, "paraphrase": 1.00, "linked": 0.75, "absent": 1.00},
+    "cold":        {"literal": 1.00, "paraphrase": 1.00, "linked": 0.83, "absent_远主题": 1.00},
+    "established": {"literal": 1.00, "paraphrase": 1.00, "linked": 0.75, "absent_远主题": 1.00},
 }
 
 
@@ -337,7 +372,7 @@ def score(idx, cases=CASES, topN=TOPN, routes=None):
         b["n"] += 1
         results = idx.retrieve(query, topN=topN, routes=routes)
         texts = [r["text"] for r in results]
-        if not expect:                              # absent 类：空手才算对
+        if not expect:                              # absent 各子类：空手才算对
             if not results:
                 b["empty_ok"] += 1
             continue
@@ -351,7 +386,7 @@ def score(idx, cases=CASES, topN=TOPN, routes=None):
             b["rr"] += 1.0 / rank
     out = {}
     for kind, b in buckets.items():
-        if kind == "absent":
+        if kind.startswith("absent"):
             out[kind] = {"correct_empty": b["empty_ok"] / b["n"], "n": b["n"]}
         else:
             out[kind] = {"recall": b["hit"] / b["n"], "mrr": b["rr"] / b["n"], "n": b["n"]}
@@ -360,14 +395,14 @@ def score(idx, cases=CASES, topN=TOPN, routes=None):
 
 def _fmt(scores):
     lines = []
-    for kind in ("literal", "paraphrase", "linked", "absent"):
+    for kind in ("literal", "paraphrase", "linked", "absent_远主题", "absent_日常"):
         s = scores.get(kind)
         if not s:
             continue
-        if kind == "absent":
-            lines.append(f"  {kind:<11} n={s['n']}  正确空手率 {s['correct_empty']:.2f}")
+        if kind.startswith("absent"):
+            lines.append(f"  {kind:<14} n={s['n']}  正确空手率 {s['correct_empty']:.2f}")
         else:
-            lines.append(f"  {kind:<11} n={s['n']}  Recall@{TOPN} {s['recall']:.2f}  MRR {s['mrr']:.2f}")
+            lines.append(f"  {kind:<14} n={s['n']}  Recall@{TOPN} {s['recall']:.2f}  MRR {s['mrr']:.2f}")
     return "\n".join(lines)
 
 
@@ -436,9 +471,15 @@ def _selftest():
     #    这条要是垮了，说明可靠命中门槛被谁改松了（比 recall 掉分更危险：
     #    它意味着模型会拿着不相关的记忆去编）。established 档尤其要守——
     #    200 块语料里"随便匹配上一点"的机会比 16 块多得多
+    #    远主题那一档必须保持 1.00（它是最容易的一档，掉了说明门槛被改松）；
+    #    日常那一档**当前就是不及格**，只守"别更差"，它是 P0 那单的计分板
     for scale in ("cold", "established"):
-        assert score(build_index(scale=scale))["absent"]["correct_empty"] == 1.0, \
-            f"absent 类必须全部空手（{scale} 档）——门槛松了"
+        got = score(build_index(scale=scale))
+        assert got["absent_远主题"]["correct_empty"] == 1.0, \
+            f"absent_远主题 必须全部空手（{scale} 档）——最容易的一档都掉了，门槛被改松"
+        assert got["absent_日常"]["correct_empty"] >= \
+            BASELINE[scale]["absent_日常"]["correct_empty"] - 1e-9, \
+            f"absent_日常 退化（{scale} 档）——这一格本来就不及格，不许再降"
 
     # 3.【钉住实测状态：实体槽当前**测不出增益**】这条断言写的是现状不是期望——
     #    建回归集时量出来的第一个真结果就是负面的：实体标注只改变了图谱邻居的
@@ -490,11 +531,11 @@ def _selftest():
     if has_embed:
         for scale, table in EMBED_BASELINE.items():
             e = score(build_index(scale=scale, embed=True))
-            assert e["absent"]["correct_empty"] == 1.0, \
-                f"--embed 路径（{scale} 档）的可靠命中门槛失守：正确空手率 " \
-                f"{e['absent']['correct_empty']:.2f}——EMBED_HIT_FLOOR 是不是被改动或绕过了？"
+            assert e["absent_远主题"]["correct_empty"] == 1.0, \
+                f"--embed 路径（{scale} 档）连远主题都挡不住：正确空手率 " \
+                f"{e['absent_远主题']['correct_empty']:.2f}——EMBED_HIT_FLOOR 被改动或绕过了？"
             for kind, floor in table.items():
-                got = e[kind]["correct_empty"] if kind == "absent" else e[kind]["recall"]
+                got = e[kind]["correct_empty"] if kind.startswith("absent") else e[kind]["recall"]
                 assert got >= floor - 1e-9, \
                     f"--embed 路径质量退化（{scale} 档）：{kind} {got:.2f} < 基线 {floor:.2f}"
     else:
@@ -507,6 +548,23 @@ def _selftest():
     held = {q for _, q, _ in HELDOUT_CASES}
     assert not (tuned & held), f"留出集与调参集重合：{tuned & held}"
     assert len(held) >= 6, "留出集太小就说明不了问题（当前 8 条）"
+
+    # 5d.【absent_日常 的成色闸——查询侧的第四伪影守门】
+    #     光有基线守不住这一格：基线是"不得低于"，而**删掉一条难查询会让分数上升**，
+    #     照样绿。第四伪影当初就是这么藏住的（absent 查询造得太"外星"，把防线测成
+    #     满分）。所以两条一起守：
+    #       ① 数量不许缩水；
+    #       ② **每条都必须在"纯 bm25>0"的朴素闸下真有候选**——这正是"日常口吻"
+    #          的操作化定义：它跟语料共享足够多的功能词，能穿透朴素闸。
+    #          一条穿不透的，就是外星查询冒充日常查询，测不出真实威胁。
+    daily = [q for k, q, _ in CASES if k == "absent_日常"]
+    assert len(daily) >= 6, f"absent_日常 查询不许缩水（当前 {len(daily)} 条）"
+    est = build_index(scale="established")
+    for q in daily:
+        bm = est._bm25.scores(tokenize(q))
+        assert sum(1 for x in bm if x > 0) > 0, \
+            f"这条编造查询在朴素闸（bm25>0）下就没有候选，说明它是'外星'风格、" \
+            f"测不出真实威胁，不该算进 absent_日常：{q!r}"
 
     # 6.【语料代表性三道闸——今晚三个伪影各对应一条】
     #    这三条守的不是检索层，是**这把尺子本身准不准**。今晚三轮返工的教训：
@@ -543,7 +601,7 @@ def _selftest():
         f"established 档规模不足，量出来的'图谱连不上'会是规模伪影而不是机制缺陷"
 
     print(f"selftest ok（回归集：{len(idx.chunks)} 块语料 / {len(CASES)} 条查询，"
-          f"10 项断言：两档不低于基线 / 门槛没松 / 实体槽增益状态 / 消融走真实路径 / 更正闭环 / embed门槛 / 留出集纪律 / 语料代表性三道闸）")
+          f"11 项断言：两档不低于基线 / 门槛没松 / 实体槽增益状态 / 消融走真实路径 / 更正闭环 / embed门槛 / absent日常成色 / 留出集纪律 / 语料代表性三道闸）")
 
 
 if __name__ == "__main__":

@@ -36,7 +36,10 @@ DISCLAIMER = "风格参考，非台词——学说话方式，不是背台词。
 # 规格 §2 的十二节骨架，顺序即权重：首尾是注意力高地，别拿去放运维细节
 SECTION_ORDER = [
     ("opening", "开篇 · 关系确认与核心哲学"),
-    ("user", "她是谁"),
+    # 用户那一节的标题带人称槽 {ta}——**这里原来写死成"她是谁"**，于是选了「他」的
+    # 用户打开自己的人格文件，第二节标题就是一句写错的话（2026.08.02 验收打回二）。
+    # 槽位由 render 时按真实人称填，判不出来走中性写法（见 memory_init.NEUTRAL_FORMS）
+    ("user", "{ta}是谁"),
     ("ai", "我是谁"),
     ("milestones", "里程碑索引"),
     ("style", "相处原则与语言风格"),
@@ -157,6 +160,10 @@ class Persona:
         self.relationship_type = relationship_type
         self.fields = []
         self.milestones = []
+        # 出货时用得上的人称（{"user": "他"/"她"/None, "ai": …}）：fill_protocol_defaults
+        # 填进来，render_persona_md 拿它填骨架标题里的槽。放在 Persona 上而不是到处
+        # 传参，是因为**每一条渲染路径都必须填到**——漏一条就是漏一句写错的话
+        self.pronouns = None
         self.style_excerpts = []
 
     def enables_intimacy(self):

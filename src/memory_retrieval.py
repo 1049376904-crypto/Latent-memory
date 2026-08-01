@@ -255,6 +255,8 @@ class MemoryIndex:
         # 撤回集（2026.07.31 验收反馈"记错以后怎么办"闭环）：被撤回的块不再被
         # retrieve/recall 返回，但原文件与 chunks 本体都不动——时间线是档案，
         # 不销毁；退出的只是检索可见性。撤回账本按内容哈希持久化（同权重先例）
+        # 语料的日期顺序推断结论（load_corpus 填）："mdy"/"dmy"/None
+        self.date_order = None
         self.retracted = set()          # chunk 下标
         self.retraction_log = {}        # 内容哈希 → {reason, time, source, heading}
         # 实体标注（图谱层可插拔升级路径，任务卡"图谱实体抽取可插拔"）：
@@ -742,6 +744,13 @@ _DATE_FULL_RE = re.compile(r"(20\d{2})[-._年]?(\d{1,2})[-._月]?(\d{1,2})")
 # 正文/标题行里的完整日期：分隔符必带——紧凑 8 位（20260729）在文件名里是命名惯例，
 # 在正文里更可能是单号/编号这类数字，不认，压误判
 _DATE_FULL_TEXT_RE = re.compile(r"(20\d{2})[-._年](\d{1,2})[-._月](\d{1,2})")
+# Claude Exporter 插件时间戳格式：M/D/YYYY HH:MM:SS（在 > 引用行里，chunk 开头处）。
+# **这段正则由内测用户贡献**（2026.08.02，他直接拿导出器的 md 建库时撞上的）。
+# 只在 _head_lines 里查，不扫正文，压误判——实测正文里的"7/11 优惠"因此没被命中。
+_DATE_MDY_RE = re.compile(r"(\d{1,2})/(\d{1,2})/(20\d{2})")
+# 斜杠 + 年在前："2026/7/15"。年份在最前面就没有歧义，跟上面那条分开写
+_DATE_YMD_SLASH_RE = re.compile(r"(20\d{2})/(\d{1,2})/(\d{1,2})")
+
 # 标题行里的短日期："## 7.29" / "## 7月29日"，年份缺失需调用方补。
 # 前后不吃数字和点，避免把 2026.7.29 的尾巴或 1.2.3 这类版本号误认成日期
 _DATE_SHORT_RE = re.compile(r"(?<![\d.])(\d{1,2})\s*[.月]\s*(\d{1,2})(?![\d.])")
@@ -785,7 +794,72 @@ def _head_lines(text, n=3):
     return [ln for ln in text.splitlines() if ln.strip()][:n]
 
 
-def parse_chunk_timestamp(filename, chunk_text, fallback_year):
+def _slash_date_ts(line, date_order=None):
+    """一行文本里的斜杠日期 → epoch 秒；认不出、或**歧义且没有依据**时返回 None。
+
+    两种形态分开处理，因为歧义程度完全不同：
+      - `2026/7/15`（年在前）：没有歧义，直接认；
+      - `7/22/2026` / `22/7/2026`（年在后）：**顺序本身是歧义的**。
+        `7/22` 一眼能定（22 只能是日）；`3/5` 两解都通。
+
+    歧义那一格的处理是这一单的核心：**不默认按美式解**。
+    有决定性证据（同一份语料里出现过 次位>12 → 月/日序，或 首位>12 → 日/月序）
+    就按 date_order 统一解释整份；**没有证据就返回 None，退到下一级来源**，
+    宁可退 mtime 也不编一个可能差几个月的日期。同 absent 防线"宁可说不知道也不编"、
+    缺失率"宁可漏报不可误伤"。
+
+    date_order: "mdy" / "dmy" / None（未知）。由 infer_date_order 在语料范围内推断。"""
+    m = _DATE_YMD_SLASH_RE.search(line)
+    if m:
+        return _ymd_ts(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    m = _DATE_MDY_RE.search(line)
+    if not m:
+        return None
+    a, b, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if b > 12:                      # 次位只能是日 → 月/日/年
+        return _ymd_ts(y, a, b)
+    if a > 12:                      # 首位只能是日 → 日/月/年（欧式）
+        return _ymd_ts(y, b, a)
+    if date_order == "mdy":
+        return _ymd_ts(y, a, b)
+    if date_order == "dmy":
+        return _ymd_ts(y, b, a)
+    return None                     # 歧义且无依据：不认，交给下一级兜底
+
+
+def infer_date_order(texts):
+    """一批文本（整份语料的开头几行）→ "mdy" / "dmy" / None。
+
+    找**决定性证据**：`7/22/2026` 的 22 只能是日 → 这份语料是月/日/年；
+    `22/7/2026` 的 22 在首位 → 日/月/年。两种证据都出现＝互相矛盾，返回 None
+    （语料本身不自洽，猜哪一边都可能错半份）。一条证据都没有也返回 None。
+
+    **推断放在语料范围、不放在单块**：单块只有一个日期时永远推不出来，而同一份
+    导出里的日期格式是同一个导出器写的、必然一致——把范围放大到整份语料，
+    才可能从别的块借到那条决定性证据。这也是为什么它属于 load_corpus 的第一趟。"""
+    mdy = dmy = 0
+    for text in texts:
+        for line in _head_lines(text):
+            if _DATE_YMD_SLASH_RE.search(line):
+                continue            # 年在前的形态没有歧义，不构成顺序证据
+            m = _DATE_MDY_RE.search(line)
+            if not m:
+                continue
+            a, b = int(m.group(1)), int(m.group(2))
+            if b > 12:
+                mdy += 1
+            elif a > 12:
+                dmy += 1
+    if mdy and dmy:
+        return None                 # 自相矛盾，不选边
+    if mdy:
+        return "mdy"
+    if dmy:
+        return "dmy"
+    return None
+
+
+def parse_chunk_timestamp(filename, chunk_text, fallback_year, date_order=None):
     """解析 chunk 时间戳 → (epoch秒, 来源) 或 (None, None)。
 
     来源按可信度排优先级：
@@ -816,6 +890,16 @@ def parse_chunk_timestamp(filename, chunk_text, fallback_year):
             ts = _ymd_ts(int(m.group(1)), int(m.group(2)), int(m.group(3)))
             if ts is not None:
                 return ts, "chunk_head"
+        # 斜杠日期（Claude Exporter 的 `> 7/22/2026 12:54:09` 引用行、以及
+        # `2026/7/15`）。**只在 head 里查，不扫正文**——正文里的"7/11 优惠"
+        # 会被读成 7 月 11 日，这条约束不许放宽，要放宽先拿断言证明不引入误判。
+        # 歧义且无依据时 _slash_date_ts 返回 None，于是这里不 return、继续往下
+        # 一级来源走，而不是默认按美式解
+        ts = _slash_date_ts(line, date_order)
+        if ts is not None:
+            #    单独一档来源：这样"这个块的日期是从斜杠格式来的、按哪种顺序解的"
+            #    在 meta 里看得见，不跟 ISO 那档混在一起
+            return ts, "chunk_head_slash"
     for line in chunk_text.splitlines():
         if not line.lstrip().startswith("#"):
             continue                      # 只认标题行；正文里的"3.5 倍"不该被读成日期
@@ -825,18 +909,24 @@ def parse_chunk_timestamp(filename, chunk_text, fallback_year):
     return None, None
 
 
-def timeline_chunks(text, filename, mtime):
+def timeline_chunks(text, filename, mtime, date_order=None):
     """单个 timeline md 文件 → [(chunk_text, meta)]。切块+时间戳解析的公共段：
     load_corpus 和 memory_import 的 markdown 翻译器共用，逻辑只此一份不复制。"""
     year = datetime.fromtimestamp(mtime).year
+    # 调用方（load_corpus）会把**整份语料**推断出的顺序传进来；单文件导入
+    # （memory_import 那条路）没有语料范围，就退而在本文件范围内推断——
+    # 仍然是找决定性证据，不是猜
+    if date_order is None:
+        date_order = infer_date_order([text])
     # 文件级日期：日期常常只写在文件标题行、只属于第一个 chunk——先按文件解析一次，
     # 让同文件其余 chunk 继承，否则一个文件十几个块除首块外全落 mtime，
     # per-chunk 解析救不回兜底率
-    file_ts, _ = parse_chunk_timestamp(filename, "\n".join(_head_lines(text)), year)
+    file_ts, _ = parse_chunk_timestamp(filename, "\n".join(_head_lines(text)), year,
+                                       date_order)
     out = []
     for i, chunk in enumerate(chunk_heading(text)):
         heading = next((ln for ln in chunk.splitlines() if ln.startswith("## ")), "")
-        ts, ts_source = parse_chunk_timestamp(filename, chunk, year)
+        ts, ts_source = parse_chunk_timestamp(filename, chunk, year, date_order)
         if ts is None and file_ts is not None:
             # 继承文件级日期：文件内的先后粒度丢了，年月日还是真的
             ts, ts_source = file_ts, "file_head"
@@ -893,13 +983,19 @@ def load_corpus(corpus_dir, embed=False, recursive=True, provider=None, cache_pa
     index = MemoryIndex(embed=embed, provider=provider, cache_path=cache_path or None)
     files = corpus_files(corpus_dir, recursive=recursive)
 
-    # 第一趟：解析每个文件的文件级日期与窗口号，供第二趟跨层继承用
+    # 第一趟：解析每个文件的文件级日期与窗口号，供第二趟跨层继承用。
+    # **顺序推断先于日期解析**：`3/5/2026` 这种歧义日期要靠同一份语料里别的块
+    # （比如 `7/22/2026`）提供的决定性证据才敢解，所以先把所有文本读进来推一次，
+    # 再拿结论去解析——这也是它属于第一趟的原因
+    raw = {}
+    for p in files:
+        raw[p] = (p.read_text(encoding="utf-8"), p.stat().st_mtime)
+    date_order = infer_date_order([t for t, _ in raw.values()])
     file_info = {}
     for p in files:
-        text = p.read_text(encoding="utf-8")
-        mtime = p.stat().st_mtime
+        text, mtime = raw[p]
         ts, _ = parse_chunk_timestamp(p.name, "\n".join(_head_lines(text)),
-                                      datetime.fromtimestamp(mtime).year)
+                                      datetime.fromtimestamp(mtime).year, date_order)
         file_info[p] = {"text": text, "mtime": mtime, "file_ts": ts,
                         "window": parse_window_no(p.name), "layer": layer_of(p)}
     # 窗口号 → 该窗已知的日期（同一窗口号的不同层共享一次会话，取先解析出的那个）
@@ -910,13 +1006,16 @@ def load_corpus(corpus_dir, embed=False, recursive=True, provider=None, cache_pa
 
     for p in files:
         info = file_info[p]
-        for chunk, meta in timeline_chunks(info["text"], p.name, info["mtime"]):
+        for chunk, meta in timeline_chunks(info["text"], p.name, info["mtime"], date_order):
             meta["window"], meta["layer"] = info["window"], info["layer"]
             if meta["timestamp_source"] == "mtime":
                 borrowed = window_ts.get(info["window"])
                 if borrowed is not None:
                     meta["timestamp"], meta["timestamp_source"] = borrowed, "window_sibling"
             index.add(chunk, meta)
+    # 推断结论挂在库上，**让它可见**：出了问题能一眼看出"这份语料被按哪种顺序解的"，
+    # 而不是只能从时间戳倒推。None＝没找到决定性证据，那些歧义日期没被采信
+    index.date_order = date_order
     return index.build()
 
 
@@ -1442,6 +1541,104 @@ def _selftest(embed=False):
         assert all(m["window"] == 7 for m in corpus.meta), "窗口号该进 meta"
         #   非递归模式下同一个根目录一个文件都吃不到（对照，证明递归确实在起作用）
         assert load_corpus(root, recursive=False).chunks == []
+
+    # 15b.【变异靶心：导出器原样格式的日期】**这一类语料从来没进过任何测试**：
+    #      我们自己的 write_corpus 写出的是 ISO（`# 第1个窗口 · 2025-07-15`），
+    #      所有自产自销的回归都走 ISO；memory_import 那边认的是 json 结构。
+    #      而"直接拿导出器吐出来的 md 建库"是最省事、因此最多人走的一条路——
+    #      2026.08.02 内测用户就是这么撞上的：头行 `> 7/22/2026 12:54:09` 一个都
+    #      认不出来，整份语料的块全落 mtime，开场召回按新鲜度排序当场失效。
+    #      语料样本是自己造的（用户明确说内容私人不给，我们也不要）。
+    def _mk(td, name, text):
+        Path(td, name).write_text(text, encoding="utf-8")
+
+    #   a) `> M/D/YYYY HH:MM:SS`：22 只能是日，单块就能定，不依赖语料级推断
+    with tempfile.TemporaryDirectory() as td:
+        _mk(td, "chat.md", "# 聊天记录\n> 7/22/2026 12:54:09\n\n## 晚上\n聊了买望远镜的事。\n")
+        c = load_corpus(td)
+        m = c.meta[0]
+        assert m["timestamp_source"] == "chunk_head_slash", \
+            f"导出器格式该被认出来，而不是落兜底：{m['timestamp_source']}"
+        assert datetime.fromtimestamp(m["timestamp"]).strftime("%Y-%m-%d") == "2026-07-22"
+
+    #   b) `2026/7/15`：斜杠但年在前，没有歧义
+    with tempfile.TemporaryDirectory() as td:
+        _mk(td, "a.md", "# 2026/7/15 那天\n\n## 下午\n修好了咖啡机。\n")
+        m = load_corpus(td).meta[0]
+        assert m["timestamp_source"] == "chunk_head_slash"
+        assert datetime.fromtimestamp(m["timestamp"]).strftime("%Y-%m-%d") == "2026-07-15"
+
+    #   c) **歧义 + 语料里有决定性证据**：3/5 两解都通，但同一份语料里的 7/22
+    #      证明这个导出器写的是月/日/年，于是 3/5 按 3 月 5 日解。
+    #      这正是"推断放在语料范围、不放在单块"的理由——单看那个文件永远推不出来
+    with tempfile.TemporaryDirectory() as td:
+        _mk(td, "a.md", "# 记录\n> 7/22/2026 12:54:09\n\n## 晚上\n买了望远镜。\n")
+        _mk(td, "b.md", "# 记录\n> 3/5/2026 09:00:00\n\n## 早上\n煮了粥。\n")
+        c = load_corpus(td)
+        assert c.date_order == "mdy", f"语料里有 7/22 这条决定性证据：{c.date_order}"
+        got = {datetime.fromtimestamp(m["timestamp"]).strftime("%Y-%m-%d")
+               for m in c.meta if "粥" in c.chunks[c.meta.index(m)]}
+        assert got == {"2026-03-05"}, f"有证据时歧义日期该按月/日序解：{got}"
+
+    #   d) **歧义 + 没有任何证据**：必须退到下一级兜底，**不许默认按美式猜**。
+    #      这一格是本单最要紧的一条：用户说了他们语料里没出现过这种，
+    #      也就是说"默认美式"那条路一次都没被真实数据验过，不能假装它验过
+    with tempfile.TemporaryDirectory() as td:
+        _mk(td, "b.md", "# 记录\n> 3/5/2026 09:00:00\n\n## 早上\n煮了粥。\n")
+        c = load_corpus(td)
+        assert c.date_order is None, "没有决定性证据时不许选边"
+        assert all(m["timestamp_source"] == "mtime" for m in c.meta), \
+            f"歧义又无依据时该退兜底、把成色标出来，不许猜一个日期：" \
+            f"{[m['timestamp_source'] for m in c.meta]}"
+
+    #   e) 欧式 `22/7/2026`：首位 >12 → 日/月序，同样单块就能定
+    with tempfile.TemporaryDirectory() as td:
+        _mk(td, "eu.md", "# 记录\n> 22/7/2026 08:00:00\n\n## 早上\n出门散步。\n")
+        c = load_corpus(td)
+        assert c.date_order == "dmy"
+        assert datetime.fromtimestamp(c.meta[0]["timestamp"]).strftime("%Y-%m-%d") == "2026-07-22"
+
+    #   f) **正文里的 7/11 与 3.5 倍不许被命中**——只扫 head 那条约束的靶子。
+    #      要放宽"只在 _head_lines 里查"必须先有断言证明不引入误判，这就是那条断言
+    with tempfile.TemporaryDirectory() as td:
+        #   正文里放三样东西，各自试一层防线：
+        #     `7/11 优惠`  —— 挡它的其实是**正则要求年份**，不是 head 限制；
+        #     `3.5 倍`     —— 挡它的是短日期只扫标题行；
+        #     `3/14/2026`  —— **这条才是 head 限制的靶子**：完整的斜杠日期，
+        #                     正则拦不住它，只有"不扫正文"这条能拦。
+        #   第一版这里只有前两样，于是把 head 限制放宽成扫全文时自检照样全绿
+        #   （变异④当场绿着过去了）——**防线要各自有各自的靶子**
+        #   ⚠ `_head_lines` 取的是 chunk 的**前 3 个非空行**，所以要测"不扫正文"
+        #     这条，正文里那个日期必须落在第 4 行之后——写在第 2 行的话它本来就在
+        #     head 里，测的就不是这条防线了（第一版就是这么写的，基线当场红）
+        _mk(td, "noise.md",
+            "# 没有日期的标题\n\n## 聊天\n昨天下午出门。\n路上买了点东西。\n"
+            "我们聊到 7/11 优惠，还有 3.5 倍的价格；他生日是 3/14/2026，记一下。\n")
+        c = load_corpus(td)
+        assert all(m["timestamp_source"] == "mtime" for m in c.meta), \
+            f"正文里的日期被当成块时间戳了（7/11 / 3.5 / 3/14/2026）：" \
+            f"{[m['timestamp_source'] for m in c.meta]}"
+        assert c.date_order is None, \
+            "正文里的 3/14/2026 不该被拿去当顺序证据——顺序推断同样只看 head"
+        #   同一份正文，日期挪到 head 里就该认出来——证明上面那条不是因为解析器坏了。
+        #   对照组的日期**必须是无歧义的**（22 只能是日）：第一版这里写的是
+        #   `7/11/2026`，它本身两解都通、被正确拒掉，于是这条对照证明不了任何事
+        _mk(td, "noise.md",
+            "# 标题\n> 7/22/2026 10:00:00\n\n## 聊天\n我们聊到 7/11 优惠，还有 3.5 倍的价格。\n")
+        c2 = load_corpus(td)
+        assert c2.meta[0]["timestamp_source"] == "chunk_head_slash", \
+            "同样的正文、日期写在 head 就该认出来——不然上面那条只是解析器坏了"
+
+    #   g) 语料自相矛盾（两种证据都有）：不选边，退兜底
+    with tempfile.TemporaryDirectory() as td:
+        _mk(td, "a.md", "# 记录\n> 7/22/2026 1:00:00\n\n## 晚上\n甲。\n")
+        _mk(td, "b.md", "# 记录\n> 22/7/2026 1:00:00\n\n## 晚上\n乙。\n")
+        _mk(td, "c.md", "# 记录\n> 3/5/2026 1:00:00\n\n## 晚上\n丙。\n")
+        c = load_corpus(td)
+        assert c.date_order is None, "两种证据都有＝语料不自洽，猜哪边都可能错半份"
+        amb = [m for m, ch in zip(c.meta, c.chunks) if "丙" in ch]
+        assert all(m["timestamp_source"] == "mtime" for m in amb), \
+            "自相矛盾时那条歧义日期不许被采信"
 
     # 16.【变异靶心：权重跟内容走，不跟位置走】用进废退权重的持久化
     #     server 是 stdio 进程、客户端每次会话都可能重启它——权重不落盘的话每次

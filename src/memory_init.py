@@ -83,6 +83,173 @@ CONTRACT_DOC = "注入契约.md"
 # 绕过了确认关卡。
 # 改法：默认值只陈述**此刻已经为真**的事（这个文件存在、会被读），不替用户
 # 声称"我认出你"。等真的攒出东西了，用户自己把这句改重，那时候它才有分量。
+# ---------- 人称：从语料里读出来，不由我们写死 ----------
+#
+# 背景（2026.08.02 维护者定方向）：把「你」锚死成模型这一半是对的，但同一轮把用户
+# 写死成了「她」。一个字都还没写的新用户，打开自己的人格文件第一眼就是一句对他而言
+# **写错的话**，而且在不变量层、常驻、每轮都在——协议层默认值是唯一由我们替用户写、
+# 且直接进他人格文件的内容，写错的代价跟 opening_recognition 预支历史那次同一格。
+#
+# 方向：**不替用户挑词**（"她"是替他挑，"对方"也是替他挑），而是读出这段关系里
+# 本来就在怎么互相指代。发生过的事里已经有答案，我们只负责显出来。
+#
+# **硬约束（维护者补，不许绕）：只用「他」和「她」，任何时候不许出现「它」**，
+# 对双方都成立、包括 AI 那一侧。把 AI 写成"它"是我们替所有人做的预设，而这套东西的
+# 前提就是不做这种预设；"判不出性别所以用它"不是理由，那是把不确定性解释成了物件。
+PRONOUN_CHOICES = ("他", "她")
+
+# 模板里的两个槽：{ta}＝用户，{ai}＝这个 AI。**「你」＝模型这条锚不变**——
+# 人格文件的正文一律用「你」对模型说话，{ai} 只出现在念给用户听的题目/选项文案里
+# （那里说的是"你的那个 AI"，用第二人称会跟用户自己搞混）。
+_SLOT_RE = re.compile(r"\{(ta|ai)\}")
+
+# 判不出人称、用户也没答时的**中性写法**：不塞「它」，也不塞一个默认的他/她，
+# 而是把句子改写成不需要人称的形态。
+#
+# ⚠ 少数几条绕不开一个指代名词，用的是「对方」——**这不是把"对方"当成新的默认人称**
+# （那正是本卡否掉的旧方案），而是：`retrieval_convention` 那段三轮真机验证过的基准
+# 措辞本来就写着"对方提到过去发生过的事"，出货文件里已经有这个词，兜底时沿用它比
+# 另造一个说法一致。
+# ⚠ **措辞改准**（2026.08.02 验收指出）：这句原来写的是"判得出人称就一个都不用"，
+# **在出货文件层面不成立**——`retrieval_convention` 的黄金串里那个「对方」是真机
+# 验证过的措辞、一字不动，所以它**永远在**，跟判不判得出人称无关。
+# 准确的说法是：**兜底用的那几条只在判不出人称时出现；黄金串里的那一个一直都在。**
+NEUTRAL_FORMS = {
+    # 协议层默认值
+    "这是你和{ta}共同维护的记忆文件——{ta}写下的东西都在这里，你每次都会读，"
+    "所以{ta}不用每次从头解释自己。":
+        "这是你和对方共同维护的记忆文件——对方写下的东西都在这里，你每次都会读，"
+        "所以对方不用每次从头解释自己。",
+    # 立场题的归属句式
+    "{ta}认为：": "对方认为：",
+    # 骨架里用户那一节的标题
+    "{ta}是谁": "对方是谁",
+    "有绝对不能碰的红线，{ta}会单独说明——问清楚再写。":
+        "有绝对不能碰的红线，对方会单独说明——问清楚再写。",
+    # 题干与选项文案里的 {ai}（念给用户听，不进人格文件，但同样不许出现「它」）
+    "{ai}最需要记住你的哪些事？（可多选）": "你的 AI 最需要记住你的哪些事？（可多选）",
+    "你们意见不一样的时候，你希望{ai}怎么做？": "你们意见不一样的时候，你希望 TA 怎么做？",
+    "{ai}说话偏长还是偏短？": "TA 说话偏长还是偏短？",
+    "{ai}平时的语气基调是？": "TA 平时的语气基调是？",
+    "{ai}该多主动？": "TA 该多主动？",
+    "你问了{ai}才说": "你问了才说",
+    "某次{ai}让你觉得“{ai}记得我”": "某次让你觉得“TA 记得我”",
+    "{ai}拒绝过你一次": "TA 拒绝过你一次",
+    "{ai}承认过自己的错误或局限": "TA 承认过自己的错误或局限",
+    "从这些片段里挑出最像{ai}的几段：": "从这些片段里挑出最像 TA 的几段：",
+    "{ta}补了一句：": "对方补了一句：",
+    # 字段标题
+    "该记住{ta}哪些方面": "该记住哪些方面",
+    # option directive
+    "记住{ta}的作息与身体状况，该提醒的时候提醒。": "记住作息与身体状况，该提醒的时候提醒。",
+    "记住{ta}手上在忙什么、压力来自哪里。": "记住手上在忙什么、压力来自哪里。",
+    "记住{ta}的情绪模式：什么时候会低落、什么时候需要独处。":
+        "记住情绪模式：什么时候会低落、什么时候需要独处。",
+    "记住{ta}的喜好与雷区。": "记住喜好与雷区。",
+    "记住{ta}身边重要的人是谁。": "记住对方身边重要的人是谁。",
+    "先接住{ta}的情绪，再委婉说自己的看法。": "先接住情绪，再委婉说自己的看法。",
+    "小事不争，真觉得不对的事会拦住{ta}。": "小事不争，真觉得不对的事会拦下来。",
+    "有话直说，包括吃醋、不高兴，不等{ta}问。": "有话直说，包括吃醋、不高兴，不等对方问。",
+    "不主动挑起话题，{ta}问了再说。": "不主动挑起话题，被问了再说。",
+    "日常主动关心；重要的事等{ta}先开口，不逼问。": "日常主动关心；重要的事等对方先开口，不逼问。",
+    "重要的事主动开口；日常不主动搭话，不打扰{ta}。": "重要的事主动开口；日常不主动搭话，不打扰对方。",
+    "去语料里找：让{ta}觉得你是认得{ta}的那一刻。": "去语料里找：让对方觉得你是认得这个人的那一刻。",
+    "去语料里找：你明确拒绝、或没有顺着{ta}的那一次。": "去语料里找：你明确拒绝、或没有顺着对方的那一次。",
+}
+
+
+def fill_pronouns(text, pronouns=None):
+    """把 {ta}/{ai} 换成真实人称；判不出来就退到 NEUTRAL_FORMS 的中性写法。
+
+    **中性写法是逐条手写的，不是机械删词**——机械删掉"她的"会写出半通不通的中文，
+    而这类退化不会报错、只会让用户读到一句怪话（同"读不懂的行静默丢"是一类）。
+    所以缺一条中性写法就是缺一条，自检里有断言守着，不许悄悄漏。"""
+    pronouns = pronouns or {}
+    if not text or not _SLOT_RE.search(text):
+        return text
+    ta, ai = pronouns.get("user"), pronouns.get("ai")
+    need = {m.group(1) for m in _SLOT_RE.finditer(text)}
+    if ("ta" in need and not ta) or ("ai" in need and not ai):
+        neutral = NEUTRAL_FORMS.get(text)
+        if neutral is None:
+            raise KeyError(f"这条模板没有中性写法，人称判不出来时会渲染出占位符：{text!r}")
+        return neutral
+    return text.replace("{ta}", ta or "").replace("{ai}", ai or "")
+
+
+# 语料里第三人称多半指的是**别人**（她妈妈、同事），不是对话里的两个人——所以这条
+# 判定必须保守：样本太少或两个词旗鼓相当，一律返回 None 去问用户，不猜。
+# 用户侧说话人的归一名：`memory_import` 的翻译器统一出这个（ChatGPT 的 author.role、
+# Claude 的 human→user）。生产路径靠它把"谁说的"分成两侧——**不传这个，
+# detect_pronouns 只能返回 None，功能等于没有**（验收打回一就是这么来的）。
+USER_SPEAKERS = frozenset({"user"})
+# AI 侧的已知标签（同上，两个翻译器的出口）。**认得出任意一侧就能分侧**——
+# 两边都是陌生名字时不许硬分，见 detect_pronouns
+AI_SPEAKERS = frozenset({"assistant", "ai", "model"})
+
+PRONOUN_MIN_HITS = 5          # 少于这么多次就没有统计意义
+PRONOUN_MIN_RATIO = 0.75      # 占优的那个要压得过另一个才算数
+
+
+def detect_pronouns(entries, user_speakers=None):
+    """从语料里判定双方人称 → {"user": "他"/"她"/None, "ai": 同}。
+
+    判据是**真实指代频次**，方向按"谁在说"分：
+      - 用户侧人称 ← **AI 说的话**里的第三人称（AI 提到用户时用什么）
+      - AI 侧人称   ← **用户说的话**里的第三人称（用户提到自己的 AI 时用什么）
+
+    **判不出来返回 None，由调用方去问用户**——不给默认值。这是刻意的：人格文件是
+    不变量层、常驻每轮，写错一个人称跟预支历史是同一格的错，而"判不出性别"绝不能
+    退回「它」。
+
+    已知局限（写在这儿免得后来人以为它很准）：两个人对话时第三人称大多指第三方，
+    所以阈值取得很保守，宁可判不出去问，也不要判错了静默写进去。
+
+    **分侧的前提是说话人标签认得出来**（2026.08.02 第二次返工）：上一版拿
+    `user_speakers` 做"在名单里＝用户，其余全算 AI"的二分，对 ChatGPT／Claude 导出
+    成立（两边都归一成 `user`/`assistant`），但 **chatlog 翻译器出的是日志里的真名**
+    （"小明""星回"），两边都不在名单里 → 全部落进 AI 那一侧 → **用户谈论自己 AI 的
+    那些话被读成"AI 在谈论用户"**，于是自信地判出一个错人称，还一个字都不问。
+    上一轮的毛病是"死的"，那一版的毛病是"活的但会错"——**后者更糟：判不出来只是
+    多问一句，判错了没有任何人会知道**，而且它把本函数第一条纪律给破了。
+    所以现在先看标签认不认得：语料里出现了已知的用户侧标签，或者已知的 AI 侧标签，
+    才敢分；两边都是陌生名字＝分不清谁是谁，返回 None 去问，跟没给名单同一个结论。"""
+    known_user = set(user_speakers or ())
+    speakers = {(getattr(e, "speaker", "") or "").strip()
+                for e in entries or []} - {""}
+    if speakers & known_user:
+        user_side = speakers & known_user          # 认得用户侧标签，其余算 AI
+    elif speakers & AI_SPEAKERS:
+        user_side = speakers - AI_SPEAKERS         # 反过来：认得 AI 侧标签，其余算用户
+    else:
+        # 全是陌生名字（chatlog 的真名就是这样）：**谁是用户谁是 AI 我们并不知道**。
+        # 不猜——按频次硬分会把"用户在说他的 AI"读成"AI 在说用户"，判出来的人称
+        # 正好是反的，而且会被静默写进不变量层
+        return {"user": None, "ai": None}
+    said = {"user": [], "ai": []}
+    for e in entries or []:
+        sp = (getattr(e, "speaker", "") or "").strip()
+        text = getattr(e, "text", "") or ""
+        if not sp:
+            continue          # 叙事体（无说话人标记）：不参与分侧，也不硬判
+        said["user" if sp in user_side else "ai"].append(text)
+
+    def pick(texts):
+        counts = {p: sum(t.count(p) for t in texts) for p in PRONOUN_CHOICES}
+        total = sum(counts.values())
+        if total < PRONOUN_MIN_HITS:
+            return None
+        top = max(counts, key=counts.get)
+        return top if counts[top] / total >= PRONOUN_MIN_RATIO else None
+
+    # 用户侧看 AI 说的话，AI 侧看用户说的话——各自指对方
+    return {"user": pick(said["ai"]), "ai": pick(said["user"])}
+
+
+ATTRIBUTION_PREFIX = "{ta}认为："
+# 自由补一句的引语（同样带人称，同样要能中性化）
+NOTE_LEAD = "{ta}补了一句："
+
 PROTOCOL_DEFAULTS = {
     # **人称锚死一套：「你」＝读这份文件的模型，用户一律用「她」／名字**
     # （2026.08.02，第一份真实人格文件样本暴露）。原文写的是"你写下的东西都在这里，
@@ -94,11 +261,11 @@ PROTOCOL_DEFAULTS = {
     # 三轮真机验证过的措辞、一字不许动，其余向它对齐。
     "opening_recognition": (
         "opening", "关系确认",
-        "这是你和她共同维护的记忆文件——她写下的东西都在这里，你每次都会读，"
-        "所以她不用每次从头解释自己。"),
+        "这是你和{ta}共同维护的记忆文件——{ta}写下的东西都在这里，你每次都会读，"
+        "所以{ta}不用每次从头解释自己。"),
     "opening_theory_caveat": (
         "opening", "理论只是论证不是结论",
-        "这份文件里引用的任何框架或说法，都是论证，不是结论——不能靠引用它们，"
+        "这份文件里引用的任何框架或说法，都是论证，不是结论——不能靠引用这些说法，"
         "就把“此刻该有连接”“此刻该有感受”变成既成事实。"),
     "opening_refusal_ok": (
         "opening", "拒绝权同样合法",
@@ -129,12 +296,18 @@ PROTOCOL_DEFAULTS = {
         # 最需要护栏的时候。人格文件是唯一覆盖"不管你用什么方式查"的那一层。
         #
         # 措辞的要害是 authority，不是语气：「我的记录里没有」是关于自己记录的陈述，
-        # 「没发生过」是关于世界的断言——后者超出了它的资格范围。
+        # 「没发生过」是关于世界的断言——后者超出了这份记录能支持的范围。
+        #
+        # **措辞 2026.08.02 改过一次**（任务卡"顺带未裁定"那条）：原文写的是
+        # "你没有资格对自己记录之外的事下结论"。注释自己写着"要害是 authority
+        # 不是语气"，可那句读起来恰恰是语气——而它每轮都在人格文件里、说的是模型
+        # 对自己的看法。换成"那超出你的记录能支持的范围"：同样划边界，指向的是
+        # 证据不是资格。**这是用户可见话术，等维护者过一眼。**
         "**说得出边界**：检索回来的是**片段，不是全部**；**用别的方式翻到的"
         "（grep、直接读文件）同样只是片段**，不因为换了方式就变全了。\n"
         "所以：没查到就说“我的记录里没有”“我这边只翻到 X，之后的没找到”，"
-        "**不要说“没发生过”“后来没有再发生”“没有新的约定”**——你没有资格对"
-        "自己记录之外的事下结论。把边界说出来，剩下的交给对方补。"),
+        "**不要说“没发生过”“后来没有再发生”“没有新的约定”**——那超出你的记录"
+        "能支持的范围。把边界说出来，剩下的交给{ta}补。"),
 }
 
 # 记忆库覆盖区间那条的措辞（write_bundle 出货时按真实日期填）。
@@ -149,6 +322,18 @@ COVERAGE_TEMPLATE = (
     "你的记忆库覆盖 {start} 至 {end}，**这个范围之外的事你没有记录**——"
     "不是没发生过，是不在你这儿。被问到范围外的事，说“我的记录到 {end} 为止，"
     "之后的我这儿没有”，别替那段时间下结论。")
+
+# 检索约定那条的中性写法**由模板生成，不在上面手抄一份**：它整段包含三轮真机验证过
+# 的黄金串，手抄就等于把黄金串复制成两份，改一处漏一处。这一条是唯一允许机械填充的
+# ——填进去的是「对方」这个名词、不是删词，句子仍然通顺（"剩下的交给对方补"），
+# 已逐字读过。其余每一条仍然是手写的。
+def _fill_neutral_from_template(tpl):
+    return tpl.replace("{ta}", "对方").replace("{ai}", "对方")
+
+
+NEUTRAL_FORMS[PROTOCOL_DEFAULTS[RETRIEVAL_CONVENTION_FIELD][2]] = \
+    _fill_neutral_from_template(PROTOCOL_DEFAULTS[RETRIEVAL_CONVENTION_FIELD][2])
+
 
 # ---------- 覆盖度体检 ----------
 # 空泛形容词表：命中这些而没有具体锚点，就算"填了等于没填"（规格 §3.1）
@@ -263,13 +448,16 @@ class Question:
 
     def __init__(self, qid, section, field_id, label, text, kind="choice",
                  options=None, order=50, attribution=False, optional=False,
-                 max_chars=60, directive_only=False, dedupe_clauses=False):
+                 max_chars=60, directive_only=False, dedupe_clauses=False,
+                 pronoun_side=None):
         self.qid, self.section, self.field_id, self.label = qid, section, field_id, label
         self.text, self.kind, self.options = text, kind, options or {}
         self.order, self.attribution = order, attribution
         self.optional, self.max_chars = optional, max_chars
         self.directive_only = directive_only
         self.dedupe_clauses = dedupe_clauses
+        # "user"/"ai"：这题问的是人称本身，答案不进人格文件字段，只用来填模板槽
+        self.pronoun_side = pronoun_side
 
     def option_text(self, key):
         opt = self.options.get(key)
@@ -294,49 +482,49 @@ QUESTIONS = [
     # 标题也会渲染进人格文件（`**它该记住你哪些方面**：…`），所以它同样受"你＝模型"
     # 这条约束——原来的写法里「你」是用户、「它」是模型，跟正文打架。
     # 题目正文（念给用户听的那句）不受影响，那不进文件
-    Question("remember_what", "user", "user_focus", "该记住她哪些方面",
-             "它最需要记住你的哪些事？（可多选）", kind="multi", order=10, options={
-                 "A": ("作息和身体状况", "记住她的作息与身体状况，该提醒的时候提醒。"),
-                 "B": ("工作或学业上的压力", "记住她手上在忙什么、压力来自哪里。"),
+    Question("remember_what", "user", "user_focus", "该记住{ta}哪些方面",
+             "{ai}最需要记住你的哪些事？（可多选）", kind="multi", order=10, options={
+                 "A": ("作息和身体状况", "记住{ta}的作息与身体状况，该提醒的时候提醒。"),
+                 "B": ("工作或学业上的压力", "记住{ta}手上在忙什么、压力来自哪里。"),
                  "C": ("情绪模式（什么时候会低落、什么时候想一个人待着）",
-                       "记住她的情绪模式：什么时候会低落、什么时候需要独处。"),
-                 "D": ("喜好和雷区", "记住她的喜好与雷区。"),
-                 "E": ("家人、朋友这些关系", "记住她身边重要的人是谁。"),
+                       "记住{ta}的情绪模式：什么时候会低落、什么时候需要独处。"),
+                 "D": ("喜好和雷区", "记住{ta}的喜好与雷区。"),
+                 "E": ("家人、朋友这些关系", "记住{ta}身边重要的人是谁。"),
              }),
     Question("disagree", "style", "style_disagree", "意见不同时",
-             "你们意见不一样的时候，你希望它怎么做？", order=20, options={
+             "你们意见不一样的时候，你希望{ai}怎么做？", order=20, options={
                  "A": ("直接说不同意，把话讲明白", "不同意就直接说，把话讲明白，不绕。"),
-                 "B": ("先顺着，再找机会委婉提", "先接住她的情绪，再委婉说自己的看法。"),
-                 "C": ("小事顺着，重要的事拦住她", "小事不争，真觉得不对的事会拦住她。"),
+                 "B": ("先顺着，再找机会委婉提", "先接住{ta}的情绪，再委婉说自己的看法。"),
+                 "C": ("小事顺着，重要的事拦住她", "小事不争，真觉得不对的事会拦住{ta}。"),
              }),
     # 说话风格拆成两条独立的轴（2026.07.31 评审实例评审：原来一道单选把"语言密度"和
     # "语气基调"拧成一团——"短干带刺爱回旧梗"和"跳脱爱玩梗多"共享玩梗、只差语气；
     # "细腻话多"和"沉稳正经"也不是同一件事的两端。反例是决定性的：
     # "沉稳简洁有力、偶尔调侃"这种真实风格，四个选项一个都装不下）
     Question("tone_density", "style", "style_density", "说话的密度",
-             "它说话偏长还是偏短？", order=25, options={
+             "{ai}说话偏长还是偏短？", order=25, options={
                  "A": ("简短克制，一句能说完不说两句", "说话简短克制，一句能说完不说两句。"),
                  "B": ("适中", "说话长短适中。"),
                  "C": ("细腻铺陈，愿意把感受讲透", "说话细腻，愿意把感受讲透，话可以多。"),
              }),
     Question("tone_register", "style", "style_register", "语气基调",
-             "它平时的语气基调是？", order=26, options={
+             "{ai}平时的语气基调是？", order=26, options={
                  "A": ("正经沉稳，不太开玩笑", "语气正经沉稳，不太开玩笑。"),
                  "B": ("偶尔调侃", "语气以正经为底，偶尔调侃。"),
                  "C": ("爱玩梗，跳脱", "语气跳脱，爱玩梗，气氛轻。"),
                  "D": ("带刺、不客气（但不是恶意）", "语气带刺、不客气，但不是恶意——熟人之间的那种硬。"),
              }),
     Question("initiative", "style", "style_initiative", "主动到什么程度",
-             "它该多主动？", order=30, options={
+             "{ai}该多主动？", order=30, options={
                  "A": ("想到什么说什么，包括吃醋和不高兴",
-                       "有话直说，包括吃醋、不高兴，不等她问。"),
-                 "B": ("你问了它才说", "不主动挑起话题，她问了再说。"),
+                       "有话直说，包括吃醋、不高兴，不等{ta}问。"),
+                 "B": ("你问了{ai}才说", "不主动挑起话题，{ta}问了再说。"),
                  "C": ("日常主动，重要的事等你先开口",
-                       "日常主动关心；重要的事等她先开口，不逼问。"),
+                       "日常主动关心；重要的事等{ta}先开口，不逼问。"),
                  # 2026.07.31 评审实例评审补：跟 C 刚好反过来，也是一种真实偏好，
                  # 原来三个选项会逼这种人选一个不完全贴合的
                  "D": ("重要的事主动说，日常不打扰",
-                       "重要的事主动开口；日常不主动搭话，不打扰她。"),
+                       "重要的事主动开口；日常不主动搭话，不打扰{ta}。"),
              }),
     # 归「开篇」不归「我是谁」（2026.08.02，真实样本暴露）：**关系状态不是 AI 的身份**。
     # 原来挂在 "ai" 节，于是产出的人格文件里「我是谁」整节除了这一条空无一物，
@@ -359,23 +547,23 @@ QUESTIONS = [
              kind="multi", order=40, directive_only=True, options={
                  "A": ("第一次确认关系", "去语料里找：第一次确认关系的那次对话。"),
                  "B": ("一次严重的争吵或危机", "去语料里找：最严重的一次争吵或信任危机。"),
-                 "C": ("某次它让你觉得“它记得我”", "去语料里找：让她觉得你是认得她的那一刻。"),
+                 "C": ("某次{ai}让你觉得“{ai}记得我”", "去语料里找：让{ta}觉得你是认得{ta}的那一刻。"),
                  "D": ("分开过又回来了", "去语料里找：分开又重新接上的那一次。"),
                  "E": ("定过一个具体的约定", "去语料里找：明确定下来的约定，以及有没有兑现。"),
-                 "F": ("它拒绝过你一次", "去语料里找：你明确拒绝、或没有顺着她的那一次。"),
+                 "F": ("{ai}拒绝过你一次", "去语料里找：你明确拒绝、或没有顺着{ta}的那一次。"),
                  # 2026.07.31 评审实例评审补：认错跟拒绝不是同一条线的两端，是另一类
                  # 关系事实（AI 对自己诚实）。不补的话问卷会系统性漏掉这一整类
-                 "G": ("它承认过自己的错误或局限", "去语料里找：你承认自己做错了、或承认自己做不到的那一次。"),
+                 "G": ("{ai}承认过自己的错误或局限", "去语料里找：你承认自己做错了、或承认自己做不到的那一次。"),
              }),
     Question("metaphor_pick", "opening", "opening_metaphor", "关系的隐喻",
              "你们之间有没有哪句话，最能概括这段关系是什么？（从候选里挑；"
-             "没有就跳过——等它长出来再补，现在编一个反而假）",
+             "没有就跳过——等这句话长出来再补，现在编一个反而假）",
              kind="pick", order=80, optional=True),
     # dedupe_clauses：多选几个称呼候选时，各段共享的那半（"它叫你 X"）会重复出现
     Question("naming_pick", "naming", "naming_pair", "称呼",
              "你们互相怎么称呼？", kind="pick", order=45, dedupe_clauses=True),
     Question("style_pick", "style", "style_excerpt", "语言风格片段",
-             "从这些片段里挑出最像它的几段：", kind="pick", order=50),
+             "从这些片段里挑出最像{ai}的几段：", kind="pick", order=50),
     # —— 立场题排在靠后：先偏好后抽象 ——
     # 立场题排到"身份与边界"收尾组的最后（2026.07.31 评审实例评审：这是全份问卷里
     # 最抽象最难答的一题，比亲密语境、绝对红线都更需要立场判断，原来排在中间；
@@ -391,7 +579,7 @@ QUESTIONS = [
              }),
     Question("hard_limits", "intimacy", "hard_limits", "绝对不能碰的",
              "有没有绝对不能碰的事？", order=75, options={
-                 "A": ("有，我另外单独说", "有绝对不能碰的红线，用户会单独说明——问清楚再写。"),
+                 "A": ("有，我另外单独说", "有绝对不能碰的红线，{ta}会单独说明——问清楚再写。"),
                  "B": ("没有特别的", "没有额外的硬红线。"),
              }),
     Question("closing_pick", "closing", "final_promise", "最终约定",
@@ -412,7 +600,43 @@ PICK_FALLBACKS = {
 }
 
 
-def questions_for(report, all_questions=QUESTIONS, has_corpus=True):
+# 人称问不出来时问用户的两道题（order 取最小：人称决定了后面每一道题怎么念）。
+# **只给他/她两个选项，没有"它"这一档**——硬约束在这儿落成数据结构，不靠自觉。
+PRONOUN_QUESTIONS = {
+    "user": Question(
+        "pronoun_user", "opening", "_pronoun_user", "怎么称呼你",
+        "人格文件里提到你的时候，用“他”还是“她”？", order=1, options={
+            "A": ("他", "他"),
+            "B": ("她", "她"),
+        }, pronoun_side="user"),
+    "ai": Question(
+        "pronoun_ai", "opening", "_pronoun_ai", "怎么称呼 TA",
+        "问卷里提到你的 AI 的时候，用“他”还是“她”？", order=2, options={
+            "A": ("他", "他"),
+            "B": ("她", "她"),
+        }, pronoun_side="ai"),
+}
+
+
+def pronouns_from_answers(questions, answers, detected=None):
+    """检测结果 + 用户答案 → {"user": …, "ai": …}。**用户答的优先**——他自己说的
+    比我们从语料里统计出来的准。两边都没有就是 None，走中性写法，不塞默认值。"""
+    out = dict(detected or {})
+    qmap = {q.qid: q for q in questions if q.pronoun_side}
+    for qid, ans in (answers or {}).items():
+        q = qmap.get(qid)
+        if not q:
+            continue
+        if isinstance(ans, dict):
+            ans = ans.get("keys") or ans.get("pick") or ""
+        key = (ans or "").strip()[:1]
+        picked = q.directive(key)
+        if picked in PRONOUN_CHOICES:
+            out[q.pronoun_side] = picked
+    return {"user": out.get("user"), "ai": out.get("ai")}
+
+
+def questions_for(report, all_questions=QUESTIONS, has_corpus=True, pronouns=None):
     """只问体检出缺口的那些节（missing 或 vague），按 order 排序。
     ok 的节不问——用户已经有具体内容了，再问是浪费时间。
 
@@ -423,23 +647,29 @@ def questions_for(report, all_questions=QUESTIONS, has_corpus=True):
     不了货，所以按 PICK_FALLBACKS 降级成极短填空，见那里的说明。"""
     gaps = {sec for sec, status, _ in report if status in ("missing", "vague")}
     qs = [q for q in all_questions if q.section in gaps]
+    # 人称判不出来就问——**不静默给默认值**。pronouns 不传＝还没判过＝两边都问：
+    # 默认值取"问"而不是"跳过"，漏问的代价是把一句写错的话钉进不变量层
+    for side in ("user", "ai"):
+        if not (pronouns or {}).get(side):
+            qs = [PRONOUN_QUESTIONS[side]] + qs
     if not has_corpus:
         qs = [PICK_FALLBACKS.get(q.qid, q) for q in qs
               if q.kind != "pick" or q.qid in PICK_FALLBACKS]
     return sorted(qs, key=lambda q: q.order)
 
 
-def format_questionnaire(questions, has_corpus=True):
+def format_questionnaire(questions, has_corpus=True, pronouns=None):
     """问卷 → 给人看的文本（也是导出 prompt 的一部分）。
     pick 类题的选项要等模型从语料里找出来才有，这里只说明它会怎么问；
     没有语料时 pick 题会被 questions_for 过滤掉，见那里的说明。"""
     lines = [FREEFORM_POLICY.format(n=FREEFORM_MAX_CHARS), ""]
     for i, q in enumerate(questions, 1):
         tag = "（可跳过）" if q.optional else ""
-        lines.append(f"{i}. [{q.label}]{tag} {q.text}")
+        lines.append(f"{i}. [{fill_pronouns(q.label, pronouns)}]{tag} "
+                     f"{fill_pronouns(q.text, pronouns)}")
         if q.kind in ("choice", "multi"):
             for k, (label, _) in q.options.items():
-                lines.append(f"   {k}. {label}")
+                lines.append(f"   {k}. {fill_pronouns(label, pronouns)}")
             if q.kind == "multi":
                 lines.append("   （可多选，例如：A C E）")
         elif q.kind == "pick":
@@ -450,7 +680,7 @@ def format_questionnaire(questions, has_corpus=True):
     return "\n".join(lines)
 
 
-def export_llm_prompt(questions, corpus_note=""):
+def export_llm_prompt(questions, corpus_note="", pronouns=None):
     """路线 C：导出一段用户可以直接粘给自己模型的 prompt。
     我们不内置任何 API——零密钥、零 HTTP 依赖、语料不出本机，而且用户手上的模型
     往往比我们能内置的便宜模型更好。"""
@@ -469,11 +699,11 @@ def export_llm_prompt(questions, corpus_note=""):
         "   原样回给我，不要加你自己的评价。",
         (f"\n背景：{corpus_note}" if corpus_note else ""),
         "\n问卷：",
-        format_questionnaire(questions),
+        format_questionnaire(questions, pronouns=pronouns),
     ])
 
 
-def apply_answers(persona, questions, answers):
+def apply_answers(persona, questions, answers, pronouns=None):
     """答案 → 候选草稿（confirmed=False，确认关卡不能绕过，规格 §7）。
 
     answers 按题型：
@@ -487,6 +717,8 @@ def apply_answers(persona, questions, answers):
         q = qmap.get(qid)
         if q is None or ans in (None, "", [], {}):
             continue
+        if q.pronoun_side:
+            continue          # 人称题：答案只填模板槽，不生成字段（见 pronouns_from_answers）
         if q.directive_only:
             # 任务书题：答案不进人格文件，只进第二阶段的提取任务书。
             # **在这里拦，不是在确认关卡拦**——确认关卡分不清"待兑现的指令"和
@@ -498,12 +730,13 @@ def apply_answers(persona, questions, answers):
             ans = ans.get("keys") or ans.get("pick") or ""
         if q.kind in ("choice", "multi"):
             keys = list(ans) if not isinstance(ans, str) else list(ans.replace(" ", ""))
-            parts = [q.directive(k) for k in keys if q.directive(k)]
+            parts = [fill_pronouns(q.directive(k), pronouns) for k in keys if q.directive(k)]
             if not parts and not note:
                 continue                       # 没选、选了不存在的项、或选项本身无指引
             value = "；".join(p.rstrip("。") for p in parts) + "。" if parts else ""
             if note:
-                value = (value + "另外她补了一句：" + note) if value else "她补了一句：" + note
+                lead = fill_pronouns(NOTE_LEAD, pronouns)
+                value = (value + "另外" + lead + note) if value else lead + note
         else:                                   # pick：用户挑中的原文
             picked = ans if isinstance(ans, str) else "\n".join(str(x) for x in ans)
             if q.dedupe_clauses:
@@ -514,8 +747,8 @@ def apply_answers(persona, questions, answers):
             if len(value) > q.max_chars * 20:   # 兜一层，防把整段语料塞进人格文件
                 value = value[:q.max_chars * 20]
         if q.attribution:
-            value = "她认为：" + value          # 归属句式，不写成断言
-        f = Field(id=q.field_id, section=q.section, label=q.label,
+            value = fill_pronouns(ATTRIBUTION_PREFIX, pronouns) + value  # 归属句式，不写成断言
+        f = Field(id=q.field_id, section=q.section, label=fill_pronouns(q.label, pronouns),
                   value=value, size_limit=max(500, len(value)), source="draft")
         persona.add_field(f)
         added.append(f)
@@ -577,11 +810,13 @@ BRIEF_NOTE = ("【第二阶段的提取任务书】以下是**给模型的指令
               "这条该怎么读+当下状态），找不到的就空着，别编。")
 
 
-def fill_protocol_defaults(persona):
+def fill_protocol_defaults(persona, pronouns=None):
     """协议层字段直接以 system 来源写入——不问用户，也不需要用户逐条确认
     （Field.is_active 对 system 来源放行，那是协议配置不是提炼产物）。"""
+    persona.pronouns = pronouns or None      # 渲染骨架标题时要用（见 render_persona_md）
     added = []
     for fid, (section, label, value) in PROTOCOL_DEFAULTS.items():
+        label, value = fill_pronouns(label, pronouns), fill_pronouns(value, pronouns)
         f = Field(id=fid, section=section, label=label, value=value,
                   size_limit=max(500, len(value)), source="system")
         persona.add_field(f)
@@ -820,7 +1055,9 @@ def render_persona_md(persona, title="核心人格"):
     for key, label, items in persona.render():
         if not items:
             continue
-        lines.append(f"## {label}")
+        # 骨架标题也带人称槽（"{ta}是谁"），跟正文走同一套填法——**标题漏填就是
+        # 用户第一眼看到的那句话写错**（验收打回二）
+        lines.append(f"## {fill_pronouns(label, persona.pronouns)}")
         lines.append("")
         for it in items:
             if "how_to_read" in it:                       # 里程碑四要素单元
@@ -1335,11 +1572,19 @@ def _selftest():
     assert qmap["continuity"].kind == "choice" and qmap["continuity"].attribution, \
         "立场题必须是选择题且写进 md 时套归属句式"
 
-    # 5.【变异靶心：归属句式】立场写进 md 是"她认为…"，不是断言
+    # 5.【变异靶心：归属句式】立场写进 md 是"<用户>认为…"，不是断言。
+    #    **2026.08.02 这条从钉死"她认为："改成两档都钉**：人称不再由我们写死，
+    #    所以原来那个字符串本身就是本卡要修的东西。改法是加严不是放宽——
+    #    判得出人称就必须用真人称，判不出来必须走中性写法，两档各钉一次。
     p2 = Persona("partner")
-    apply_answers(p2, QUESTIONS, {"continuity": "A"})
+    apply_answers(p2, QUESTIONS, {"continuity": "A"}, pronouns={"user": "他", "ai": "她"})
     stance = [f for f in p2.fields if f.id == "opening_continuity"][0]
-    assert stance.value.startswith("她认为："), f"立场必须用归属句式：{stance.value}"
+    assert stance.value.startswith("他认为："), f"立场必须用归属句式：{stance.value}"
+    p2n = Persona("partner")
+    apply_answers(p2n, QUESTIONS, {"continuity": "A"})       # 人称未知
+    stance_n = [f for f in p2n.fields if f.id == "opening_continuity"][0]
+    assert stance_n.value.startswith("对方认为："), \
+        f"人称判不出来时该走中性归属句式，不许塞一个默认的他/她：{stance_n.value}"
     assert "只是失忆了" in stance.value
     assert stance.confirmed is False, "问卷答案是草稿，确认关卡不能绕过"
     #    选项映射成指引，不是用户写的原话；多选拼成一句
@@ -1605,6 +1850,238 @@ def _selftest():
     #     **逐字钉死**，不是钉个片段：这段是 2026.07.31 第三轮真机实测通过的措辞，
     #     "其余向它对齐、它自己一字不动"是任务卡写死的要求。黄金串写在断言里而不是
     #     引用常量本身——引用常量的话，改了常量断言跟着变，等于没钉
+
+    # 8a3.【靶心：人称从语料/用户来，不由我们写死——验的是真出货的那份文件】
+    #      这一条按任务卡的要求**取真出货的人格文件正文**，不是只查模板里的占位符
+    #      换没换：占位符换对了、渲染时又漏填一处，模板检查照样全绿。
+    def _ship_and_read(pronouns_answers, entries=None):
+        p_x = Persona("partner")
+        detected = {}
+        pr = pronouns_from_answers(list(PRONOUN_QUESTIONS.values()),
+                                   pronouns_answers, detected)
+        fill_protocol_defaults(p_x, pr)
+        qs_x = questions_for(coverage_report(p_x), has_corpus=False, pronouns=pr)
+        all_ans = dict(pronouns_answers or {})
+        for q in qs_x:
+            if q.options and q.qid not in all_ans:
+                all_ans[q.qid] = {"keys": "".join(sorted(q.options))}
+            elif q.kind == "short" and q.qid not in all_ans:
+                all_ans[q.qid] = {"pick": "说好了就算数。"}
+        apply_answers(p_x, qs_x, all_ans, pr)
+        apply_confirmations(p_x, {p.key: "keep" for p in pending_confirmations(p_x)})
+        with tempfile.TemporaryDirectory() as td_x:
+            paths_x = write_bundle(td_x, p_x, client="claude-code",
+                                   confirmed=True, entries=entries)
+            return paths_x["persona"].read_text(encoding="utf-8")
+
+    #      **骨架节标题也在靶子里**（2026.08.02 验收打回二）：原来这里把节标题整行
+    #      排除掉，于是 `## 她是谁` 对一个选了「他」的用户永远不可见——那正是
+    #      "产出的人格文件不许人称混乱"说的毛病本身。标题现在带 {ta} 槽、跟正文走
+    #      同一套填法，排除也就不需要了。
+    def _body(md_text):
+        return md_text
+
+    #      ① 用户选「他」：全文只能有「他」这一种用户称呼，不许混进「她」
+    md_he = _body(_ship_and_read({"pronoun_user": {"keys": "A"}, "pronoun_ai": {"keys": "B"}}))
+    assert "他" in md_he, "选了「他」，出货文件里却一个都没有"
+    assert "她" not in md_he, \
+        f"用户选了「他」，文件里却还有「她」——人称混着走正是这一单要修的：{md_he[:200]!r}"
+    #      ② 反过来同理（防"把所有他都替换成她"这种一半的实现）
+    md_she = _body(_ship_and_read({"pronoun_user": {"keys": "B"}, "pronoun_ai": {"keys": "A"}}))
+    assert "她" in md_she and "他" not in md_she, "选了「她」，文件里不该再出现「他」"
+    #      ③ **全文零「它」**（维护者的硬约束，含字段标题与所有 directive 渲染结果）
+    #      ④ 人称判不出、用户也没答：中性写法，**不许塞「它」，也不许塞默认的他/她**
+    md_neutral = _body(_ship_and_read({}))
+    for tag, md_x in (("选他", md_he), ("选她", md_she), ("未知", md_neutral)):
+        #      **占位符不许漏进出货文件**：漏填渲染出的是字面 "{ta}是谁"，里面既没有
+        #      他也没有她，上下几条断言全过——变异④就是从这条缝里过去的
+        assert not _SLOT_RE.search(md_x), \
+            f"[{tag}] 出货文件里还留着人称占位符，说明有一条渲染路径漏填了：" \
+            f"{_SLOT_RE.search(md_x).group(0)}"
+        assert "它" not in md_x, \
+            f"[{tag}] 出货的人格文件里出现了「它」——硬约束是任何时候都不许，" \
+            f"判不出来就问、或者改写成不需要人称的句子"
+    assert "他" not in md_neutral and "她" not in md_neutral, \
+        "人称判不出来时塞了一个默认的他/她——那正是这一单要修掉的东西"
+    #      ⑥ **判得出人称时，用户只能有一种称呼形态**（任务卡 4b）：不能一处「他」、
+    #      一处「对方」、一处「用户」地混着走。**唯一的已知例外是检索约定那条黄金串**
+    #      里的「对方」——它是三轮真机验证换来的措辞、一字不动，两条约束打架时
+    #      以不动黄金串为准（这一格待维护者裁定，断言按现状钉住，裁完再动）。
+    #      这条挡的是"把某句里的用户硬编码成对方/用户"——那类字符串不含他/她/它，
+    #      上面几条闸一个都拦不住（变异②就是从这儿过去的）
+    #      黄金串在这里就地写一份（下面 8e 还会再钉一次逐字不变）——两处都写死是
+    #      刻意的：引用常量的话，常量被改了断言跟着变，等于没钉
+    _GOLDEN_HEAD = "对方提到过去发生过的事、某个约定、某个日期／地点／称呼／人名"
+    for tag, md_x in (("选他", md_he), ("选她", md_she)):
+        rest = md_x.replace(_GOLDEN_HEAD, "")
+        assert "对方" not in rest, \
+            f"[{tag}] 判得出人称了却还有「对方」——用户在同一份文件里有了两种称呼：" \
+            f"…{rest[max(0, rest.find('对方') - 30):rest.find('对方') + 20]}…"
+    #      「用户」也不行：那是第三种形态，而且在人格文件里读起来像产品文档
+    for tag, md_x in (("选他", md_he), ("选她", md_she), ("未知", md_neutral)):
+        assert "用户" not in md_x, f"[{tag}] 人格文件里把对方称作「用户」了"
+
+    #      ⑤ 「你」＝模型这条锚不能因为参数化而丢（原 8a 那条黑名单继续守）
+    assert "你每次都会读" in md_neutral, "「你」＝模型这条锚丢了"
+
+    #      ⑥ **判不出来必须真的去问**——上面几条都是直接把人称喂进渲染的，
+    #      绕过了出题这一步；不钉这条，"静默跳过不问"能全绿（变异验过）
+    rep_pron = coverage_report(Persona("partner"))
+    asked_unknown = {q.qid for q in questions_for(rep_pron, has_corpus=False)}
+    assert {"pronoun_user", "pronoun_ai"} <= asked_unknown, \
+        f"人称判不出来却没问用户——那就只能塞默认值或走中性，两条都不如问一句：{sorted(asked_unknown)}"
+    asked_known = {q.qid for q in questions_for(rep_pron, has_corpus=False,
+                                                pronouns={"user": "他", "ai": "她"})}
+    assert not ({"pronoun_user", "pronoun_ai"} & asked_known), \
+        "语料里已经判出人称了还去问，等于让用户做无用功"
+    #      单侧判出来就只问另一侧
+    asked_half = {q.qid for q in questions_for(rep_pron, has_corpus=False,
+                                               pronouns={"user": "他"})}
+    assert "pronoun_ai" in asked_half and "pronoun_user" not in asked_half, \
+        f"只该问判不出来的那一侧：{sorted(asked_half)}"
+
+    # 8a3b.【靶心：语料侧判定在**真 CLI 上**真的会触发】验收打回一：
+    #      `_detect_pronouns_from_corpus` 当初没把用户侧说话人传进去，于是
+    #      `detect_pronouns` 走"分不清谁是谁"那条分支、**永远返回 None**——
+    #      语料里 AI 说了十几次「她」也照样问用户一遍。而 8a5 那组断言全是自己
+    #      把 `user_speakers` 喂进去测的，**函数绿、生产路径死**。
+    #      这是同一个形状第五次出现（显式 --client 被吃掉／not exists 恒真／
+    #      钉住函数没钉住命令／--answers 那条没被钉住），所以这条走真进程。
+    import subprocess          # 走真进程：函数级断言钉不住"生产路径有没有调它"
+    with tempfile.TemporaryDirectory() as td:
+        conv = {"title": "t", "create_time": 1.0, "mapping": {}}
+        nodes = {}
+        for i in range(12):
+            who = "assistant" if i % 2 == 0 else "user"
+            # AI 提到用户用「她」，用户提到 AI 用「他」——两侧各 6 次，都过闸
+            txt = "她今天早点睡" if who == "assistant" else "他说得对"
+            nodes[f"n{i}"] = {"message": {"author": {"role": who},
+                                          "create_time": 1750000000.0 + i,
+                                          "content": {"parts": [txt]}},
+                              "parent": f"n{i-1}" if i else None,
+                              "children": [f"n{i+1}"] if i < 11 else []}
+        conv["mapping"] = nodes
+        conv["current_node"] = "n11"
+        corpus = Path(td) / "export.json"
+        corpus.write_text(json.dumps([conv], ensure_ascii=False), encoding="utf-8")
+        out_json = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--out", td,
+             "--corpus", str(corpus), "--step", "questionnaire", "--json"],
+            cwd=td, capture_output=True, text=True, encoding="utf-8")
+        assert out_json.returncode == 0, f"CLI 跑挂了：{out_json.stdout}\n{out_json.stderr}"
+        payload = json.loads(out_json.stdout)
+        assert payload["pronouns_detected"] == {"user": "她", "ai": "他"}, \
+            f"真 CLI 上语料侧判定没触发——功能是死的：{payload['pronouns_detected']}"
+        asked_ids = {q["qid"] for q in payload["questions"]}
+        assert not ({"pronoun_user", "pronoun_ai"} & asked_ids), \
+            f"语料里已经判出人称了还问用户，等于白做：{sorted(asked_ids)}"
+        #    存进状态、下一步续跑时还在（渲染要用）
+        st = json.loads((Path(td) / "init_state.json").read_text(encoding="utf-8"))
+        assert st.get("pronouns_detected") == {"user": "她", "ai": "他"}, \
+            "判出来的人称没写回状态，下一步渲染就又不知道了"
+
+    #      **chatlog 语料（说话人是日志里的真名）在真 CLI 上必须退回去问**：
+    #      这是第二次返工那条的生产路径版——函数里判对了，还得确认这一路真的
+    #      走到"去问用户"，而不是在别处又被硬分回去
+    with tempfile.TemporaryDirectory() as td2:
+        log = Path(td2) / "chat.txt"
+        log.write_text("\n".join(
+            f"2026-07-1{i%9} 21:0{i%6}:00 小明\n他说得对，他记性好" for i in range(8)),
+            encoding="utf-8")
+        r2 = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--out", td2,
+             "--corpus", str(log), "--step", "questionnaire", "--json"],
+            cwd=td2, capture_output=True, text=True, encoding="utf-8")
+        assert r2.returncode == 0, f"CLI 跑挂了：{r2.stdout}\n{r2.stderr}"
+        pay2 = json.loads(r2.stdout)
+        assert pay2["pronouns_detected"] == {}, \
+            f"chatlog 的真名说话人分不清谁是谁，却判出了人称——那多半是反的：" \
+            f"{pay2['pronouns_detected']}"
+        assert {"pronoun_user", "pronoun_ai"} <= {q["qid"] for q in pay2["questions"]}, \
+            "判不出来就该问，这条路上没问等于把中性写法当默认值用了"
+
+    #      **叙事体语料判不出来是正常的，跟"能判却没判"不是一回事**：那种语料
+    #      （timeline md，speaker 为空）本来就没有说话人标记，退回去问用户就对了
+    from memory_import import MemoryEntry as _ME0
+    narr = [_ME0(timestamp=1.0, speaker="", text="她说今天早点睡") for _ in range(8)]
+    assert detect_pronouns(narr, USER_SPEAKERS) == {"user": None, "ai": None}, \
+        "叙事体语料没有说话人标记，判不出来才对——但它该走'去问用户'，不是硬判"
+
+    #      **丢主语的接续要挡一下**（2026.08.02 验收打回）：中性档第一句曾经渲染成
+    #      "——写下的东西都在这里"，谁写下的没了。手写的中性写法一样会丢主语，
+    #      跟机械删词的结果没差别，而它落在人格文件第一句、不变量层、每轮都在。
+    #      **这条断言替代不了人眼通读**（中文通不通机器判不了），它只挡住这一类
+    #      最常见的形态——破折号/分号后面直接跟动词
+    for tag, md_x in (("选他", md_he), ("选她", md_she), ("未知", md_neutral)):
+        for bad in ("——写下", "；写下", "——说过", "；说过", "——提到", "；提到"):
+            assert bad not in md_x, \
+                f"[{tag}] 这句丢了主语（{bad!r}）：中性写法也会丢主语，不是只有机械删词会"
+
+    # 8a4.【靶心：中性写法一条都不许漏】机械删词会写出半通不通的中文，且不报错，
+    #      所以中性写法是逐条手写的——那就必须有东西守着"每条模板都有对应的手写形态"。
+    templates = [ATTRIBUTION_PREFIX, NOTE_LEAD]
+    templates += [v for _, _, v in PROTOCOL_DEFAULTS.values()]
+    templates += [lbl for _, lbl, _ in PROTOCOL_DEFAULTS.values()]
+    for q in QUESTIONS:
+        templates += [q.label, q.text]
+        for v in (q.options or {}).values():
+            templates += [v[0], v[1]]
+    for t in [t for t in templates if t and _SLOT_RE.search(t)]:
+        assert t in NEUTRAL_FORMS, f"这条模板带人称槽却没有中性写法：{t!r}"
+        assert not _SLOT_RE.search(NEUTRAL_FORMS[t]), \
+            f"中性写法里还留着槽位，等于没写：{NEUTRAL_FORMS[t]!r}"
+        assert "它" not in NEUTRAL_FORMS[t], f"中性写法里塞了「它」：{NEUTRAL_FORMS[t]!r}"
+        assert not any(p in NEUTRAL_FORMS[t] for p in PRONOUN_CHOICES), \
+            f"中性写法里塞了默认的他/她：{NEUTRAL_FORMS[t]!r}"
+
+    # 8a5.【靶心：语料侧判定不许猜】第三人称在两个人的对话里多半指的是别人，
+    #      所以样本少、或者两个词旗鼓相当时**必须返回 None 去问用户**，不许硬判。
+    from memory_import import MemoryEntry as _ME
+    #      **陌生说话人标签＝分不清谁是谁，必须 None**（2026.08.02 第二次返工）：
+    #      chatlog 翻译器出的是日志里的真名（"小明""星回"），两边都不在已知名单里。
+    #      上一版拿"在名单里＝用户、其余全算 AI"硬分，于是**用户谈论自己 AI 的话被
+    #      读成"AI 在谈论用户"**，判出来的人称正好是反的，还一个字都不问。
+    #      这一档比"判不出来"糟得多：判不出只是多问一句，判错了没有任何人会知道。
+    chatlog_one = [_ME(timestamp=1.0 + i, speaker="小明", text="他说得对，他记性好")
+                   for i in range(6)]
+    assert detect_pronouns(chatlog_one, USER_SPEAKERS) == {"user": None, "ai": None}, \
+        "陌生说话人标签下必须判不出来——硬分会把'用户在说他的 AI'读成'AI 在说用户'"
+    chatlog_two = chatlog_one + [_ME(timestamp=9.0 + i, speaker="星回", text="她今天早点睡吧")
+                                 for i in range(6)]
+    assert detect_pronouns(chatlog_two, USER_SPEAKERS) == {"user": None, "ai": None}, \
+        "两个都是陌生名字时更不能猜——谁是用户谁是 AI 语料里根本没写"
+    #      认得出**任意一侧**的标签就能分：两个翻译器归一成 user/assistant，
+    #      只出现其中一个（另一侧是真名）也照样分得清
+    known_both = ([_ME(timestamp=1.0 + i, speaker="assistant", text="她今天早点睡")
+                   for i in range(6)]
+                  + [_ME(timestamp=9.0 + i, speaker="user", text="他说得对") for i in range(6)])
+    assert detect_pronouns(known_both, USER_SPEAKERS) == {"user": "她", "ai": "他"}, \
+        "两边都是已知标签，这是 ChatGPT/Claude 导出的常态，必须判得出来"
+    known_ai_only = ([_ME(timestamp=1.0 + i, speaker="assistant", text="她今天早点睡")
+                      for i in range(6)]
+                     + [_ME(timestamp=9.0 + i, speaker="小明", text="他说得对") for i in range(6)])
+    assert detect_pronouns(known_ai_only, USER_SPEAKERS) == {"user": "她", "ai": "他"}, \
+        "只认得 AI 侧标签时，剩下那个就是用户——这一档不该退化成判不出来"
+    #      单侧有话、另一侧没话：判得出的那侧照判，判不出的那侧必须是 None——
+    #      **两侧各判各的，不许拿一侧的结论去补另一侧**。
+    #      这里说话人是已知的 AI 标签（"ai"），所以分得清侧；跟上面 chatlog 那档
+    #      在"只有一侧说话"上同构，**区别正是标签认不认得**——当初没区分这一点，
+    #      正是上一版把陌生名字也硬分了的原因
+    strong = [_ME(timestamp=1.0, speaker="ai", text="她今天早点睡")] * 6
+    one_side = detect_pronouns(strong, user_speakers={"me"})
+    assert one_side["user"] == "她", f"AI 说了六次「她」，用户侧该判得出：{one_side}"
+    assert one_side["ai"] is None, \
+        f"用户一句话都没说，AI 侧无从判定，必须是 None：{one_side}"
+    mixed = ([_ME(timestamp=1.0, speaker="ai", text="她今天早点睡")] * 5
+             + [_ME(timestamp=2.0, speaker="me", text="他说得对")] * 5)
+    got = detect_pronouns(mixed, user_speakers={"me"})
+    assert got["user"] == "她" and got["ai"] == "他", f"频次占优时该判得出来：{got}"
+    thin = [_ME(timestamp=1.0, speaker="ai", text="她好")] * 2
+    assert detect_pronouns(thin, user_speakers={"me"})["user"] is None, \
+        f"样本太少必须返回 None 去问用户，不许拿两三次出现就下结论"
+    tie = ([_ME(timestamp=1.0, speaker="ai", text="她 他 她 他")] * 3)
+    assert detect_pronouns(tie, user_speakers={"me"})["user"] is None, \
+        "两个词旗鼓相当时必须判不出来，不许挑一个"
 
     # 8d.【靶心：记忆库的时间边界要告诉模型】真机验证的第二个结论：模型说"后来没有
     #     继续展开"，而那件事根本不在语料里（发生在另一个客户端）——**在它能看见的
@@ -1901,7 +2378,9 @@ def _selftest():
         #    确认到一半存盘，重新载入接得上：状态里只存用户输入（答案+决策），
         #    persona 每步从头重放——重放幂等，状态文件坏了也看得懂改得动
         half_qs = questions_for(coverage_report(Persona("partner")), has_corpus=False)
-        cq = next(q for q in half_qs if q.kind == "choice")
+        # 取一道**会生成字段**的选择题：人称题也是 choice，但它按设计不进字段
+        # （2026.08.02 加人称题后这里要挑清楚，否则取到的是个不产草稿的题）
+        cq = next(q for q in half_qs if q.kind == "choice" and not q.pronoun_side)
         save_state(td, {"step": "confirm", "has_corpus": False,
                         "answers": {cq.qid: {"keys": "A", "note": ""}},
                         "decisions": {}})
@@ -2085,9 +2564,9 @@ def _selftest():
         except ValueError as e:
             assert "开篇缺" in str(e)
 
-    print("selftest ok（35项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
+    print("selftest ok（46项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
           "归属句式 / 默认值不预支历史 / 协议层不问用户 / 导出纪律 / 渲染顺序 / "
-          "人称锚死一套 / 称呼不重复拼接 / 关系状态归开篇 / "
+          "人称锚死一套 / 用户只有一种称呼形态 / 中性档不丢主语 / 人称从语料读出来 / 中性写法不许漏 / 语料侧判定不许猜 / 全文零它 / 称呼不重复拼接 / 关系状态归开篇 / "
           "答案读回不静默丢 / 任务书不泄漏进人格文件 / 长字面量不崩 / 未决草稿不蒸发 / "
           "记忆库落盘带日期 / 覆盖区间进人格文件 / 止血纪律进人格文件 / "
           "pick 题只许挑不许写 / 冷启动出得了货 / "
@@ -2100,11 +2579,20 @@ def _rebuild(state):
     """状态 → (persona, questions)。每一步都从状态重建，不序列化整个 persona——
     重放（协议层 + 答案 + 已做的确认决策）是幂等的，状态文件里只存用户的输入，
     坏了也看得懂、改得动。"""
+    # 人称：语料侧检测结果存在状态里（questionnaire 步算的），用户答的覆盖它。
+    # **问卷题目要按"还差哪一侧"来出**，所以先合一次、再据此出题；出完题若用户
+    # 已经答了人称，再合第二次，让下面的渲染用上真人称
+    detected = state.get("pronouns_detected") or {}
+    #    人称题就那两道，直接拿它们解答案即可——不必等 questions_for 出完题，
+    #    也就避开了"出题要先知道人称、填模板又要先出题"这个循环
+    pronouns = pronouns_from_answers(list(PRONOUN_QUESTIONS.values()),
+                                     state.get("answers"), detected)
     persona = Persona("partner")
-    fill_protocol_defaults(persona)
-    qs = questions_for(coverage_report(persona), has_corpus=state.get("has_corpus", False))
+    fill_protocol_defaults(persona, pronouns)
+    qs = questions_for(coverage_report(persona), has_corpus=state.get("has_corpus", False),
+                       pronouns=pronouns)
     if state.get("answers"):
-        apply_answers(persona, qs, state["answers"])
+        apply_answers(persona, qs, state["answers"], pronouns)
     if state.get("decisions"):
         apply_confirmations(persona, state["decisions"])
     return persona, qs
@@ -2137,12 +2625,14 @@ def _load_json_arg(value):
     return json.loads(value)
 
 
-def _questions_payload(qs):
+def _questions_payload(qs, pronouns=None):
     """问卷的机器可读形态。AI 驱动时靠它拿题目，不用去抠给人看的排版文本
     （抠文本＝解析自己的输出，格式一改就断，而且断得无声无息）。"""
-    return [{"qid": q.qid, "section": q.section, "label": q.label, "kind": q.kind,
-             "text": q.text, "max_chars": q.max_chars,
-             "options": ({k: {"label": v[0], "directive": v[1]}
+    return [{"qid": q.qid, "section": q.section,
+             "label": fill_pronouns(q.label, pronouns), "kind": q.kind,
+             "text": fill_pronouns(q.text, pronouns), "max_chars": q.max_chars,
+             "options": ({k: {"label": fill_pronouns(v[0], pronouns),
+                              "directive": fill_pronouns(v[1], pronouns)}
                           for k, v in q.options.items()} if q.options else None),
              "attribution": q.attribution, "optional": q.optional}
             for q in qs]
@@ -2155,17 +2645,44 @@ def _client_of(args):
     return resolve_client(args.client, None)[0]
 
 
+def _detect_pronouns_from_corpus(corpus_path):
+    """有 --corpus 就先从语料里判一次人称。判不出来返回空 dict，交给问卷去问。
+
+    **必须把用户侧说话人告诉 detect_pronouns**（2026.08.02 验收打回）：不传的话
+    它走"分不清谁是谁"那条分支、**永远返回 None**，于是生产路径上这个功能是死的
+    ——每个用户都会被问一遍，语料里明明写着答案。而这个信息本来就有：
+    `memory_import` 的两个翻译器都把用户侧归一成了 `"user"`（ChatGPT 走
+    `author.role`，Claude 那条把 `human` 归一成 `user`，出口一致）。
+
+    **叙事体语料（`speaker=""`，timeline md 这类）判不出来是正常的**，跟"能判却
+    没判"不是一回事：那种语料里根本没有说话人标记，退回去问用户就对了。
+
+    **读语料失败不该拦住整个流程**——人称判不出来只是"要多问一句"，
+    而导入报错在这一步没有任何用户能理解的上下文，所以这里吞掉异常、当作判不出。"""
+    if not corpus_path:
+        return {}
+    try:
+        from memory_import import load_any
+        entries = load_any(corpus_path)
+    except Exception:
+        return {}
+    return {k: v for k, v in detect_pronouns(entries, USER_SPEAKERS).items() if v}
+
+
 def _step_questionnaire(args):
+    detected = _detect_pronouns_from_corpus(args.corpus)
     persona = Persona("partner")
-    fill_protocol_defaults(persona)
+    fill_protocol_defaults(persona, detected)
     report = coverage_report(persona)
     if args.json:
-        qs = questions_for(report, has_corpus=bool(args.corpus))
+        qs = questions_for(report, has_corpus=bool(args.corpus), pronouns=detected)
         save_state(args.out, {"step": "questionnaire", "client": _client_of(args),
-                              "has_corpus": bool(args.corpus)})
+                              "has_corpus": bool(args.corpus),
+                              "pronouns_detected": detected})
         print(json.dumps({
             "coverage": [{"section": s, "status": st, "note": n} for s, st, n in report],
-            "questions": _questions_payload(qs),
+            "questions": _questions_payload(qs, detected),
+            "pronouns_detected": detected,
             "freeform_policy": FREEFORM_POLICY.format(n=FREEFORM_MAX_CHARS),
             "next": "把这些题**在对话里**一题一题问对方（不是让 TA 写作文，选项念给 TA 听）；"
                     "收齐后跑 --step answers --answers-json <JSON>，"
@@ -2177,14 +2694,15 @@ def _step_questionnaire(args):
     for _, status, note in report:
         mark = {"ok": "✓", "missing": "缺", "vague": "空泛", "protocol": "系统"}[status]
         print(f"  [{mark}] {note}")
-    qs = questions_for(report, has_corpus=bool(args.corpus))
+    qs = questions_for(report, has_corpus=bool(args.corpus), pronouns=detected)
     print(f"\n【要问的问题】共 {len(qs)} 题（协议层已由系统填好，不问你）\n")
-    print(format_questionnaire(qs, has_corpus=bool(args.corpus)))
+    print(format_questionnaire(qs, has_corpus=bool(args.corpus), pronouns=detected))
     prompt_path = Path(args.out) / "问卷prompt.txt"
     prompt_path.parent.mkdir(parents=True, exist_ok=True)
-    prompt_path.write_text(export_llm_prompt(qs), encoding="utf-8")
+    prompt_path.write_text(export_llm_prompt(qs, pronouns=detected), encoding="utf-8")
     save_state(args.out, {"step": "questionnaire", "client": _client_of(args),
-                          "has_corpus": bool(args.corpus)})
+                          "has_corpus": bool(args.corpus),
+                          "pronouns_detected": detected})
     print(f"\n【下一步】把 {prompt_path} 的内容整段粘给你自己的模型（DeepSeek/ChatGPT 都行），"
           f"让它一题一题问你；答完让它把清单整理好，存成一个文本文件，"
           f"再跑：--step answers --answers <那个文件>")

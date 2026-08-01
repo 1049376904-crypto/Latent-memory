@@ -42,6 +42,11 @@ ENV_ENDPOINT = "MEMORY_EMBED_ENDPOINT"      # 云端：完整 URL，如 https://
 ENV_KEY_NAME = "MEMORY_EMBED_API_KEY_ENV"   # **变量名**，不是 key 本身
 ENV_QUERY_PREFIX = "MEMORY_EMBED_QUERY_PREFIX"
 DEFAULT_KEY_ENV = "MEMORY_EMBED_API_KEY"
+# 门槛覆盖口（**采纳自外部 PR #1**，`lu7899112-source`，2026.08.01）：他指出，
+# 换了后端/模型的人**只能改源码**才能填自己量出来的门槛。这条是对的——我们的
+# 标定表纪律（没量过就是 None、不给替代数字）拦的是"照抄一个数"，不该顺带把
+# **真的量过的人**也拦在外面。所以口子开，纪律照旧写在门口：见 hit_floor_override()。
+ENV_HIT_FLOOR = "MEMORY_EMBED_HIT_FLOOR"
 
 DEFAULT_LOCAL_MODEL = "BAAI/bge-small-zh-v1.5"
 
@@ -65,6 +70,13 @@ HIT_FLOOR_BY_MODEL = {
 CLOUD_BATCH = 32
 CLOUD_TIMEOUT = 60
 
+# 单条截断（**采纳自外部 PR #1**，`lu7899112-source`，2026.08.01——他在 2G 内存 VPS 上
+# 独立实现了同一条云端路径，这一条是我们那版漏掉的）：护住服务商侧的 token 上限。
+# 我们自己的块中位 352 字符，但真实语料里量到过 4386 的长块——一批全是长块就可能
+# 撞上批量 token 上限，而**失效形态是整批请求报错**，建库当场中断。
+# 截断只作用在**发出去的那份副本**上，本地的块正文一个字都不动。
+CLOUD_TRUNC = 2000
+
 
 def normalize(vec):
     """单位化（纯 python，不依赖 numpy——云端档可能连 numpy 都没装）。"""
@@ -82,9 +94,44 @@ def query_prefix_for(model, override=None):
     return ""      # 认不出来就不加，并在 describe() 里说明
 
 
-def get_hit_floor(model):
-    """该模型的实测门槛；**没标定过返回 None，不给替代数字**。"""
+def hit_floor_override(env=None):
+    """`MEMORY_EMBED_HIT_FLOOR` → float 或 None（没设／设歪了）。
+
+    **这个口子是给"自己量过"的人开的，不是给"想找个数填上"的人开的**（采纳自
+    外部 PR #1，他那版把这条警告原样搬进了新注释，做法对）。余弦标度跟模型绑死，
+    照抄别人的数会让"库里没有就说没有"无声失灵——所以这里只做一件事：**把它
+    如实标成 override**，`describe()` 里说明这个数不是我们量的，出了偏差是用户
+    自己的标定，不是我们的标定表。
+
+    设歪了（非数字、不在 [-1, 1] 内）**当没设**，不当 0 用：一个悄悄变成 0 的门槛
+    等于门槛不存在，而那正是这条最坏的失效方向。"""
+    raw = (env if env is not None else os.environ).get(ENV_HIT_FLOOR)
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return val if -1.0 <= val <= 1.0 else None
+
+
+def get_hit_floor(model, env=None):
+    """该模型的实测门槛；**没标定过返回 None，不给替代数字**。
+    用户自己量过、通过 `MEMORY_EMBED_HIT_FLOOR` 传进来的覆盖值优先。"""
+    override = hit_floor_override(env)
+    if override is not None:
+        return override
     return HIT_FLOOR_BY_MODEL.get(model)
+
+
+def _floor_note(floor, env=None):
+    """describe() 里那句门槛说明。**用户自己设的覆盖值要标出来是他设的**——
+    出了偏差那是他的标定，不是我们标定表里的数，两件事不能混着说。"""
+    if floor is None:
+        return "命中门槛**未标定**"
+    if hit_floor_override(env) is not None:
+        return f"命中门槛 {floor}（**你自己设的覆盖值**，不是我们量的）"
+    return f"命中门槛 {floor}（已标定）"
 
 
 class EmbeddingProvider:
@@ -152,7 +199,7 @@ class LocalProvider(EmbeddingProvider):
     def describe(self):
         prefix = "加 bge 中文指令前缀" if self.query_prefix else "不加 query 前缀"
         return (f"本地模型 {self.model}（fastembed / 本地 CPU）；"
-                f"语料不出本机；{prefix}")
+                f"语料不出本机；{_floor_note(self.hit_floor())}；{prefix}")
 
 
 class HTTPCloudProvider(EmbeddingProvider):
@@ -212,7 +259,8 @@ class HTTPCloudProvider(EmbeddingProvider):
     def _embed_raw(self, texts):
         out = []
         for i in range(0, len(texts), self.batch):
-            chunk = texts[i:i + self.batch]
+            # 发出去的副本按 CLOUD_TRUNC 截断，本地正文不动（见那个常量的注释）
+            chunk = [t[:CLOUD_TRUNC] for t in texts[i:i + self.batch]]
             self.calls += 1
             data = self._post({"model": self.model, "input": chunk})
             try:
@@ -228,7 +276,7 @@ class HTTPCloudProvider(EmbeddingProvider):
         from urllib.parse import urlparse
         host = urlparse(self.endpoint).netloc or self.endpoint
         floor = self.hit_floor()
-        cal = f"命中门槛 {floor}（已标定）" if floor is not None else "命中门槛**未标定**"
+        cal = _floor_note(floor, self._env)
         prefix = "加 bge 中文指令前缀" if self.query_prefix else "不加 query 前缀"
         return (f"云端服务 {host} 的 {self.model}；"
                 f"**查询和被检索的内容都会发到这家服务商**；"
@@ -440,8 +488,50 @@ def _selftest():
         except ValueError:
             pass
 
-    print("selftest ok（8 项：key 不外泄 / 缺 key 报错 / 分批不乱序 / 前缀按模型 / "
-          "未标定即 None / 缓存只算一次 / 坏缓存不致命 / 未知档报错）")
+    # 9.【采纳自外部 PR #1：单条截断】护住服务商侧 token 上限。
+    #    **靶子取真正发出去的请求体**——截断做在本地正文上就成了另一个 bug
+    #    （把用户的记忆截短了），所以两头都断言：发出去的短了、手上的没动。
+    long_env = {ENV_ENDPOINT: "https://api.example.com/v1/embeddings",
+                ENV_MODEL: "BAAI/bge-m3", "MEMORY_EMBED_API_KEY": "k"}
+    seen = []
+
+    def _capture(payload):
+        seen.append(payload)
+        return {"data": [{"index": i, "embedding": [1.0, 0.0]}
+                         for i in range(len(payload["input"]))]}
+
+    long_text = "长" * (CLOUD_TRUNC + 500)
+    texts = [long_text, "短句"]
+    pc = resolve_provider("cloud", env=long_env, transport=_capture)
+    #    **把 texts 本身传进去，不传副本**——传副本的话"本地正文没被改"这条
+    #    就成了恒真断言（截断即使写成原地修改也测不出来，验过）
+    pc.embed(texts)
+    sent = seen[0]["input"]
+    assert len(sent[0]) == CLOUD_TRUNC, \
+        f"超长块没按 CLOUD_TRUNC 截断就发出去了，会撞服务商的 token 上限：{len(sent[0])}"
+    assert sent[1] == "短句", "短块不该被动"
+    assert texts[0] == long_text, "截断污染了本地正文——那是把用户的记忆截短了"
+    #    如实标注：这一条**只挡得住两层一起塌**。`embed()` 开头的 `texts = list(texts)`
+    #    是第一层，截断处不原地改是第二层，单点变异会被另一层吸收（两层都拆掉才红，
+    #    验过）。不假装它是单点靶。
+
+    # 10.【采纳自外部 PR #1：门槛覆盖口，但设歪了要当没设】
+    #     覆盖口是给"自己量过"的人开的。**非法值绝不能悄悄变成 0**——门槛为 0
+    #     等于门槛不存在，而那是这条最坏的失效方向（"库里没有就说没有"当场归零）。
+    assert get_hit_floor("BAAI/bge-m3", env={}) is None, "没设覆盖时，未标定模型仍该是 None"
+    assert get_hit_floor("BAAI/bge-m3", env={ENV_HIT_FLOOR: "0.62"}) == 0.62, \
+        "自己量过的覆盖值该生效——不然只能改源码"
+    for bad in ("abc", "", "  ", "1.5", "-2", "nan"):
+        got = get_hit_floor("BAAI/bge-m3", env={ENV_HIT_FLOOR: bad})
+        assert got is None, f"非法覆盖值 {bad!r} 该当没设（得到 {got}），绝不能落成 0"
+    #     覆盖值要在 describe() 里标明是用户设的，不许混进"我们标定过"
+    note = _floor_note(0.62, {ENV_HIT_FLOOR: "0.62"})
+    assert "你自己设的" in note and "已标定" not in note, \
+        f"覆盖值被说成了我们的标定值：{note}"
+
+    print("selftest ok（10 项：key 不外泄 / 缺 key 报错 / 分批不乱序 / 前缀按模型 / "
+          "未标定即 None / 缓存只算一次 / 坏缓存不致命 / 未知档报错 / "
+          "超长块截断（发出去的截、本地的不动）/ 门槛覆盖口（设歪了当没设））")
 
 
 if __name__ == "__main__":

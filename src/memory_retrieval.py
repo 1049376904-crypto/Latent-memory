@@ -404,6 +404,59 @@ class MemoryIndex:
         return [{"id": i, "text": self.chunks[i], "meta": self.meta[i], "score": s}
                 for i, s in scored[:topN]]
 
+
+    def _distinctive_df(self):
+        """"区分性 token"的 df 上限：出现在超过这么多块里的词，不算区分性词面证据。
+
+        **刻意复用图谱路早就在用的那条判据**（`max(3, N//5)`，即"最多出现在 20% 的
+        块里"），不新造一个常数——`EMBED_HIT_FLOOR` 的教训是：跟外部标度绑死的手写
+        数字换个模型就失灵。这个判据是**对语料自身分布定义的**（占比，不是绝对分数），
+        换语料、换语言、换规模都跟着动，不需要重新标定。
+
+        它在图谱路的语义是"这个词稀有到能说明两块讲同一件事"，在这里是"这个词稀有到
+        能说明这个块跟查询讲的是同一件事"——同一个判据的两次使用，不是两套。"""
+        return max(3, self._bm25.N // 5)
+
+    def lexical_admit(self, query_tokens):
+        """词面路的候选资格：块必须与查询共享**至少一个区分性 token** → set(块下标)。
+
+        为什么需要它（2026.08.02，P0"候选闸补词面门槛"）：原来的候选闸是
+        「BM25 有分 **或** 向量过槛」，而 `bm_scores[i] > 0` 这一路**压根没有门槛**。
+        真实语料 602 块词汇丰富，任意查询都能跟十几到几十个块撞上 bigram 重叠、
+        BM25 分还有 9.8~15.4——于是"库里根本没有的事"照样端回五条沾边记录。
+        实测：远主题无关查询只挡住 2/16、**贴近生活的日常问题 0/8**。
+
+        **短板是"分从哪来"，不是"分够不够高"**：编造查询撞上的是「我们」「那次」
+        「的事」这类功能词 bigram，它们在几乎每一块里都出现。所以门槛不设成分数阈值
+        （那又是一个拍脑袋的常数，而且高频词堆起来照样能过），而是问一句结构性的话：
+        **这个块跟查询共享的，有没有一个是区分性的词？** 一个都没有，就说明这块只是
+        跟查询共用了些人人都有的功能词，它不构成"命中"。
+
+        这条同时解释了为什么它对"专名缺席"以外的编造也有效：判据不是"有没有专名"，
+        是"共享的词面里有没有一个在这份语料里是稀有的"。"""
+        max_df = self._distinctive_df()
+        distinctive = {t for t in set(query_tokens)
+                       if 0 < self._bm25.df.get(t, 0) <= max_df}
+        # 整句都是高频功能词、一个区分性 token 都没有：**词面路一个都不放行**。
+        #
+        # 这一格是这条判据最要紧的地方，也是我第一版写反了的地方：当时退回旧行为
+        # （有分即可），理由是"怕误杀'她最近怎么样'这类合法提问"。但那恰恰把
+        # "整句都是功能词"——也就是编造查询最典型的形态——原样放了过去。
+        # **没有任何区分性词面证据时，正确的答案是"我这儿没有依据"，不是"都给你"。**
+        #
+        # 不是拍脑袋翻的：拿本回归集两档语料 + 留出集全量查询量过一遍，
+        # **present 四类里零区分性 token 的查询是 0 条**（两档都是），
+        # 命中这一格的全是 absent／越界提问。误杀风险实测为零。
+        # ⚠ 这条测的是我们的合成语料；真实语料上未标定——真实库词汇更丰富，
+        # 一个有主题的问句几乎必然带一个稀有词，理论上更安全，但没量过就是没量过。
+        if not distinctive:
+            return set()
+        out = set()
+        for i, tf in enumerate(self._bm25.tf):
+            if any(t in tf for t in distinctive):
+                out.add(i)
+        return out
+
     def retrieve(self, query, topN=5, reranker=None, coarse_topM=20, routes=None):
         """query → 前 topN 个相关片段 [{id, text, meta, score, weight}]。
         命中的片段权重 +weight_boost（用进废退），作为副作用记在 index 上。
@@ -446,9 +499,27 @@ class MemoryIndex:
             else (lambda i: False)
         vec_rank_ok = (lambda i: vec_scores[i] > self.vec_floor) if self.vec_calibrated \
             else (lambda i: True)
+        # 词面路的资格判定（2026.08.02 P0）：BM25 有分**且**共享至少一个区分性
+        # token，才算词面命中。整句都是功能词时 lexical_admit 返回空集——
+        # 那时词面路一个都不放行（见那里的注释：这是"知道自己不知道"的那一半）。
+        lex_ok = self.lexical_admit(tokenize(query))
+
+        def bm_admit(i):
+            return bm_scores[i] > 0 and i in lex_ok
+
+        # **零依赖档的"语义"路也得受这条门槛管**（2026.08.02，做这一单时才发现）：
+        # 那一路用的是**同一套字符 bigram** 的余弦（消融早就实测过它没有独立贡献），
+        # 所以它跟 BM25 是同一种证据的两种算法，不是两种证据。而它的 floor 在零依赖
+        # 档是 0.0——等于没有门槛。只关 BM25 那扇门，候选照样从这扇进来：
+        # 我第一版就是只关了一扇，量出来"门槛毫无效果"，差点把结论写成"这条路不通"。
+        # 真 embedding 档不在此列：那一路是真正独立的语义证据，有自己标定过的门槛。
+        lexical_vector = not self.embed
+        if lexical_vector:
+            _vec_admit_raw = vec_admit
+            vec_admit = lambda i: _vec_admit_raw(i) and i in lex_ok  # noqa: E731
         scored_ok = [i for i in range(len(self.chunks))
                      if i not in self.retracted
-                     and (bm_scores[i] > 0 or vec_admit(i))]
+                     and (bm_admit(i) or vec_admit(i))]
         ok = set(scored_ok)
         bm_ranks = [i for i in ranked(bm_scores) if i in ok]
         vec_ranks = [i for i in ranked(vec_scores) if i in ok and vec_rank_ok(i)]
@@ -1639,6 +1710,39 @@ def _selftest(embed=False):
         amb = [m for m, ch in zip(c.meta, c.chunks) if "丙" in ch]
         assert all(m["timestamp_source"] == "mtime" for m in amb), \
             "自相矛盾时那条歧义日期不许被采信"
+
+    # 15c.【变异靶心：词面路的候选门槛】P0"候选闸补词面门槛"。原来的闸是
+    #      「BM25 有分 **或** 向量过槛」，而 `bm_scores[i] > 0` 那一路压根没门槛：
+    #      真实语料词汇丰富，任意查询都能撞上一堆块的 bigram 重叠。
+    #      **判据是"共享的词面里有没有一个是区分性的"，不是"分够不够高"**——
+    #      分数阈值挡不住高频功能词堆出来的分，而且又会是一个拍脑袋的常数。
+    with tempfile.TemporaryDirectory() as td:
+        #   语料构造：每块都有那串功能词（模拟真实语料里人人都有的口语），
+        #   而"保险丝"只出现在一块里（模拟真正有区分度的内容词）——**区分性判据是
+        #   相对语料自身的 df，所以那个词在 fixture 里必须真的稀有**，
+        #   第一版把它写进了每一块，于是它 df 超标、反被判成非区分性（断言当场红）
+        for i in range(12):
+            body = "我们那次说的那件事后来怎么样了，当时聊到很晚。"
+            if i == 0:
+                body += "拆开后盖发现保险丝熔断。"
+            Path(td, f"w{i:02d}_2026-07-{i + 1:02d}.md").write_text(
+                f"# 第{i}窗\n\n## 那天\n{body}\n", encoding="utf-8")
+        idx_g = load_corpus(td)
+        #   a) 整句都是高频功能词（语料里每块都有）→ **词面路一个都不放行**
+        junk = "我们那次说的那件事后来怎么样了"
+        assert idx_g.lexical_admit(tokenize(junk)) == set(), \
+            "整句都是高频功能词却放行了——这正是编造查询最典型的形态"
+        assert idx_g.retrieve(junk) == [], \
+            "没有任何区分性词面证据时该明确空手，不该端回一堆沾边的块"
+        #   b) 带一个区分性词 → 照常放行（**反向也要守**：把闸拧死成"永远空集"
+        #      同样能让上面两条全过，那是把检索废掉，不是修好）
+        real = "保险丝"
+        admit = idx_g.lexical_admit(tokenize(real))
+        assert admit, "带区分性词的查询必须还能进候选，否则等于把检索关了"
+        assert idx_g.retrieve(real), "真实查询该照常有结果"
+        #   c) 门槛的 df 上限**复用图谱路那条判据**（对语料自身的占比，不是绝对分数）
+        assert idx_g._distinctive_df() == max(3, idx_g._bm25.N // 5), \
+            "区分性判据该复用图谱路的 max_df，不许另造一个跟外部标度绑死的常数"
 
     # 16.【变异靶心：权重跟内容走，不跟位置走】用进废退权重的持久化
     #     server 是 stdio 进程、客户端每次会话都可能重启它——权重不落盘的话每次

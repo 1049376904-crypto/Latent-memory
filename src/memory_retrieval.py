@@ -58,6 +58,12 @@ RECALL_HALF_LIFE_DAYS = 7.0
 # 同一待遇：等真实检索质量评估再调，现在不拍脑袋。
 WEIGHT_INFLUENCE_CAP = 2.0
 
+# 图谱路专用的 RRF k（2026.08.01 回归集实测定的，理由见 rrf_fuse docstring）。
+# 取值 10：3~15 是一整片平台（留出集分数不变），10 落在平台中间，不是尖峰上的
+# 拟合值；>20 退回原状。**这是在合成回归集上调的，样本量仍小**——真实语料上
+# 复核之前，它跟 +0.05 / rrf_k=60 / CAP=2.0 一样属于待调经验值。
+GRAPH_RRF_K = 10
+
 
 def tokenize(text: str):
     """BM25 用的中文零依赖分词：清标点/空白后取字符 bigram 当词。"""
@@ -101,9 +107,17 @@ def ranked(scores):
     return [i for i, _ in sorted(enumerate(scores), key=lambda x: (-x[1], x[0]))]
 
 
-def rrf_fuse(rank_lists, k=60):
+def rrf_fuse(rank_lists, k=60, ks=None):
     """RRF 融合多路名次（纯函数，只看名次不看分数）。
     rank_lists: [[chunk_idx 从好到坏], ...]。返回 [(chunk_idx, 融合分), ...] 按分降序。
+    ks：可选，每路各自的 k（长度需与 rank_lists 一致）；不传则各路共用 k。
+    **为什么要允许每路不同的 k**（2026.08.01 回归集实测后加）：k 决定这一路"名次
+    差别值多少钱"。k=60 时 rank1(1/61) 与 rank10(1/70) 只差 15%，等于把名次抹平、
+    让**进了几条路**压倒**排第几**。这对词面/向量两路是好事（它们本来就该互相印证），
+    但对图谱路是致命的——图谱路存在的全部意义就是捞回那些**在词面和向量里都是零分**
+    的块（同一件事换了说法），这种块天生只可能出现在一条路里，在 k=60 下永远赢不了
+    任何一个在两条路里都混了个脸熟的闲词块。给图谱路一个更小的 k，它排头几名的块
+    才有机会真的被端上来。
 
     2026.07.31 起权重不再乘进融合分。原来 fused *= weight 是无上界乘子叠在
     天生很平的 RRF 分上（rank1=1/61 与 rank10=1/70 只差 15%，命中三次的 ×1.15
@@ -111,9 +125,10 @@ def rrf_fuse(rank_lists, k=60):
     封顶——维护者指出的滚雪球陷阱（详见 retrieve 的权重第四路注释）。
     现在权重的话语权由 retrieve 以"第四路名次"的形式并进来，影响力有界。"""
     fused = defaultdict(float)
-    for ranks in rank_lists:
+    for li, ranks in enumerate(rank_lists):
+        kk = k if ks is None else ks[li]
         for rank, idx in enumerate(ranks):
-            fused[idx] += 1.0 / (k + rank + 1)
+            fused[idx] += 1.0 / (kk + rank + 1)
     return sorted(fused.items(), key=lambda x: (-x[1], x[0]))
 
 
@@ -121,12 +136,13 @@ class MemoryIndex:
     """记忆检索索引：add 片段 → build → retrieve。权重随命中浮沉（用进废退）。"""
 
     def __init__(self, embed=False, weight_boost=0.05, rrf_k=60,
-                 graph_topK=5, graph_seeds=3):
+                 graph_topK=5, graph_seeds=3, graph_rrf_k=None):
         # graph_topK/graph_seeds 是经验值（每块存几个邻居/两路各取几个种子扩展），
         # 跟 +0.05/k=60 同一待遇，等真实检索质量评估再调
         self.embed = embed
         self.weight_boost = weight_boost
         self.rrf_k = rrf_k
+        self.graph_rrf_k = GRAPH_RRF_K if graph_rrf_k is None else graph_rrf_k
         self.graph_topK = graph_topK
         self.graph_seeds = graph_seeds
         self.chunks, self.meta, self.weights = [], [], []
@@ -311,8 +327,11 @@ class MemoryIndex:
         ok = set(scored_ok)
         bm_ranks = [i for i in ranked(bm_scores) if i in ok]
         vec_ranks = [i for i in ranked(vec_scores) if i in ok]
-        rank_lists = [r for r, on in ((bm_ranks, "bm25" in routes),
-                                      (vec_ranks, "vector" in routes)) if on]
+        rank_lists, route_ks = [], []
+        for r, on in ((bm_ranks, "bm25" in routes), (vec_ranks, "vector" in routes)):
+            if on:
+                rank_lists.append(r)
+                route_ks.append(self.rrf_k)
         # 第三层：按留口设计把关联块排成第三路 append 进 RRF，融合逻辑不改。
         # 两处实现细节是实测调出来的（过程见 设计笔记"关系图谱"一节）：
         #   种子只取真有分的命中——零分并列块不是命中，它们的邻居是纯噪声；
@@ -335,6 +354,7 @@ class MemoryIndex:
         # 带出了新关联块才追加，没有就退回两路融合
         if "graph" in routes and len(graph_route) > len(seeds):
             rank_lists.append(graph_route)
+            route_ks.append(self.graph_rrf_k)   # 图谱路用更小的 k，见 rrf_fuse docstring
         # 第四路：用进废退权重（2026.07.31，滚雪球治理——维护者指出的陷阱：
         # 权重当乘子时无上界增长×近乎持平的 RRF 分，被频繁命中的块会自激滚雪球，
         # "曾经对、现在错"的旧事实靠历史命中数一直占着前排）。两条治理规则：
@@ -349,7 +369,8 @@ class MemoryIndex:
             key=lambda i: (-self.weights[i], i))
         if "weight" in routes and weight_route:
             rank_lists.append(weight_route)
-        fused = rrf_fuse(rank_lists, self.rrf_k)
+            route_ks.append(self.rrf_k)
+        fused = rrf_fuse(rank_lists, self.rrf_k, ks=route_ks)
         if reranker is not None:
             # 精排是乘法路径，权重乘子钳到 WEIGHT_INFLUENCE_CAP（滚雪球治理的
             # 乘法侧：重排不豁免用进废退，但同样不给无上界话语权）

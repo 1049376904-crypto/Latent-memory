@@ -64,6 +64,24 @@ WEIGHT_INFLUENCE_CAP = 2.0
 # 复核之前，它跟 +0.05 / rrf_k=60 / CAP=2.0 一样属于待调经验值。
 GRAPH_RRF_K = 10
 
+# 真 embedding 路径（--embed）的可靠命中门槛（2026.08.01 实测定的）。
+#
+# **这条不是优化，是修一个会让 --embed 变危险的缺陷。** 零依赖路径下门槛是
+# "bm25 或向量层有分（>0）"，因为字符 bigram 余弦对不相干的文本真的会给 0；
+# 但真 embedding 的余弦**几乎恒正**——库里根本没有的事，它照样给每块 0.2~0.4 分。
+# 实测：开 --embed 后 absent 类的"正确空手率"从 1.00 **掉到 0.00**，两档都是。
+# 也就是说模型问"去年体检血糖多少"，系统会端回四条毫不相干的记忆，而 instructions
+# 又堵着"不许说我没有记录"——这是一条通往编造的流水线，比检索不准危险得多。
+#
+# 取值 0.45 的依据：实测 absent 类查询的最高余弦落在 0.364~0.436，真实查询的最高
+# 余弦落在 0.485~0.718，中间有一道真实的间隙；0.44~0.47 是一整片平台（各项分数
+# 不变），0.45 落在平台里。0.48 以上开始伤 linked，0.42 以下 absent 失守。
+#
+# **这个数与 embedding 模型绑定**（当前是 bge-small-zh-v1.5，512 维）——换模型
+# 余弦标度就变了，必须重新量，不能照抄。零依赖路径**不适用**这个阈值（bigram
+# 余弦是另一套标度），所以它只在 self.embed 为真时生效。
+EMBED_HIT_FLOOR = 0.45
+
 
 def tokenize(text: str):
     """BM25 用的中文零依赖分词：清标点/空白后取字符 bigram 当词。"""
@@ -143,6 +161,13 @@ class MemoryIndex:
         self.weight_boost = weight_boost
         self.rrf_k = rrf_k
         self.graph_rrf_k = GRAPH_RRF_K if graph_rrf_k is None else graph_rrf_k
+        # 向量层"算不算有信号"的门槛，**两条路径两套标度**：零依赖的字符 bigram
+        # 余弦对不相干文本会给 0，>0 就够；真 embedding 的余弦几乎恒正，必须用
+        # 数值门槛（见 EMBED_HIT_FLOOR）。在构造时定死成属性而不是在 retrieve 里
+        # 现算，是为了能被直接断言——这条的失效形态（门槛误用到零依赖路径）
+        # **行为测试抓不到**：零依赖下 cosine>0 必然 bm25>0（同一套 bigram），
+        # 误用门槛今天是无害的，但等哪天语义代理换好了就会变成静默的坑
+        self.vec_floor = EMBED_HIT_FLOOR if embed else 0.0
         self.graph_topK = graph_topK
         self.graph_seeds = graph_seeds
         self.chunks, self.meta, self.weights = [], [], []
@@ -321,12 +346,13 @@ class MemoryIndex:
         # 路径下这道门槛基本不起作用，待真实评估再调。
         # 撤回的块（self.retracted）在这里一并出局：不进候选、不进种子、不被
         # 图谱带回、不加权。
+        vec_ok = lambda i: vec_scores[i] > self.vec_floor
         scored_ok = [i for i in range(len(self.chunks))
                      if i not in self.retracted
-                     and (bm_scores[i] > 0 or vec_scores[i] > 0)]
+                     and (bm_scores[i] > 0 or vec_ok(i))]
         ok = set(scored_ok)
         bm_ranks = [i for i in ranked(bm_scores) if i in ok]
-        vec_ranks = [i for i in ranked(vec_scores) if i in ok]
+        vec_ranks = [i for i in ranked(vec_scores) if i in ok and vec_ok(i)]
         rank_lists, route_ks = [], []
         for r, on in ((bm_ranks, "bm25" in routes), (vec_ranks, "vector" in routes)):
             if on:
@@ -1050,6 +1076,16 @@ def _selftest(embed=False):
     assert ts_h1 is not None and datetime.fromtimestamp(ts_h1).strftime("%m%d") == "0708"
     #  c) 正文里的短日期一概不认——"3.5 倍"不是 3 月 5 日
     assert parse_chunk_timestamp("window_9.md", "# 无日期标题\n\n效率提升了 3.5 倍。", 2026) == (None, None)
+
+    # 14b.【靶心：门槛的适用范围】两条路径的余弦是**两套标度**，门槛只归真
+    #      embedding 用。这条只能做结构性断言：它的失效形态（把 0.45 套到零依赖
+    #      路径上）**行为测试抓不到**——零依赖下 cosine>0 必然 bm25>0（两者用同一套
+    #      bigram），误用今天不改变任何结果。但等语义代理换好了它就是个静默的坑，
+    #      所以把决策定死成构造时的属性，直接断言
+    assert MemoryIndex(embed=False).vec_floor == 0.0, \
+        "零依赖路径不该有数值门槛——bigram 余弦是另一套标度，套上会掐死向量路"
+    assert MemoryIndex(embed=True).vec_floor == EMBED_HIT_FLOOR, \
+        "真 embedding 路径必须带数值门槛，否则 absent 类的正确空手率会归零"
 
     # 15.【可靠命中门槛靶心（2026.07.31 验收反馈；变异：去掉 scored_ok 过滤必红）】
     #     词面/语义都零信号的 query → 空手而归，且一个块都不加权——不设门槛的话

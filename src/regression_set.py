@@ -199,6 +199,13 @@ BASELINE = {
 }
 TOPN = 5
 
+# 真 embedding 路径的实测基线（2026.08.01，bge-small-zh-v1.5）。
+# **只在装了 fastembed 的环境里检查**——自检不能强依赖可选件，否则零依赖主干就名存实亡。
+EMBED_BASELINE = {
+    "cold":        {"literal": 1.00, "paraphrase": 1.00, "linked": 0.83, "absent": 1.00},
+    "established": {"literal": 1.00, "paraphrase": 1.00, "linked": 0.75, "absent": 1.00},
+}
+
 
 # ---------- 填充语料（把语料撑到真实规模，并且**词频分布也要真实**） ----------
 #
@@ -263,7 +270,7 @@ def _filler(i):
             f"{_TAILS[(i // 4) % len(_TAILS)]}")
 
 
-def build_index(scale="established", with_entities=True, with_correction=True):
+def build_index(scale="established", with_entities=True, with_correction=True, embed=False):
     """建回归用的索引。with_* 关掉可以单独看某个机制的影响。
 
     scale 两档，**都是真实的用户状态，不是"对照组"**：
@@ -274,7 +281,7 @@ def build_index(scale="established", with_entities=True, with_correction=True):
                     那把尺子；拿 cold 档去判断机制有没有缺陷会得出错误结论
                     （深夜那两个伪影就是这么来的）。
     """
-    idx = MemoryIndex()
+    idx = MemoryIndex(embed=embed)
     for window, layer, date, text in CORPUS:
         idx.add(text, {"source": f"window_{window:02d}_{date}.md",
                        "window": window, "layer": layer,
@@ -456,6 +463,29 @@ def _selftest():
     assert idx.weights[idx.chunks.index(WRONG_TEXT)] == 1.0, \
         "被撤回的块权重要归位——误召回攒的命中数是错误信号，不该留着"
 
+    # 5c.【真 embedding 路径的门槛守门】只在装了 fastembed 时跑——自检不能强依赖
+    #     可选件。守的是 2026.08.01 实测出来的那个缺陷：真 embedding 余弦几乎恒正，
+    #     不加数值门槛的话 absent 类"正确空手率"会从 1.00 掉到 0.00，等于把
+    #     "查不到就诚实说没有"整条拆掉，而 instructions 又堵着"不许说我没有记录"
+    #     ——一条通往编造的流水线。这条断言比分数高低重要得多。
+    try:
+        import fastembed  # noqa: F401
+        has_embed = True
+    except ImportError:
+        has_embed = False
+    if has_embed:
+        for scale, table in EMBED_BASELINE.items():
+            e = score(build_index(scale=scale, embed=True))
+            assert e["absent"]["correct_empty"] == 1.0, \
+                f"--embed 路径（{scale} 档）的可靠命中门槛失守：正确空手率 " \
+                f"{e['absent']['correct_empty']:.2f}——EMBED_HIT_FLOOR 是不是被改动或绕过了？"
+            for kind, floor in table.items():
+                got = e[kind]["correct_empty"] if kind == "absent" else e[kind]["recall"]
+                assert got >= floor - 1e-9, \
+                    f"--embed 路径质量退化（{scale} 档）：{kind} {got:.2f} < 基线 {floor:.2f}"
+    else:
+        print("  （跳过 --embed 路径检查：环境里没有 fastembed，这是可选件）")
+
     # 5b.【留出集纪律】留出集与调参集不许有重合的查询——重了就等于把留出集
     #     变成调参集，anti-overfitting 的保护当场归零。这条规矩今天刚用一次就
     #     抓到了真问题（"聚合排序"在调参集涨 0.25、留出集一分不涨），值得钉死。
@@ -499,7 +529,7 @@ def _selftest():
         f"established 档规模不足，量出来的'图谱连不上'会是规模伪影而不是机制缺陷"
 
     print(f"selftest ok（回归集：{len(idx.chunks)} 块语料 / {len(CASES)} 条查询，"
-          f"9 项断言：两档不低于基线 / 门槛没松 / 实体槽增益状态 / 消融走真实路径 / 更正闭环 / 留出集纪律 / 语料代表性三道闸）")
+          f"10 项断言：两档不低于基线 / 门槛没松 / 实体槽增益状态 / 消融走真实路径 / 更正闭环 / embed门槛 / 留出集纪律 / 语料代表性三道闸）")
 
 
 if __name__ == "__main__":

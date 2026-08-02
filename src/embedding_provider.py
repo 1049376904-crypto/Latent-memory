@@ -42,7 +42,7 @@ ENV_ENDPOINT = "MEMORY_EMBED_ENDPOINT"      # 云端：完整 URL，如 https://
 ENV_KEY_NAME = "MEMORY_EMBED_API_KEY_ENV"   # **变量名**，不是 key 本身
 ENV_QUERY_PREFIX = "MEMORY_EMBED_QUERY_PREFIX"
 DEFAULT_KEY_ENV = "MEMORY_EMBED_API_KEY"
-# 门槛覆盖口（**采纳自外部 PR #1**，`lu7899112-source`，2026.08.01）：他指出，
+# 门槛覆盖口（**采纳自外部 PR #1**，`lu7899112-source`，2026.08.01）：对方指出，
 # 换了后端/模型的人**只能改源码**才能填自己量出来的门槛。这条是对的——我们的
 # 标定表纪律（没量过就是 None、不给替代数字）拦的是"照抄一个数"，不该顺带把
 # **真的量过的人**也拦在外面。所以口子开，纪律照旧写在门口：见 hit_floor_override()。
@@ -70,7 +70,7 @@ HIT_FLOOR_BY_MODEL = {
 CLOUD_BATCH = 32
 CLOUD_TIMEOUT = 60
 
-# 单条截断（**采纳自外部 PR #1**，`lu7899112-source`，2026.08.01——他在 2G 内存 VPS 上
+# 单条截断（**采纳自外部 PR #1**，`lu7899112-source`，2026.08.01——对方在 2G 内存 VPS 上
 # 独立实现了同一条云端路径，这一条是我们那版漏掉的）：护住服务商侧的 token 上限。
 # 我们自己的块中位 352 字符，但真实语料里量到过 4386 的长块——一批全是长块就可能
 # 撞上批量 token 上限，而**失效形态是整批请求报错**，建库当场中断。
@@ -98,7 +98,7 @@ def hit_floor_override(env=None):
     """`MEMORY_EMBED_HIT_FLOOR` → float 或 None（没设／设歪了）。
 
     **这个口子是给"自己量过"的人开的，不是给"想找个数填上"的人开的**（采纳自
-    外部 PR #1，他那版把这条警告原样搬进了新注释，做法对）。余弦标度跟模型绑死，
+    外部 PR #1，那一版把这条警告原样搬进了新注释，做法对）。余弦标度跟模型绑死，
     照抄别人的数会让"库里没有就说没有"无声失灵——所以这里只做一件事：**把它
     如实标成 override**，`describe()` 里说明这个数不是我们量的，出了偏差是用户
     自己的标定，不是我们的标定表。

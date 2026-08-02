@@ -605,17 +605,29 @@ PICK_FALLBACKS = {
 PRONOUN_QUESTIONS = {
     "user": Question(
         "pronoun_user", "opening", "_pronoun_user", "怎么称呼你",
-        "人格文件里提到你的时候，用“他”还是“她”？", order=1, options={
+        "人格文件里提到你的时候，需要一个人称。你希望我们怎么称呼你？"
+        "「他」、「她」，或者写你的昵称。", order=1, options={
+            # ⚠ A=他 / B=她 这个键映射**不许换**：已建过档的人答案存在
+            # init_state.json 里，换一次顺序，TA 重跑 --step ship 人称就整个翻转
             "A": ("他", "他"),
             "B": ("她", "她"),
         }, pronoun_side="user"),
     "ai": Question(
         "pronoun_ai", "opening", "_pronoun_ai", "怎么称呼 TA",
-        "问卷里提到你的 AI 的时候，用“他”还是“她”？", order=2, options={
-            "A": ("他", "他"),
+        "问卷里提到你的 AI 的时候，需要一个人称。你希望我们怎么称呼 TA？"
+        "「他」、「她」，或者写 TA 的昵称。", order=2, options={
+            "A": ("他", "他"),          # 同上，键映射不许换
             "B": ("她", "她"),
         }, pronoun_side="ai"),
 }
+
+# 昵称档的两条护栏。**昵称不是选项，是走 FREEFORM_POLICY 那条既有的"补一句"口子**
+# ——所以这里不新开自由输入，只是让 pronouns_from_answers 认得它。
+# ⚠ 「它」照旧不许（硬约束在 PRONOUN_CHOICES 那条注释里，昵称这一档不是它的例外口）。
+# 限长比 FREEFORM_MAX_CHARS 短得多：这东西会填进 {ta}/{ai} 槽、出现在人格文件正文的
+# 句子中间，四十个字的"昵称"会把每一句都撑坏——它是称呼，不是一句话。
+NICKNAME_MAX_CHARS = 8
+_NICKNAME_REJECT = ("它",)
 
 
 def pronouns_from_answers(questions, answers, detected=None):
@@ -629,10 +641,21 @@ def pronouns_from_answers(questions, answers, detected=None):
             continue
         if isinstance(ans, dict):
             ans = ans.get("keys") or ans.get("pick") or ""
-        key = (ans or "").strip()[:1]
-        picked = q.directive(key)
+        raw = (ans or "").strip()
+        picked = q.directive(raw[:1])
         if picked in PRONOUN_CHOICES:
             out[q.pronoun_side] = picked
+            continue
+        # 昵称档：选项都不贴合时按 FREEFORM_POLICY 自己补一句。**不静默丢**——
+        # 旧版这里只认 A/B，用户写的昵称会被无声吃掉，然后退回中性写法，
+        # 而 TA 明明已经回答过了（"读不懂的行静默丢"是这个项目的老毛病之一）。
+        nick = raw
+        if not nick:
+            continue
+        if any(bad in nick for bad in _NICKNAME_REJECT) or len(nick) > NICKNAME_MAX_CHARS:
+            # 不猜、也不硬塞：拒掉就退回"没答"，走中性写法，比填一个撑坏句子的串好
+            continue
+        out[q.pronoun_side] = nick
     return {"user": out.get("user"), "ai": out.get("ai")}
 
 
@@ -1602,6 +1625,32 @@ def _selftest():
     qs = [q.qid for q in questions_for(coverage_report(p))]
     assert "naming_pick" not in qs, "已有具体内容的节不该再问"
     assert "remember_what" in qs, "空泛的节要继续问"
+
+    # 3c.【昵称档：TA 自己写的称呼不许被静默吃掉】人称题按 FREEFORM_POLICY 允许
+    #     "选项都不贴合就补一句"，但旧版 pronouns_from_answers 只认 A/B 两个键，
+    #     用户写的昵称会被无声丢掉、退回中性写法——**而 TA 明明已经回答过了**。
+    #     两条护栏一并钉住：「它」不许（硬约束对这一档同样成立）、超长不许
+    #     （昵称要填进 {ta} 槽、坐在句子中间，四十个字会把每句都撑坏）。
+    #     ⚠ **A=他 / B=她 这个键映射不许换**：已建过档的人答案存在 init_state.json
+    #     里，换一次顺序 TA 重跑 --step ship 人称就整个翻转（这条下面单独断言）。
+    _PQ = list(PRONOUN_QUESTIONS.values())
+    assert pronouns_from_answers(_PQ, {"pronoun_user": "A"})["user"] == "他", \
+        "A 必须还是「他」——换了键映射会让已建档的人重跑时人称翻转"
+    assert pronouns_from_answers(_PQ, {"pronoun_user": "B"})["user"] == "她", \
+        "B 必须还是「她」"
+    assert pronouns_from_answers(_PQ, {"pronoun_user": "小鹿"})["user"] == "小鹿", \
+        "用户自己写的昵称被静默吃掉了——TA 已经回答过了，不该退回中性写法"
+    assert pronouns_from_answers(_PQ, {"pronoun_ai": "阿般"})["ai"] == "阿般", \
+        "AI 侧的昵称同样要认"
+    assert pronouns_from_answers(_PQ, {"pronoun_user": "它"})["user"] is None, \
+        "「它」在昵称这一档同样不许——它不是这条硬约束的例外口"
+    assert pronouns_from_answers(_PQ, {"pronoun_user": "小" * 20})["user"] is None, \
+        "超长的串不该进 {ta} 槽——那会把人格文件每一句都撑坏，宁可退回中性写法"
+    #     昵称填进模板要念得通（这是它跟代词唯一的差别，必须真渲染一次看）
+    _t = "这是你和{ta}共同维护的记忆文件——{ta}写下的东西都在这里，你每次都会读，" \
+         "所以{ta}不用每次从头解释自己。"
+    _r = fill_pronouns(_t, {"user": "小鹿", "ai": "阿般"})
+    assert "小鹿写下的东西都在这里" in _r and "{" not in _r, f"昵称没填进去：{_r}"
 
     # 4.【变异靶心：立场题排序】先具体后抽象——立场题不能排在最前面
     ordered = [q.qid for q in sorted(QUESTIONS, key=lambda q: q.order)]
@@ -2670,9 +2719,9 @@ def _selftest():
         except ValueError as e:
             assert "开篇缺" in str(e)
 
-    print("selftest ok（47项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
+    print("selftest ok（48项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
           "归属句式 / 默认值不预支历史 / 协议层不问用户 / 导出纪律 / 渲染顺序 / "
-          "人称锚死一套 / 用户只有一种称呼形态 / 中性档不丢主语 / 人称从语料读出来 / 中性写法不许漏 / 语料侧判定不许猜 / 全文零它 / 称呼不重复拼接 / 关系状态归开篇 / "
+          "人称锚死一套 / 用户只有一种称呼形态 / 昵称档不被静默吃掉 / 中性档不丢主语 / 人称从语料读出来 / 中性写法不许漏 / 语料侧判定不许猜 / 全文零它 / 称呼不重复拼接 / 关系状态归开篇 / "
           "答案读回不静默丢 / 任务书不泄漏进人格文件 / 长字面量不崩 / 未决草稿不蒸发 / "
           "记忆库落盘带日期 / 覆盖区间进人格文件 / 止血纪律进人格文件 / "
           "pick 题只许挑不许写 / 冷启动出得了货 / "

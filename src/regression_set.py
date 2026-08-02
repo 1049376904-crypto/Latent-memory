@@ -272,6 +272,87 @@ HELDOUT_CASES = [
     ("absent_日常", "我们后来还提起过那回的事吗", []),
 ]
 
+# ---------- 编造题探针的护栏（2026.08.02，协议照抄外部报告人 `lu7899112-source`） ----------
+#
+# 她那份 1144 条真实语料的复测报告里，最值得信的不是那些数字，是**她的护栏抓了她
+# 自己一次**：十道编造题里有一道（问「科目二」）被自己的护栏拦下作废了——那个词
+# 在她语料里真的存在，那道题问的就不是"库里没有的事"，计进去等于给自己送分。
+#
+# 我们原来的 absent 集**没有这一层**：编造题是人写的，写的人凭印象觉得"这事没发生
+# 过"就写进去了，没有任何一步去验证它真的不在语料里。这跟"合成集给 absent 满分"
+# 是同一类病——**尺子上没刻这一格，就永远量不出自己错在哪**。
+#
+# 协议三条：
+#   ① 每道编造题带**区分词表**：这道题靠哪几个词才算"问的是另一件事"；
+#   ② 计分前先验证词表里的词**在语料全文里一个都不出现**，出现即作废并记录；
+#   ③ 有一类编造题**天生没有区分词**（整句都是功能词，「那次我们说好的事后来怎么
+#      样了」这种）——它们恰恰是最真实的威胁形态。**护栏管不了这一类，就如实说
+#      管不了**，单独归一档、单独计数，不假装验过。
+#
+# 第③条是这次特意没有偷懒的地方：给它编一个"查一下有没有稀有 token"的伪护栏很
+# 容易，但本单的判定实验刚刚证明**零依赖判不出"是不是内容词"**（字符 bigram 层
+# 产不出这个概念，PMI 内聚度也分不开——「薄荷」+10.38 对「光是」+0.69）。
+# 拿一个我们刚证伪的判据去当护栏，比没有护栏更糟。
+UNGUARDABLE = "无区分词·整句功能词"
+
+ABSENT_DISTINCTIVE = {
+    # absent_远主题
+    "量子对撞机的运行日志": ["对撞机", "量子"],
+    "报税截止日期是哪天": ["报税"],
+    "邻居家狗的名字": ["邻居"],
+    "去年体检的血糖值": ["体检", "血糖"],
+    # absent_日常（带内容词的那一批）
+    "上次我们一起去滑雪摔跤的那回": ["滑雪", "摔跤"],
+    "她那天说要养猫的事后来怎么样了": ["养猫"],
+    "我们说好去海边看日出那次": ["海边", "日出"],
+    "上回她妈妈来住的那几天": ["妈妈"],
+    "那次一起熬夜看球赛的事": ["球赛"],
+    "她生日那天我们去的那家店": ["生日"],
+    "上个月我们搬去海边住的那阵子": ["海边"],
+    "她说想学吉他那回后来买了吗": ["吉他"],
+    "那天下大雨我们困在路上的事": ["大雨"],
+    "我们一起养的那只狗叫什么来着": ["养的那只狗"],
+    # absent_日常（整句功能词那一批——护栏管不了，如实标出来）
+    "那次我们说好的事后来怎么样了": UNGUARDABLE,
+    "上回她提过的那件事你还记得吗": UNGUARDABLE,
+    "我们那天聊到很晚的那回是为什么": UNGUARDABLE,
+    "她当时说的那句话后来还算数吗": UNGUARDABLE,
+    "上次那件事我们最后是怎么定的": UNGUARDABLE,
+    "她那阵子跟我说过的那些话呢": UNGUARDABLE,
+    "我们后来还提起过那回的事吗": UNGUARDABLE,
+}
+
+GUARDED_KINDS = ("absent_日常", "absent_远主题")
+
+
+def absent_probe_guard(idx, cases=None):
+    """编造题探针护栏 → (valid, rejected, unguardable)。
+
+    valid：区分词经验证确实不在语料里，可以计分；
+    rejected：区分词在语料里真的存在 → **作废并记录**（这题问的不是"库里没有的
+              事"，计进去是给自己送分）；也包括压根没登记区分词表的题；
+    unguardable：显式声明"整句功能词、没有区分词"的那一批，护栏验不了，单独计数。
+
+    **越界提问不走这条护栏**：它问的是很可能真发生过、只是不在语料时间范围内的事，
+    判据是时间锚不是词面，拿"词不在语料里"去卡它是错的口径。
+    """
+    full = "\n".join(idx.chunks)
+    valid, rejected, unguardable = [], [], []
+    for kind, q, expect in (CASES if cases is None else cases):
+        if kind not in GUARDED_KINDS:
+            continue
+        words = ABSENT_DISTINCTIVE.get(q)
+        if words is None:
+            rejected.append((q, "没登记区分词表——编造题必须写清楚它靠哪几个词才算编造"))
+        elif words == UNGUARDABLE:
+            unguardable.append((kind, q, expect))
+        elif [w for w in words if w in full]:
+            rejected.append((q, f"区分词 {[w for w in words if w in full]} 在语料里真的存在"))
+        else:
+            valid.append((kind, q, expect))
+    return valid, rejected, unguardable
+
+
 # ---------- present 查询的第二条轴：具名式 / 归纳式（2026.08.01，第二份外部反馈建议） ----------
 #
 # 现有的 literal/paraphrase/linked 分类是**按机制**分的（考哪一路）。测试者的标定
@@ -553,9 +634,19 @@ def build_index(scale="established", with_entities=True, with_correction=True,
 
 
 def score(idx, cases=CASES, topN=TOPN, routes=None):
-    """跑一遍查询集 → 按类别分组的指标。"""
+    """跑一遍查询集 → 按类别分组的指标。
+
+    **编造题先过护栏再计分**（2026.08.02）：区分词在语料里真的存在的题当场作废、
+    不进分母——它问的不是"库里没有的事"，算进去是拿一道送分题抬正确空手率。
+    established 档现在就有一道被拦下（「球赛」在填充块里真的出现过），
+    这不是假设，是我们自己的探针集被自己的护栏抓了一次。
+    """
+    _, _rejected, _ = absent_probe_guard(idx, cases)
+    _void = {q for q, _ in _rejected}
     buckets = {}
     for kind, query, expect in cases:
+        if query in _void:
+            continue
         b = buckets.setdefault(kind, {"n": 0, "hit": 0, "rr": 0.0, "empty_ok": 0})
         b["n"] += 1
         results = idx.retrieve(query, topN=topN, routes=routes)
@@ -651,6 +742,17 @@ def report(embed=False, provider_spec=None):
                                               cases=HELDOUT_CASES)).strip().replace("\n", "  "))
     print()
 
+    print("【编造题护栏】（协议照抄外部报告人；被拦下的题作废、不进计分分母）")
+    for scale in ("cold", "established"):
+        i = mk(scale=scale)
+        for name, cs in (("CASES", CASES), ("留出集", HELDOUT_CASES)):
+            v, rj, ug = absent_probe_guard(i, cs)
+            print(f"  {scale:<12}{name:<7} 计分 {len(v)}  作废 {len(rj)}  "
+                  f"护栏管不了（整句功能词）{len(ug)}")
+            for q, why in rj:
+                print(f"      作废：{q} ← {why}")
+    print()
+
     print("【缺失率分档记账】（记账不守门；阈值 %.0f%% 由外部真实语料标定，"
           "我们的合成语料词汇窄、整体虚高，见伪影⑤）" % (MISS_RATE_FLAG * 100))
     print(f"  {'档':<16}{'n':>3}  {'最低':>6}{'中位':>7}{'最高':>7}   触发标注")
@@ -724,6 +826,42 @@ def _selftest():
         assert got["absent_日常"]["correct_empty"] >= \
             BASELINE[scale]["absent_日常"]["correct_empty"] - 1e-9, \
             f"absent_日常 退化（{scale} 档）——这一格本来就不及格，不许再降"
+
+    # 2b.【变异靶心：编造题护栏】2026.08.02，协议照抄外部报告人。
+    #     没有这一层的话，"编造题"只是**写的人以为**没发生过的事——写错一道，
+    #     absent 那一格就凭空多一分送分。她自己的护栏抓过她一次（「科目二」），
+    #     我们的护栏也当场抓了我们一次（「球赛」在 established 档的填充块里真有）。
+    for scale in ("cold", "established"):
+        i = build_index(scale=scale)
+        for cs in (CASES, HELDOUT_CASES):
+            v, rj, ug = absent_probe_guard(i, cs)
+            #   a) 每道编造题都必须登记区分词表——漏登记的会掉进 rejected 的
+            #      "没登记"那一档，这条不许有
+            assert not [q for q, why in rj if "没登记" in why], \
+                f"有编造题没登记区分词表（{scale} 档）：{[q for q, why in rj if '没登记' in why]}"
+            #   b) 计分集与作废集加起来 + 管不了的那档 = 全部编造题，一道不许丢
+            total = sum(1 for k, _, _ in cs if k in GUARDED_KINDS)
+            assert len(v) + len(rj) + len(ug) == total, \
+                "护栏把题弄丢了——作废要记录，不许静默丢弃"
+    #     c)【本条的变异靶心】护栏必须**真的会拦**：塞一道区分词确实在语料里的
+    #        编造题，它必须被拦下。把"先验证词不在语料里"那一步去掉，这条当场红。
+    idx_c = build_index(scale="established")
+    canary = "上次修咖啡机那回换的是什么零件"
+    ABSENT_DISTINCTIVE[canary] = ["咖啡机"]
+    try:
+        v, rj, _ = absent_probe_guard(idx_c, [("absent_日常", canary, [])])
+        assert not v and [q for q, _ in rj] == [canary], \
+            "区分词在语料里真的存在的题必须被护栏拦下作废——不然这道题是在给自己送分"
+    finally:
+        del ABSENT_DISTINCTIVE[canary]
+    #   d) 被作废的题不许还留在计分分母里（护栏接进 score 的那一步）
+    v_e, rj_e, _ = absent_probe_guard(idx_c, CASES)
+    assert rj_e, "established 档本来就有一道该被拦下（「球赛」）——这条空了说明护栏没接上"
+    n_scored = score(idx_c).get("absent_日常", {}).get("n", 0)
+    n_declared = sum(1 for k, q, _ in CASES
+                     if k == "absent_日常" and q not in {x for x, _ in rj_e})
+    assert n_scored == n_declared, \
+        f"作废的题还在计分分母里：计分 n={n_scored}，护栏放行 {n_declared}"
 
     # 3.【钉住实测状态：实体槽当前**测不出增益**】这条断言写的是现状不是期望——
     #    建回归集时量出来的第一个真结果就是负面的：实体标注只改变了图谱邻居的

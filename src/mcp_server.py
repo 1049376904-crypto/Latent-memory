@@ -31,18 +31,23 @@ tools/list / tools/call，字段名与错误分层均照规格），**已查证�
 用法：
   python mcp_server.py --selftest
   python mcp_server.py --corpus <md目录> [--threads <threads.jsonl>]   # stdio 服务
-客户端配置（Claude Desktop 之类）里把上面第二条命令填成 server 启动命令即可。
+  python mcp_server.py --doctor --corpus <md目录> [--threads <threads.jsonl>]  # 部署体检
+客户端配置（Claude Desktop 之类）里把上面第二条命令填成 server 启动命令即可；
+配完接不上、或者不确定 --corpus 指对了没有时，把同一行参数换成 --doctor 跑一次
+（体检只读，不往语料目录写任何东西）。
 """
 
 import argparse
 import io
 import json
+import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 # 同目录模块，import 不触发各自的 CLI
-from memory_retrieval import (MemoryIndex, load_corpus, append_record,
+from memory_retrieval import (MemoryIndex, load_corpus, append_record, corpus_files,
                               query_miss_rate, miss_rate_note, annotate_block)
 from embedding_provider import resolve_provider
 from session_recall import SessionRecall, format_recall_block, SELF_CHECK_FOOTER  # noqa: F401
@@ -399,6 +404,241 @@ class MemoryServer:
                 stdout.flush()
 
 
+# ---------- 部署体检（任务卡"部署体检命令"） ----------
+#
+# 挂在 mcp_server.py 上、不另开脚本文件：配 MCP 的人手里已经有这个文件的绝对路径
+# （`claude mcp add` 那行就是它），体检命令跟着它走，等于零新增路径要记。
+#
+# **只读是硬约束，不是习惯**：体检最可能被在"看起来没接通"的时候跑，那时候人对
+# 目录状态的信任最脆弱；跑一次体检往语料目录里掉一个 `.weights.json`，等于在
+# 排查故障的现场留下一个新变量。所以这里一个字节都不写盘——包括 sidecar，
+# 包括 embed 档的块向量缓存。这条由 selftest 的目录快照断言守着（第 14 项）。
+
+OK, WARN, FAIL = "ok", "warn", "fail"
+_DOCTOR_ICON = {OK: "✓", WARN: "⚠", FAIL: "✗"}
+
+# 不该出现在语料目录里的 md：它们是产出目录那一层的东西。撞见就说明 --corpus
+# 多指了一层（指到了产出目录本身，而不是里面的记忆库）——人格文件会被当成记忆
+# 吃进库里，检索结果里冒出自己的人格设定，但不报任何错
+_NOT_CORPUS_MD = {"claude.md", "agents.md", "persona.md", "readme.md",
+                  "注入契约.md", "index_readme.md"}
+# mtime 兜底占比超过这条线就报警：时间戳全落 mtime 时换窗召回的新鲜度排序整个失效
+_MTIME_WARN_RATIO = 0.2
+
+
+def diagnose(corpus_dir, threads_path=None, embed=False):
+    """体检语料目录与接线，返回 [{level,title,detail}, ...]。**纯读，不写盘。**
+
+    检的是"配好了没有"，不是"检索好不好"——后者归回归集（regression_set.py）。
+    每一条都对应一种**不报错的失败**：指错目录、人格文件混进语料、时间戳全落
+    mtime、sidecar 哈希对不上、写回落点只读、thread 没落点。这些的共同点是
+    服务照常起、握手照常成功、模型照常回话，只是回得不对。"""
+    out = []
+    def add(level, title, detail):
+        out.append({"level": level, "title": title, "detail": detail})
+
+    # **相对路径必须解析成绝对路径**（判据 1，也是这一单的来源）：`.mcp.json` 里写的
+    # 是 `--corpus corpus` 这种相对值，跑体检的人心里的问题正是"它到底去哪儿读了"。
+    # 把他自己写的那个词原样回显给他，等于一个字没答——报告里必须出现真实绝对路径。
+    # ⚠ 别把 .resolve() 去掉（selftest 第 15 项走真进程守着这条）
+    root = Path(corpus_dir).resolve()
+    if not root.exists():
+        add(FAIL, "语料目录", f"{root} 不存在。服务端认的是 --corpus 传进去的这个路径，"
+                              "跟目录叫什么名字无关——先确认 MCP 配置里那行路径写对了没有。")
+        return out
+    if not root.is_dir():
+        add(FAIL, "语料目录", f"{root} 不是目录。--corpus 要指向记忆库那一层目录，不是单个文件。")
+        return out
+
+    files = corpus_files(root)          # 递归，子目录里的 md 也算
+    if not files:
+        # 典型是指到了 src/ 或路径写岔了一格。给候选时**只看目录里有没有 md，
+        # 不看目录叫什么名字**——外层目录名本来就是自由的（叫 corpus/、我的记忆/
+        # 都一样读得到），拿名字猜就是在教人一个错的判据
+        near = [d for d in sorted(root.parent.iterdir())
+                if d.is_dir() and d != root and corpus_files(d)] if root.parent.exists() else []
+        hint = (f"同级的这些目录里有 md，你要指的多半是其中之一："
+                f"{'、'.join(d.name for d in near[:5])}。" if near
+                else "它的同级目录里也没有——确认一下记忆库到底建在哪儿。")
+        add(FAIL, "语料文件", f"{root} 下（含子目录）没找到任何 .md 语料。{hint}")
+        return out
+    add(OK, "语料目录", f"{root}（{len(files)} 个 md 文件）")
+
+    stray = [p.name for p in files if p.name.lower() in _NOT_CORPUS_MD]
+    if stray:
+        add(WARN, "混进来的文件",
+            f"语料里有 {'、'.join(sorted(set(stray)))}——这些是产出目录那一层的文件，"
+            "不是记忆。多半是 --corpus 多指了一层（应指向里面的记忆库目录）。"
+            "它们会被当成记忆检索到，但不会报任何错。")
+
+    index = load_corpus(root)          # embed=False：这一档不写任何缓存文件
+    if not index.chunks:
+        # "有 md、但一块都切不出来"是上面那道 `not files` 关卡挡不住的一档：
+        # 文件全是空行/只有空白的话，语料目录看着满满当当，库却是空的，
+        # 服务照样起、每次检索都空手。这条要显著地说，别让它一路往下崩在除法上
+        add(FAIL, "建库", f"{len(files)} 个 md 文件里一块内容都切不出来——"
+                          "文件是空的或只有空白行。这样的库起得来但查不到任何东西，"
+                          "每次检索都会空手。先确认语料是不是真写进去了。")
+        return out
+    n_index = sum(1 for m in index.meta if m.get("layer") == "index")
+    add(OK, "建库", f"{len(index.chunks)} 块（索引层 {n_index} / 叙事层 "
+                    f"{len(index.chunks) - n_index}）")
+
+    # 时间范围（判据 3）：兜的是《快速上手》第 0 步那个坑的**部署侧版本**——
+    # 旧导出包建出来的库，条数漂亮、块数漂亮、什么都不报错，只是**整份停在了
+    # 过去某一天**。`memory_import.py --stats` 只在导入那一刻能发现它；导完之后，
+    # 这里是唯一还会把这个数摆到人眼前的地方。只读 index.meta 里现成的 timestamp，
+    # 不开任何文件句柄
+    ts = [m["timestamp"] for m in index.meta if m.get("timestamp")]
+    if ts:
+        span = (f"{datetime.fromtimestamp(min(ts)):%Y-%m-%d} ~ "
+                f"{datetime.fromtimestamp(max(ts)):%Y-%m-%d}")
+        add(OK, "时间范围", f"{span}——盯住后面那个日期，问自己一句：跟 TA 最近一次"
+                            "聊天真的是这天吗？对不上说明这份语料是旧快照，"
+                            "重新导一份再建库（数字再健康也救不了停在过去的语料）。")
+    else:
+        add(WARN, "时间范围", "一块都没有时间戳，算不出时间范围——"
+                              "换窗召回按时间新鲜度排序，这种情况下它没有任何排序依据。")
+    if n_index == 0:
+        add(WARN, "分层", "没有索引层（父目录名叫 index 的才算）。不算错，但命中率会低一档："
+                          "索引层是每会话一条高密度摘要，专门喂检索。")
+
+    # 时间戳成色：mtime 兜底不是"不太准"，是全错且整齐地错——复制目录/重新 clone
+    # 会把全目录 mtime 刷成同一时刻，一整批记忆拿到同一个假时间，换窗召回按新鲜度
+    # 排序，这一错就整个乱套
+    srcs = {}
+    for m in index.meta:
+        srcs[m.get("timestamp_source")] = srcs.get(m.get("timestamp_source"), 0) + 1
+    detail = "、".join(f"{k} {v} 块" for k, v in sorted(srcs.items(), key=lambda x: -x[1]))
+    n_mtime = srcs.get("mtime", 0)
+    ratio = n_mtime / len(index.chunks)
+    if ratio > _MTIME_WARN_RATIO:
+        bad = sorted({m["source"] for m in index.meta
+                      if m.get("timestamp_source") == "mtime"})
+        add(WARN, "时间戳来源",
+            f"{detail}——{ratio:.0%} 的块只能退到文件修改时间。它不是"
+            "“不太准”，是全错且整齐地错：复制一遍目录或重新 clone，全目录 mtime 会被"
+            "刷成同一时刻，换窗召回的新鲜度排序整个失效。修法是把日期写进文件名"
+            f"（window_04_2026-06-17.md 这种）或标题行。落 mtime 的文件："
+            f"{'、'.join(bad[:5])}{' 等' if len(bad) > 5 else ''}")
+    else:
+        add(OK, "时间戳来源", detail)
+    if index.date_order:
+        add(OK, "日期顺序", f"语料里的 m/d/y 型日期按 {index.date_order} 解析（有决定性证据）")
+
+    # sidecar：三个都是可选的，**没有不是错**；有、但一块都对不上才是错——
+    # 那说明语料被编辑过或换过目录，哈希对不上号，等于这份 sidecar 静默失效了
+    for name, loader, what in ((".retractions.json", index.load_retractions, "撤回账本"),
+                               (".weights.json", index.load_weights, "命中权重"),
+                               (".entities.json", index.load_entities, "实体标注")):
+        p = root / name
+        if not p.exists():
+            add(OK, name, f"没有（正常：{what}第一次用到时才生成）")
+            continue
+        try:
+            n = loader(p)
+        except (ValueError, OSError) as e:
+            add(FAIL, name, f"{what}读不出来：{e}")
+            continue
+        if n == 0:
+            add(WARN, name, f"{what}在，但没有一条对得上当前语料——按内容哈希对号入座，"
+                            "语料被编辑过或换了目录就会全部失效（文件还在，等于没有）。")
+        else:
+            add(OK, name, f"{what}接上 {n} 块")
+    index.build()                       # 实体边在 build 时算，接上后要重建一次
+
+    # 写回落点：memory_append/memory_correct 要往这里写。只用 os.access 判，
+    # 不试写——试写就破了只读
+    if os.access(root, os.W_OK):
+        add(OK, "写回落点", f"{root} 可写（memory_append 会往这里加窗口文件）")
+    else:
+        add(FAIL, "写回落点", f"{root} 不可写——模型会说“记下了”，但每一次写回都失败。")
+
+    # thread 落点：没配 --threads 时 thread_close 只活在内存里，进程一退就没了，
+    # 下个会话的开场召回接不上上一次聊到哪
+    if not threads_path:
+        add(WARN, "会话线索", "没配 --threads，会话收尾只在内存里、进程一退就没——"
+                              "下个会话接不上“上次聊到哪”。MCP 配置里补一个 jsonl 路径。")
+    else:
+        tp = Path(threads_path)
+        if not tp.exists():
+            writable = tp.parent.exists() and os.access(tp.parent, os.W_OK)
+            add(OK if writable else FAIL, "会话线索",
+                f"{tp} 还没有（第一次 thread_close 时创建）"
+                + ("" if writable else "，但它的父目录不存在或不可写，创建会失败。"))
+        else:
+            try:
+                threads = ThreadStore(tp).all()
+            except (ValueError, OSError) as e:
+                add(FAIL, "会话线索", f"{tp} 读不出来：{e}")
+                threads = None
+            if threads is not None:
+                latest = max(threads, key=lambda t: (t.window, t.ended_at)) if threads else None
+                add(OK, "会话线索", f"{tp}：{len(threads)} 条"
+                                    + (f"，最新是第 {latest.window} 个窗口" if latest else ""))
+
+    if embed:
+        # 明说不体检，而不是偷偷降级：embed 档下 load_corpus 会把块向量缓存
+        # （.embed_cache.json）落在语料目录里，跑一次体检就落一个文件——跟只读冲突
+        add(WARN, "检索路线", "体检只走零依赖档：embed 档建库会把块向量缓存"
+                              "（.embed_cache.json）写进语料目录，跟“体检不落文件”冲突。"
+                              "上面关于语料/时间戳/sidecar 的结论跟检索路线无关，照样作数；"
+                              "embed 那一路通不通请直接起一次服务看。")
+
+    # 接线本身：握手 + 工具表 + 一次真检索。前面全绿也可能死在这一步，
+    # 而这是唯一一处能证明"这份语料真能被查到"的检查
+    srv = MemoryServer(index=index, thread_store=ThreadStore(threads_path))
+    #    ⚠ 故意不接 weights_path：接了的话下面这次检索会把权重落盘，体检就不再只读。
+    #    要改这行之前先读 selftest 第 14 项——它就是守这个的。
+    hs = srv.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    tools = srv.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
+    add(OK, "MCP 接线", f"握手 {hs['result']['protocolVersion']}，工具 {len(tools)} 个："
+                        + "、".join(t["name"] for t in tools))
+
+    probe = _doctor_probe(index)
+    res = srv.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                      "params": {"name": "memory_search",
+                                 "arguments": {"query": probe}}})["result"]
+    if res["isError"]:
+        add(FAIL, "检索自查", f"拿语料自己的标题“{probe}”去查，反而查不到："
+                              + res["content"][0]["text"].splitlines()[0])
+    else:
+        add(OK, "检索自查", f"拿语料自己的标题“{probe}”查得到")
+    return out
+
+
+def _doctor_probe(index):
+    """从语料自己身上取一句探针 query——用最新那块的标题（没有标题就用首行）。
+    拿库里确实存在的说法去查，查不到就说明接线坏了，而不是"这个问题库里没有"。"""
+    i = max(range(len(index.meta)),
+            key=lambda j: index.meta[j].get("timestamp") or 0)
+    head = (index.meta[i].get("heading") or "").strip()
+    if not head:
+        head = next((ln.lstrip("# ").strip() for ln in index.chunks[i].splitlines()
+                     if ln.strip()), "")
+    return head[:30]
+
+
+def format_doctor_report(checks):
+    """体检结果 → 给人看的报告。结论一句话放最后，别让人自己数图标。"""
+    lines = ["记忆库部署体检", ""]
+    for c in checks:
+        lines.append(f"{_DOCTOR_ICON[c['level']]} {c['title']}：{c['detail']}")
+    n_fail = sum(1 for c in checks if c["level"] == FAIL)
+    n_warn = sum(1 for c in checks if c["level"] == WARN)
+    lines.append("")
+    if n_fail:
+        lines.append(f"结论：{n_fail} 项过不去" + (f"、{n_warn} 项要注意" if n_warn else "")
+                     + "。上面标 ✗ 的先修，修完再起服务。")
+    elif n_warn:
+        lines.append(f"结论：能用，{n_warn} 项要注意——标 ⚠ 的都是"
+                     "“不报错但会悄悄变差”的那类，值得看一眼。")
+    else:
+        lines.append("结论：全部通过。")
+    lines.append("（体检只读，没有向语料目录写入任何文件。）")
+    return "\n".join(lines)
+
+
 # ---------- selftest（合成语料，全部虚构） ----------
 
 _SYNTH = [
@@ -675,14 +915,157 @@ def _selftest():
         assert r13["isError"] is False and "阳台" in r13["content"][0]["text"], \
             "server 接上 .entities.json 后，换了说法的关联块该被图谱带回"
 
-    print("selftest ok（15项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层 / "
+    # 14.【部署体检·靶心是"只读"】体检最常在"看起来没接通"的时候跑，那时候往
+    #     语料目录里掉一个文件，等于在排查现场留下新变量。跑前跑后整棵目录树的
+    #     快照（相对路径 + 大小 + mtime_ns）必须逐字相等——**顺手接一条
+    #     weights_path 进 diagnose 里的 server，这条立刻红**，那是最容易被写出来的
+    #     sidecar（检索命中就落盘）。
+    #     靶子目录**故意叫 corpus/、不叫 memory/**：外层目录名是自由的，服务端认的
+    #     是 --corpus 指向哪儿；判定必须靠目录内容，一旦有人拿名字做判断，这里就红
+    def _snapshot(root):
+        return {str(p.relative_to(root)): (p.is_dir(), p.stat().st_size if p.is_file() else 0,
+                                           p.stat().st_mtime_ns)
+                for p in sorted(_P(root).rglob("*"))}
+
+    with tempfile.TemporaryDirectory() as td:
+        corpus = _P(td) / "corpus"
+        (corpus / "timeline").mkdir(parents=True)
+        (corpus / "index").mkdir(parents=True)
+        (corpus / "timeline" / "window_04_2026-06-17.md").write_text(
+            "## 修咖啡机\n加热管不工作，拆开发现保险丝熔断，换上通电正常。\n",
+            encoding="utf-8")
+        (corpus / "index" / "window_04.md").write_text(
+            "## 第4窗摘要\n修好了咖啡机。\n", encoding="utf-8")
+        before = _snapshot(corpus)
+        checks = diagnose(corpus, threads_path=_P(td) / "threads.jsonl")
+        report = format_doctor_report(checks)
+        assert _snapshot(corpus) == before, \
+            "体检必须只读：跑完语料目录里多/少/改了东西（最常见的是 .weights.json）"
+        assert not list(corpus.rglob(".*")), \
+            f"体检不许留 sidecar：{[p.name for p in corpus.rglob('.*')]}"
+        assert all(c["level"] != FAIL for c in checks), f"这份语料该全过：{checks}"
+        by = {c["title"]: c for c in checks}
+        assert "索引层 1" in by["建库"]["detail"], "index/ 那层要被认出来"
+        assert by["时间戳来源"]["level"] == OK and "mtime" not in by["时间戳来源"]["detail"], \
+            "文件名带日期 + 邻层继承，不该有块落 mtime"
+        assert by["检索自查"]["level"] == OK, "拿语料自己的标题该查得到"
+        assert "没有向语料目录写入任何文件" in report
+
+        #    指错目录的三种典型都要给出**能照着改**的话，不是"失败"两个字
+        gone = diagnose(_P(td) / "根本没有这个目录")
+        assert gone[0]["level"] == FAIL and "--corpus" in gone[0]["detail"]
+        #    指到了旁边一个没有语料的目录（典型是 src/）：报失败之外还要**按内容**
+        #    把真正的候选找出来。这里的靶子目录叫 corpus/ 不叫 memory/，所以
+        #    谁把候选判据写成"目录名叫 memory/"，这条立刻红
+        (_P(td) / "src").mkdir()
+        astray = diagnose(_P(td) / "src")
+        assert astray[-1]["level"] == FAIL and "corpus" in astray[-1]["detail"], \
+            f"该按内容指出“你要指的多半是 corpus/”：{astray[-1]}"
+        #    指到了产出目录本身：人格文件被当成记忆吃进库，不报任何错——这条只能靠体检
+        (corpus / "CLAUDE.md").write_text("# 人格文件\n你是……\n", encoding="utf-8")
+        stray = {c["title"]: c for c in diagnose(corpus)}
+        assert stray["混进来的文件"]["level"] == WARN and \
+            "CLAUDE.md" in stray["混进来的文件"]["detail"], "人格文件混进语料要报出来"
+
+    #     mtime 兜底的报警：文件名与正文都不带日期时，整批块拿到同一个假时间
+    with tempfile.TemporaryDirectory() as td:
+        c2 = _P(td) / "corpus"
+        c2.mkdir()
+        (c2 / "随手记.md").write_text("## 没写日期\n聊了点别的。\n", encoding="utf-8")
+        m = {c["title"]: c for c in diagnose(c2)}
+        assert m["时间戳来源"]["level"] == WARN and "mtime" in m["时间戳来源"]["detail"]
+        assert m["会话线索"]["level"] == WARN, "没配 --threads 要提醒收尾不过夜"
+        #     sidecar 在、但一块都对不上 = 静默失效（换过目录/改过语料），要报出来
+        (c2 / ".weights.json").write_text('{"deadbeef": 2.0}', encoding="utf-8")
+        w = {c["title"]: c for c in diagnose(c2)}
+        assert w[".weights.json"]["level"] == WARN and "对得上" in w[".weights.json"]["detail"]
+
+    # 15.【部署体检·走真进程，从相对路径 cwd 起】上面第 14 项全是函数级断言，
+    #     它有两个够不着的地方，而返工的三条缺陷恰好都藏在那里：
+    #       ① 函数级断言喂的是 tempfile 给的**绝对**路径，于是"相对路径有没有被
+    #          解析开"永远测不到——而 `.mcp.json` 里写的正是 `--corpus corpus`
+    #          这种相对值，这一单的来源就是它；
+    #       ② `__main__` 那段分派（缺 --corpus 的报错、按 FAIL 决定的退出码）
+    #          一条断言都盖不到，全在裸奔。
+    #     所以这一项起真进程、传相对值、断言 stdout 与退出码。
+    #     **断的是 str(corpus.resolve()) 在不在输出里，不是字符串 "corpus" 在不在**
+    #     ——后者用户本来就知道，回显给他等于一个字没答。
+    #     变异：去掉 diagnose 里的 .resolve() / 把块数写死 / 空目录也报成功 → 各自红
+    import subprocess
+    here = _P(__file__).resolve().parent
+
+    def run_doctor(cwd, *argv):
+        p = subprocess.run([sys.executable, str(here / "mcp_server.py"), "--doctor", *argv],
+                           cwd=str(cwd), capture_output=True, text=True, encoding="utf-8")
+        return p.returncode, p.stdout + p.stderr
+
+    with tempfile.TemporaryDirectory() as td:
+        corpus = _P(td) / "corpus"
+        (corpus / "timeline").mkdir(parents=True)
+        (corpus / "index").mkdir(parents=True)
+        (corpus / "timeline" / "window_04_2026-06-17.md").write_text(
+            "## 修咖啡机\n加热管不工作，拆开发现保险丝熔断。\n", encoding="utf-8")
+        (corpus / "index" / "window_04.md").write_text(
+            "## 第4窗摘要\n修好了咖啡机。\n", encoding="utf-8")
+        before = _snapshot(corpus)
+        #    从父目录起、传相对值——**照 .mcp.json 里那行的形态跑**
+        code, out = run_doctor(td, "--corpus", "corpus")
+        assert code == 0, f"这份语料该全过，退出码 {code}：{out}"
+        assert str(corpus.resolve()) in out, \
+            f"报告里必须出现真实绝对路径（相对路径要解析开），实际输出：{out}"
+        assert "建库：2 块" in out and "索引层 1" in out, f"块数与分层计数要在输出里：{out}"
+        #    断在“建库：”那一行上，别只断“2 块”——时间戳来源那行也带块数，
+        #    松着断的话把块数写死成常量的变异会从那儿溜过去（实测溜过一次）
+        #    块数要真的数出来：**同一次 selftest 里再跑一份块数不同的语料**，
+        #    不然把它写死成常量的变异测不出来（第一份恰好就是那个常量）
+        bigger = _P(td) / "另一份"
+        bigger.mkdir()
+        (bigger / "window_05_2026-06-20.md").write_text(
+            "## 换纱窗\n阳台的纱窗破了个洞，量好尺寸重新装了一扇。\n\n"
+            "## 修水龙头\n厨房水龙头滴水，换掉里面的胶垫就好了。\n\n"
+            "## 装晾衣杆\n阳台加了一根晾衣杆，位置挑在采光最好的一侧。\n",
+            encoding="utf-8")
+        code2, out2 = run_doctor(td, "--corpus", "另一份")
+        assert code2 == 0 and "建库：3 块" in out2, f"块数要真数出来，不是写死的：{out2}"
+        assert "时间范围" in out and "2026-06-17" in out, \
+            f"时间范围（最早/最晚）要在输出里——旧快照那个坑靠它：{out}"
+        assert "filename" in out, f"时间戳来源分布要在输出里：{out}"
+        assert _snapshot(corpus) == before, "真进程跑一遍同样不许写盘"
+
+        #    空目录：显著提示 + 退出码非零（自动化靠它，人靠那句话）
+        empty = _P(td) / "空目录"
+        empty.mkdir()
+        code, out = run_doctor(td, "--corpus", "空目录")
+        assert code != 0, f"空目录必须非零退出，实际 {code}：{out}"
+        assert "✗" in out and "没找到任何 .md 语料" in out, f"提示要显著：{out}"
+        assert str(empty.resolve()) in out, "失败路径同样要回答“读的是哪儿”"
+
+        #    有 md、但切不出块（全空行）：不许崩成 traceback——正在排查故障的人
+        #    要的是一句看得懂的话。旧版在这里 ZeroDivisionError
+        blank = _P(td) / "空白语料"
+        blank.mkdir()
+        (blank / "a.md").write_text("\n   \n\n", encoding="utf-8")
+        code, out = run_doctor(td, "--corpus", "空白语料")
+        assert code != 0, f"切不出块的语料要非零退出，实际 {code}：{out}"
+        assert "Traceback" not in out, f"不许崩，要出话：{out}"
+        assert "一块内容都切不出来" in out and "✗" in out, f"要显著地说“一块都没有”：{out}"
+
+        #    缺 --corpus：argparse 拦下，同样是真进程才盖得到的一格
+        code, out = run_doctor(td)
+        assert code != 0 and "--corpus" in out, f"缺 --corpus 要被拦下：{code} {out}"
+
+    print("selftest ok（17项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层 / "
           "完整链路 / stdio / UTF-8 / 写回当场可查 / 用进撑过重启 / "
-          "无可靠命中明确说 / 撤回更正闭环 / 缺失率标注接线 / 实体标注接线）")
+          "无可靠命中明确说 / 撤回更正闭环 / 缺失率标注接线 / 实体标注接线 / "
+          "部署体检只读 / 部署体检走真进程（相对路径解析开、空语料非零退出））")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--doctor", action="store_true",
+                    help="部署体检：查语料目录、时间戳成色、sidecar、写回落点与 MCP 接线，"
+                         "只读不写盘。有一项过不去时退出码为 1")
     ap.add_argument("--corpus", help="md 语料目录")
     ap.add_argument("--threads", help="会话线索 jsonl 路径（省略则内存态）")
     ap.add_argument("--embed", action="store_true", help="用真 embedding")
@@ -693,6 +1076,13 @@ if __name__ == "__main__":
     args = ap.parse_args()
     if args.selftest:
         _selftest()
+    elif args.doctor:
+        if not args.corpus:
+            ap.error("--doctor 要跟 --corpus 一起用：体检的就是它指向的那个目录")
+        checks = diagnose(args.corpus, threads_path=args.threads, embed=args.embed)
+        print(format_doctor_report(checks))
+        # 退出码给自动化用：有 ✗ 就非零，⚠ 不算失败（那些是"能用但会悄悄变差"）
+        sys.exit(1 if any(c["level"] == FAIL for c in checks) else 0)
     elif args.corpus:
         # 权重文件放语料目录下，起点号不带 .md——不会被 load_corpus 当语料吃进去
         # 块向量缓存（.embed_cache.json）同理，由 load_corpus 默认落在这里：

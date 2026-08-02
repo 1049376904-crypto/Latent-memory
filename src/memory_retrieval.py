@@ -464,7 +464,7 @@ class MemoryIndex:
         # 落在待定阈值的两侧（真实语料 present 对 99.1% 共享 ≥5 字，合成集 present
         # 查询 100% 共享 ≤4 字）——**这道题现在没有一把尺子判得了**。
         # 全部数据、被证伪的三条路线、以及下一步该先补哪把尺子，见任务卡
-        # 任务卡「区分性token离开bigram层」的「判定实验结果」一节。
+        # 「区分性token离开bigram层」的「判定实验结果」一节。
         if not distinctive:
             return set()
         out = set()

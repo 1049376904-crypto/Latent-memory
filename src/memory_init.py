@@ -85,7 +85,9 @@ CONTRACT_DOC = "注入契约.md"
 # **要不要改推荐口径留给维护者拍板**，本行只把过期的前提改掉，实现一个字没动。
 GUIDANCE_DOC = "引导句.txt"
 GUIDANCE_TEMPLATE = "每次对话开始，先完整读取这个文件再回应：{path}"
-# 长度判据写成断言、不是「尽量短」（任务卡验收判据）：设置字段容量的量级。
+# 长度判据写成断言、不是「尽量短」（任务卡验收判据）。⚠ 判据的理由 2026.08.03 起
+# 不再是「设置字段容量的量级」（上面那条：两家都贴得下全文）——是**它是指针不是
+# 第二份人格**：超长基本只有两种可能，往里塞了内容，或产出目录路径深得离谱。
 # 超了拒绝出货并指向真正的修法（产出目录挪浅），不静默截断——截断的指针指向不存在
 # 的路径，失败形态是静默的。
 GUIDANCE_LIMIT = 100
@@ -102,8 +104,8 @@ def guidance_text(persona_path):
     text = GUIDANCE_TEMPLATE.format(path=p)
     if len(text) > GUIDANCE_LIMIT:
         raise ValueError(
-            f"引导句超长（{len(text)} > {GUIDANCE_LIMIT} 字），塞不进 App 的设置字段。"
-            f"多半是产出目录路径太长——把产出目录挪浅一点再出货。")
+            f"引导句超长（{len(text)} > {GUIDANCE_LIMIT} 字）——它该是一句指针，"
+            f"不该这么长。多半是产出目录路径太长——把产出目录挪浅一点再出货。")
     return text
 
 # ---------- 协议层默认值：系统填，不问用户 ----------
@@ -2751,7 +2753,8 @@ def _selftest():
         assert (Path(td) / "CLAUDE.md").exists(), "宿主档这一次货本身就没出成，后面的断言无从谈起"
         #    第四件：引导句（任务卡「人格按需读取的引导句」）。三条一起钉：
         #    文件真出了（变异靶心：出货漏产必红）、指向这次出的人格文件且是绝对路径、
-        #    长度过得了设置字段那道闸
+        #    长度过得了长度那道闸（⚠ 判据理由 2026.08.03 起是「指针不是第二份人格」，
+        #    不再是设置字段容量，见 GUIDANCE_LIMIT 上注）
         gtxt = (Path(td) / GUIDANCE_DOC).read_text(encoding="utf-8").strip()
         assert str((Path(td) / "CLAUDE.md").resolve()) in gtxt, \
             f"引导句没指向这次出货的人格文件：{gtxt}"
@@ -2996,7 +2999,7 @@ def _selftest():
     #     超长必须拦住并把修法说进错误信息——静默截断的指针指向不存在的路径
     try:
         guidance_text("x" * (GUIDANCE_LIMIT + 1))
-        assert False, "超长引导句没被拦住——塞不进设置字段时必须明说，不许静默出货"
+        assert False, "超长引导句没被拦住——超长时必须明说，不许静默出货"
     except ValueError as e:
         assert "产出目录" in str(e), "超长的错误信息没告诉用户怎么修"
 

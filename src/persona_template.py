@@ -231,22 +231,26 @@ class Persona:
             out.append("建议补：里程碑索引——等关系里真发生过转折点再写，别硬凑")
         return out
 
-    def validate(self):
+    def validate(self, mode="legacy_v1"):
         """成文前的**硬性**完整性检查。返回缺失项列表（空列表=可以成文）。
         不抛异常——用于给用户看"还差什么"，而不是中断流程。
-        推荐项见 suggestions()，那些缺了不阻塞出货。"""
+        推荐项见 suggestions()，那些缺了不阻塞出货。
+
+        compiler_v2 只放松尚无真实来源的关系状态与最终约定；协议底座仍必填。"""
+        if mode not in {"legacy_v1", "compiler_v2"}:
+            raise PersonaValidationError(f"未知校验模式：{mode}")
         missing = []
         active_ids = {f.id for f in self.active_fields()}
         for fid, label in OPENING_REQUIRED.items():
             if fid not in active_ids:
                 missing.append(f"开篇缺：{label}")
-        if CURRENT_STATE_FIELD not in active_ids:
+        if mode == "legacy_v1" and CURRENT_STATE_FIELD not in active_ids:
             # 这条只查字段在不在，不查它归哪一节——2026.08.02 它从"我是谁"挪到
             # 开篇（关系状态不是 AI 的身份），提示语跟着改，校验逻辑本来就不依赖节
             missing.append("缺：当前关系状态（这段关系此刻是什么状态）")
         if RETRIEVAL_CONVENTION_FIELD not in active_ids:
             missing.append("“技术架构”节缺：检索约定——不写这句，模型默认不会主动查记忆库")
-        if not any(f.section == "closing" for f in self.active_fields()):
+        if mode == "legacy_v1" and not any(f.section == "closing" for f in self.active_fields()):
             missing.append("缺结尾：最终约定（结尾是注意力高地，不能空着）")
         return missing
 
@@ -407,7 +411,18 @@ def _selftest():
     style_block = [x for x in out["style"] if "style_pool" in x]
     assert style_block and style_block[0]["disclaimer"] == DISCLAIMER, "风格块必须带 disclaimer"
 
-    print("selftest ok（12项断言：骨架顺序 / 开篇四要素 / 里程碑四要素 / gating / 确认关卡）")
+    # 13. compiler_v2 的零材料路径只放松关系 specific，不放松协议底座。
+    zero = Persona("partner")
+    for f in _opening_fields():
+        zero.add_field(f)
+    zero.add_field(Field(
+        id=RETRIEVAL_CONVENTION_FIELD, section="architecture", label="检索约定",
+        value="先查记忆再回答。", source="system"))
+    assert any("当前关系状态" in m for m in zero.validate())
+    assert any("最终约定" in m for m in zero.validate())
+    assert zero.validate(mode="compiler_v2") == []
+
+    print("selftest ok（13项断言：骨架顺序 / 开篇与里程碑 / gating / v1-v2 确认关卡）")
 
 
 if __name__ == "__main__":

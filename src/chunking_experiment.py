@@ -80,8 +80,56 @@ def embed_texts(texts, is_query=False):
 
 # ---------- 三种切法 ----------
 
-def chunk_heading(text: str, max_chars=1500):
-    """按"## "标题切；没有标题或小节超长时按空行段落细分到max_chars以内"""
+def chunk_body(chunk: str):
+    """块剥掉开头那行标题之后剩下的正文（没有标题行就是整块）。
+
+    只认块的**第一行**是不是 `#` 开头——超长小节被按段落切细后的后续块不带标题行，
+    那些块的正文就是它自己，不该被当成"只有标题"。
+
+    ⚠ **这是切块下界与 `--doctor` 切块成色检查共用的唯一判据**，两边都问它、
+    别各抄一份（这个仓库为"两份等价实现早晚分岔"返工过）。"""
+    lines = chunk.splitlines()
+    if lines and lines[0].lstrip().startswith("#"):
+        return "\n".join(lines[1:]).strip()
+    return chunk.strip()
+
+
+def chunk_heading(text: str, max_chars=1500, merge_bodyless=True):
+    """按"## "标题切；没有标题或小节超长时按空行段落细分到max_chars以内；
+    **标题始终跟自己的正文走**，剩下的无正文块**向下**并入后一块（下界，见下）。
+
+    **下界这件事**（《导出格式把每句话切成一块》①，2026.08.03 维护者拍板接受）：
+    原先切块**有上界没有下界**——小节再短也照样独立成块。于是"把 `##` 滥用成
+    每条消息前缀"的第三方导出，我们一点抵抗力都没有：19 个 md 切出 7237 块，
+    每块一句话，**建库成功、块数报得出来、检索也跑得动，只是查不出东西**。
+
+    判据用**结构**（`chunk_body()` 为空）而不是"块长小于 N 字"：
+    长度阈值是要拿真实语料标定的经验值（同 `MILESTONE_BODY_LIMIT` 的教训），
+    而 2026.08.03 实测发现**标不出来也不必标**——三份真实语料里"短块"和"无正文块"
+    几乎完全重合（有正文的合法小节最短 70 字；无正文块最长 77 字），
+    而病态导出 100% 无正文。**"短但有正文"的块在 `##` 这种形态里天然不产出。**
+
+    ⚠ **已知上限，别写成"解决了切块下界"**：它只认"除了标题行什么都没有"。
+    哪天出现 `## 好的` 底下真跟一行字的导出，这条放行、拦不住。
+    接受这个上限是维护者拍的板——替代方案（长度阈值）要等的样本大概率等不到。
+
+    **方向是向下，不是向上**（2026.08.03 返工改的，第一版反了）：无正文的标题行
+    在语义上属于**后文**，向上合并等于把它接到上一个话题的尾巴上——两头都坏，
+    上一块混进别人的标题（`heading` 元数据还是旧的），本节正文块丢了自己的标题。
+    在两份真实中文语料上实测共 18 处踩这条（按天记的日志型 15 处、项目文档型 3 处），
+    **全是长小节的正常路径，没有一处是病态导出**。
+
+    治根优先于合并：上面按段落细分时**攒了标题还没攒到正文就不出块**，
+    绝大多数无正文块从源头就不产生了；下面这段只收拾剩下的
+    （真·空小节、以及"每句 `##`"那种整份都没正文的输入）。
+
+    合并保留原标题行（那些标题本身是内容），且**不破 max_chars 上界**：
+    攒到装不下就先出一块。
+
+    `merge_bodyless=False` 只给**诊断**用（`mcp_server --doctor`）：合并会把病态形态
+    在建库阶段吃掉，体检就再也报不出来了——**两条防线不能互相吃掉**，
+    所以体检要能看一眼合并前的样子。这个参数不是给建库路径留的开关，
+    生产路径永远走默认的 True。"""
     sections = re.split(r"(?=^## )", text, flags=re.M)
     chunks = []
     for sec in sections:
@@ -91,16 +139,45 @@ def chunk_heading(text: str, max_chars=1500):
         if len(sec) <= max_chars:
             chunks.append(sec)
             continue
-        # 超长小节：按段落攒，攒到接近max_chars就出一个chunk
+        # 超长小节：按段落攒，攒到接近max_chars就出一个chunk。
+        # ⚠ **攒了标题却还没攒到正文时不许出块**（2026.08.03 返工，治根）：
+        # 小节第一段常常就是那行标题，而后面第一个内容段又太长、攒不下——原先这里
+        # 会把光秃秃的标题行单独出成一块，它就成了"无正文块"，再被下界合并搬走，
+        # 于是标题跟自己的正文分了家。**这才是无正文块最主要的来源**，
+        # 跟"每句 ## "那种病态导出无关，是正常长文档的正常路径。
+        # 从源头不产它，比产出来再合并干净。
+        # 代价：标题+超长首段可能略微超出 max_chars——但单个超长段落本来就会
+        # 超（下面 buf 里只有一段时照样直接出块），上界本来就是软的，不新增破坏。
         buf = ""
         for para in re.split(r"\n{2,}", sec):
-            if buf and len(buf) + len(para) > max_chars:
+            if buf and chunk_body(buf) and len(buf) + len(para) > max_chars:
                 chunks.append(buf.strip())
                 buf = ""
             buf += para + "\n\n"
         if buf.strip():
             chunks.append(buf.strip())
-    return chunks
+    # 下界：剩下的无正文块**向下**并入后一块（方向见 docstring）。攒到装不下
+    # max_chars 就先出一块，所以上界仍然成立——两条约束不打架
+    if not merge_bodyless:
+        return chunks
+    merged, pending = [], ""
+    for c in chunks:
+        if not chunk_body(c):
+            if pending and len(pending) + len(c) + 1 > max_chars:
+                merged.append(pending)
+                pending = ""
+            pending = pending + "\n" + c if pending else c
+            continue
+        if pending:
+            if len(pending) + len(c) + 1 <= max_chars:
+                c = pending + "\n" + c
+            else:
+                merged.append(pending)
+            pending = ""
+        merged.append(c)
+    if pending:                      # 结尾一串无正文块，后面没得并了，只能自成一块
+        merged.append(pending)
+    return merged
 
 
 def chunk_fixed(text: str, size=500, overlap=100):
@@ -261,6 +338,59 @@ def _selftest(embed=False):
     # 超长小节细分路径
     long_text = "## 超长节\n" + ("字" * 400 + "\n\n") * 6
     assert len(chunk_heading(long_text, max_chars=1000)) > 1
+
+    # 【切块下界】《导出格式把每句话切成一块》① —— 维护者 2026.08.03 拍板接受
+    #   判据是**结构**（剥掉标题行后正文空不空），不是长度阈值：长度阈值那条要真实
+    #   语料标定，而实测发现"短但有正文"的合法小节在 `##` 这种形态里天然不产出
+    #   （三份真实语料最短的有正文块 70 字，短块几乎全是无正文的），标不出来。
+    #   a) 病态形态：每句话前面一个 `##` —— 必须被合并回正常块数
+    每句一块 = "\n\n".join(f"## 第{i}句话，很短" for i in range(60))
+    merged = chunk_heading(每句一块, max_chars=200)
+    assert len(merged) < 60, f"无正文块必须向上合并，不能一句一块：{len(merged)}"
+    assert all(len(c) <= 200 for c in merged), "合并不许撑破 max_chars 上界"
+    #   b) 标题行必须保留（合并不是丢弃——那些标题本身是内容）
+    assert "第0句话" in merged[0] and "第59句话" in merged[-1], "合并要保留原标题行"
+    #   c) 有正文的块**一个都不许动**：这条守的是"别误伤真语料"
+    正常 = "## 甲\n甲的正文。\n\n## 乙\n乙的正文。"
+    assert chunk_heading(正常) == ["## 甲\n甲的正文。", "## 乙\n乙的正文。"], \
+        "有正文的小节不许被合并——判据认的是正文空不空，不是块短不短"
+    #   d)【返工靶心 2026.08.03】**标题必须跟自己的正文在一起**。
+    #      第一版把无正文块**向上**并进前一块——而无正文的标题行语义上属于**后文**，
+    #      向上合并等于把它接到上一个话题的尾巴上，两头都坏：上一块混进了别人的标题
+    #      （heading 元数据还是旧的），本节的正文块丢了自己的标题。
+    #      触发路径**跟"每句 ##"那种病态输入无关**，是长小节的正常路径：小节超过
+    #      max_chars 按段落细分时，第一段常常就是那行标题（后面第一个内容段太长、
+    #      攒不下），标题于是独立成块、被判无正文、被并进上一块。
+    #      实测：两份真实中文语料共 18 处（日志型 15、文档型 3），全是这个机制，
+    #      无一是病态导出。
+    两节 = ("## 前一节\n\n前一节的正文，写够长一点免得两节并成一块。\n\n"
+            "## 收藏盒·后端\n\n" + "表 003_gallery.sql 已经建好了。" * 12
+            + "\n\n" + "后端接口三条，都接上了。" * 12)
+    out = chunk_heading(两节, max_chars=200)
+    前 = [c for c in out if c.startswith("## 前一节")]
+    assert 前 and "收藏盒" not in 前[0], \
+        f"标题被接到了上一个话题的尾巴上——合并方向反了：{前}"
+    本 = [c for c in out if c.startswith("## 收藏盒")]
+    assert 本, f"本节的标题整个丢了，正文块成了孤儿：{[c[:20] for c in out]}"
+    assert chunk_body(本[0]), f"标题必须跟自己的正文在一起，不许独立成块：{本[0]!r}"
+    #      ⚠ 上面那段被**治根**兜住了，所以它测不出合并方向——只改方向、不动治根的话
+    #      它照样绿（写这条时实测：靶心变异是绿的，差点把方向的靶子当成已经有了）。
+    #      **方向要单独一个靶子**：真·空小节（整节只有一行标题，治根救不了它，
+    #      必须靠合并方向处理）——它属于后文，只能向下并。
+    空节 = ("## 甲节\n\n甲节的正文。\n\n"
+            "## 乙节\n\n"                       # 整节只有标题，没有任何正文
+            "## 丙节\n\n丙节的正文。")
+    o2 = chunk_heading(空节, max_chars=200)
+    甲 = [c for c in o2 if c.startswith("## 甲节")][0]
+    assert "乙节" not in 甲, f"空小节的标题被向上并到了甲节尾巴上——方向反了：{甲!r}"
+    assert any("乙节" in c and "丙节" in c for c in o2), \
+        f"空小节的标题该向下并给丙节（它在语义上属于后文）：{o2}"
+    #   e) 判据必须取自 chunk_body 本人，不许另抄一份（mcp_server 的体检走的是
+    #      同一个函数；两份判据早晚分岔，这个仓库为此返工过）
+    assert chunk_body("## 只有标题") == ""
+    assert chunk_body("## 标题\n正文") == "正文"
+    assert chunk_body("没有标题行的块") == "没有标题行的块", \
+        "超长小节切细后的后续块不带标题行，正文算它自己，不该被判成无正文"
     # answer子串校验路径（evaluate之前由run做，这里直接验证判断逻辑）
     assert "保险丝熔断" in SYNTH
 

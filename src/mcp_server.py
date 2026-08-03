@@ -50,6 +50,8 @@ from pathlib import Path
 from memory_retrieval import (MemoryIndex, load_corpus, append_record, corpus_files,
                               query_miss_rate, miss_rate_note, annotate_block)
 from embedding_provider import resolve_provider
+# 切块下界与体检的切块成色检查**共用同一个判据**，不各抄一份
+from chunking_experiment import chunk_body as _chunk_body, chunk_heading
 from session_recall import SessionRecall, format_recall_block, SELF_CHECK_FOOTER  # noqa: F401
 from session_thread import ThreadStore, close_thread
 
@@ -424,6 +426,17 @@ _NOT_CORPUS_MD = {"claude.md", "agents.md", "persona.md", "readme.md",
                   "注入契约.md", "index_readme.md"}
 # mtime 兜底占比超过这条线就报警：时间戳全落 mtime 时换窗召回的新鲜度排序整个失效
 _MTIME_WARN_RATIO = 0.2
+# 「只有标题行、没有正文」的块占到这个比例就报警——兜的是"第三方导出把每句消息
+# 前面加 `##`"那类输入（见《导出格式把每句话切成一块》任务卡）。`chunk_heading`
+# 有上界没有下界，这种语料建库成功、块数报得出来、检索也跑得动，只是每个块都是
+# 一句话，**静默地没有检索价值**，还顺带把图谱那条平方曲线推过 MCP 启动超时。
+#
+# 判据**刻意不选"块长中位数低于 N 字"**：那是要拿真实语料标定的经验值（同
+# MILESTONE_BODY_LIMIT 的教训），手上只有"正常"和"病态"两个极端、中间没有样本，
+# 定不出来。"标题行就是整个块"是结构判据，不用标定：按小节切出来的块本该有正文。
+# 这条线取"过半"是语义边界不是调出来的数——本仓三份真实 md 语料量到 0% / 3.6%
+# / 11.6%，每句 `##` 的导出形态是 100%，两边离这条线都远得很。
+_HEADING_ONLY_WARN_RATIO = 0.5
 
 
 def diagnose(corpus_dir, threads_path=None, embed=False):
@@ -481,8 +494,36 @@ def diagnose(corpus_dir, threads_path=None, embed=False):
                           "每次检索都会空手。先确认语料是不是真写进去了。")
         return out
     n_index = sum(1 for m in index.meta if m.get("layer") == "index")
+    lens = sorted(len(c) for c in index.chunks)
+    median_len = lens[len(lens) // 2]
     add(OK, "建库", f"{len(index.chunks)} 块（索引层 {n_index} / 叙事层 "
-                    f"{len(index.chunks) - n_index}）")
+                    f"{len(index.chunks) - n_index}），中位块长 {median_len} 字")
+
+    # 切块成色：块数漂亮、分层漂亮，但每个块只有一句话——体检以前只报块数，
+    # 报告里那个虚高一个数量级的数字**没有任何一行说它不正常**（首发用户就是这么
+    # 错过它的）。只加诊断、不改切块行为
+    # ⚠ 这里必须看**合并前**的形态。2026.08.03 切块下界落地后，无正文块在建库阶段
+    # 就被向上合并掉了，拿 index.chunks 数永远是 0——**两条防线会互相吃掉**，
+    # 而被吃掉的那条恰恰是唯一会告诉用户"你的导出有毛病"的那条。修法治的是症状，
+    # 诊断仍要照直说病因：导出该改，不然每次建库都要靠合并兜。
+    raw = []
+    for f in files:
+        try:
+            t = Path(f).read_text(encoding="utf-8")
+        except OSError:
+            continue          # 实际不可达（load_corpus 在前面先读过一遍），防御性保留
+        raw += chunk_heading(t, merge_bodyless=False)
+    n_heading_only = sum(1 for c in raw if not _chunk_body(c))
+    # 有文件读不出来时 raw 会比实际建库的块少，差值可能变负——报负数比不报更糊涂，
+    # 钳到 0（合并只会让块变少，负数在语义上不存在）
+    merged_n = max(0, len(raw) - len(index.chunks))
+    if raw and n_heading_only > len(raw) * _HEADING_ONLY_WARN_RATIO:
+        add(WARN, "切块", f"切块前 {n_heading_only}/{len(raw)} 块只有一行标题、没有正文"
+            f"——已在建库时合并 {merged_n} 块，现在是 {len(index.chunks)} 块、"
+            f"中位块长 {median_len} 字。**库是能用了，但语料本身该改**：去看一眼是不是"
+            "**每句话前面都有 `##`**（有的第三方聊天导出插件这么干）。切块按 `## ` 认"
+            "小节，所以一句话就成了一个块。合并只是兜底，导出后把这些消息前缀去掉再"
+            "建库，块的边界才落在你真正的话题上。")
 
     # 时间范围（判据 3）：兜的是《快速上手》第 0 步那个坑的**部署侧版本**——
     # 旧导出包建出来的库，条数漂亮、块数漂亮、什么都不报错，只是**整份停在了
@@ -550,7 +591,11 @@ def diagnose(corpus_dir, threads_path=None, embed=False):
     # 写回落点：memory_append/memory_correct 要往这里写。只用 os.access 判，
     # 不试写——试写就破了只读
     if os.access(root, os.W_OK):
-        add(OK, "写回落点", f"{root} 可写（memory_append 会往这里加窗口文件）")
+        # 落点要报到层：写回永远进 timeline 层（append_record 构造上锁死的），
+        # 人格文件里「按需读取指针」必须盖住这个目录——用户拿这行对自己的指针，
+        # 指漏了的症状是"新长出来的记忆按需读不到"，而且不报错
+        add(OK, "写回落点", f"{root}/timeline 可写（memory_append 按窗口号+日期"
+            f"往这里加文件；人格文件的「按需读取指针」要盖住这个目录）")
     else:
         add(FAIL, "写回落点", f"{root} 不可写——模型会说“记下了”，但每一次写回都失败。")
 
@@ -1050,6 +1095,22 @@ def _selftest():
         assert "Traceback" not in out, f"不许崩，要出话：{out}"
         assert "一块内容都切不出来" in out and "✗" in out, f"要显著地说“一块都没有”：{out}"
 
+        #    切块成色：正常语料不许报警，"每句一个 `##`"的导出必须报警。
+        #    两个方向都断——只断报警那一半的话，"永远报警"的变异测不出来
+        assert "中位块长" in out2 and "⚠ 切块" not in out2, \
+            f"正常语料要报中位块长、且不该报切块警告：{out2}"
+        每句一块 = _P(td) / "每句一块"
+        每句一块.mkdir()
+        (每句一块 / "chat_2026-06-21.md").write_text(
+            "\n\n".join(["## 好的，我看一下", "## 这个改完了吗", "## 嗯",
+                         "## 明天上午十点开会", "## 收到"]), encoding="utf-8")
+        code, out3 = run_doctor(td, "--corpus", "每句一块")
+        assert "⚠ 切块" in out3 and "只有一行标题" in out3, \
+            f"每句话一个 `##` 的导出要被体检拦下来吭一声：{out3}"
+        assert "`##`" in out3, f"要告诉人去看哪儿（语料里的 `##`）：{out3}"
+        #    变异：去掉 _chunk_body 的首行判断（整块都当正文）/ 把阈值放到 1.0
+        #    / 只报块数不报块长 → 各自红
+
         #    缺 --corpus：argparse 拦下，同样是真进程才盖得到的一格
         code, out = run_doctor(td)
         assert code != 0 and "--corpus" in out, f"缺 --corpus 要被拦下：{code} {out}"
@@ -1057,7 +1118,8 @@ def _selftest():
     print("selftest ok（17项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层 / "
           "完整链路 / stdio / UTF-8 / 写回当场可查 / 用进撑过重启 / "
           "无可靠命中明确说 / 撤回更正闭环 / 缺失率标注接线 / 实体标注接线 / "
-          "部署体检只读 / 部署体检走真进程（相对路径解析开、空语料非零退出））")
+          "部署体检只读 / 部署体检走真进程（相对路径解析开、空语料非零退出、"
+          "每句一个 `##` 的导出要报切块警告））")
 
 
 if __name__ == "__main__":

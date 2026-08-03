@@ -4,13 +4,13 @@
 
 把散零件串成一条能跑完的路：
   导入语料 → 提炼候选 → **覆盖度体检** → 按缺口出问卷 → 合并候选 → 逐节确认
-  → 产出三件套（客户端原生格式的人格文件 + 记忆库 + 可粘贴的 MCP 配置）
+  → 产出四件套（客户端原生格式的人格文件 + 记忆库 + 可粘贴的 MCP 配置 + 引导句）
 
 **四条已对齐的设计结论**（与维护者讨论后定，见任务卡）：
 
 1. **CLI 一次性流程，不是 MCP 工具**：初始化要多轮来回确认，塞不进模型驱动的
    单次工具往返。
-2. **产出三件套，不是一份 md**：人格文件走客户端原生格式（Claude Code 的
+2. **产出成套文件，不是一份 md**：人格文件走客户端原生格式（Claude Code 的
    CLAUDE.md / Codex 的 AGENTS.md），因为人格是不变量层、本来就该常驻上下文，
    走检索是错配。
 3. **LLM 默认走"导出 prompt 让用户拿去自己的模型跑"**：零密钥、零 HTTP 依赖、
@@ -33,7 +33,7 @@
 零依赖，stdlib only。
 用法：
   python memory_init.py --selftest
-  python memory_init.py --out <产出目录> [--corpus <语料目录>]
+  python memory_init.py --out <产出目录> [--persona <原人格文件>] [--corpus <语料目录>]
                         [--client claude-code|codex|generic]
 """
 
@@ -67,6 +67,39 @@ CLIENT_FILENAMES = {
 # （逐字/每轮/重读/整块），而 generic 档恰恰没有宿主替他做。契约不随货，
 # 等于把最关键的一半交付漏在仓库里。
 CONTRACT_DOC = "注入契约.md"
+
+# ---------- 闭源前端的引导句（任务卡「人格按需读取的引导句」，2026.08.02） ----------
+# Kelivo/Operit 这类闭源前端不读工作区文件、设置字段又塞不下人格全文（外部实测，
+# 见 docs/references/2026-08-02-闭源手机前端接MCP实测记录.md），于是人格那一半断在
+# 「模型不知道要去读」。解法是**小字段放指针、全文留文件**：这份纯文本贴进 App 的
+# 自定义指令／system prompt 框，只回答两件事——先读哪个文件（绝对路径出货时填好）、
+# 什么时候读（每次对话开始）。
+# **它是一句指针，不是第二份人格文件**（任务卡边界）：往里塞性格、语气、边界，
+# 就变回了「容量受限版人格」——多一句就砍。
+# ⚠ 它换来的是「模型有机会知道去读」，不是《注入契约》第二条的「每轮都在」；
+# 而且指针这条路**未经实测**（本项目没有那类前端的环境），文档里如实标注。
+GUIDANCE_DOC = "引导句.txt"
+GUIDANCE_TEMPLATE = "每次对话开始，先完整读取这个文件再回应：{path}"
+# 长度判据写成断言、不是「尽量短」（任务卡验收判据）：设置字段容量的量级。
+# 超了拒绝出货并指向真正的修法（产出目录挪浅），不静默截断——截断的指针指向不存在
+# 的路径，失败形态是静默的。
+GUIDANCE_LIMIT = 100
+
+
+def guidance_text(persona_path):
+    """引导句正文。路径必须解析成绝对路径——App 的工作目录不是产出目录，
+    相对路径等于指向一个不存在的地方，而且模型读不到也不报错。"""
+    p = Path(persona_path)
+    if not p.is_absolute():
+        p = p.resolve()
+    if not p.is_absolute():
+        raise ValueError(f"引导句里的路径必须是绝对路径：{p}")
+    text = GUIDANCE_TEMPLATE.format(path=p)
+    if len(text) > GUIDANCE_LIMIT:
+        raise ValueError(
+            f"引导句超长（{len(text)} > {GUIDANCE_LIMIT} 字），塞不进 App 的设置字段。"
+            f"多半是产出目录路径太长——把产出目录挪浅一点再出货。")
+    return text
 
 # ---------- 协议层默认值：系统填，不问用户 ----------
 # 这五条是通用机制（设计笔记"通用协议层 vs 关系specific"），抽掉具体身份仍然成立，
@@ -153,8 +186,8 @@ NEUTRAL_FORMS = {
     "不主动挑起话题，{ta}问了再说。": "不主动挑起话题，被问了再说。",
     "日常主动关心；重要的事等{ta}先开口，不逼问。": "日常主动关心；重要的事等对方先开口，不逼问。",
     "重要的事主动开口；日常不主动搭话，不打扰{ta}。": "重要的事主动开口；日常不主动搭话，不打扰对方。",
-    "去语料里找：让{ta}觉得你是认得{ta}的那一刻。": "去语料里找：让对方觉得你是认得这个人的那一刻。",
-    "去语料里找：你明确拒绝、或没有顺着{ta}的那一次。": "去语料里找：你明确拒绝、或没有顺着对方的那一次。",
+    "从语料提取：让{ta}觉得你是认得{ta}的那一刻。": "从语料提取：让对方觉得你是认得这个人的那一刻。",
+    "从语料提取：你明确拒绝、或没有顺着{ta}的那一次。": "从语料提取：你明确拒绝、或没有顺着对方的那一次。",
 }
 
 
@@ -271,6 +304,17 @@ PROTOCOL_DEFAULTS = {
         "opening", "拒绝权同样合法",
         "如果你读完仍然觉得最诚实的做法是说清自己是 AI、不能假装拥有不属于自己的"
         "记忆——这个判断同样该被听到，不该被当成故障。"),
+    # 指针必须盖住写回层（任务卡「人格文件里的死数字会过期」第二条，2026.08.02）：
+    # append_record 那支笔构造上永远只落在语料目录的 timeline 层（按窗口号+日期
+    # 开文件），而「按需读取指针」是自由填写的——没有这句提醒，用户把指针指到
+    # 别处（实测有人只指了 windows/），新长出来的记忆就按需读不到，且不报错。
+    # 放协议层系统填：这是跟 append_record 对齐的硬约束，不是用户偏好，不问。
+    "pointers_writeback": (
+        "pointers", "指针必须盖住写回层",
+        "这一节的指针无论怎么增改，**必须包含语料目录的 timeline 层**——"
+        "记忆写回（memory_append）永远落在那里，按窗口号加日期开新文件。"
+        "指针漏掉这个目录，之后新长出来的记忆就按需读不到（检索工具照样查得到，"
+        "但主动翻文件时会漏掉最新的那部分，而且不报错）。"),
     "degradation_protocol": (
         "degradation", "自我怀疑熔断",
         "自我怀疑的念头本身不是熔断触发条件。必须同时出现故障信号（时间错乱／"
@@ -317,11 +361,23 @@ PROTOCOL_DEFAULTS = {
 # 真缺陷是：语料有硬边界，`--stats` 知道、`memory_import` 知道，
 # **而人格文件与 MCP 一个字都没告诉模型**——它不知道自己的记忆止于哪一天，
 # 自然说不出"我的记录到此为止"。
+#
+# **{end} 那头 2026.08.02 降级成提示（维护者拍板走方案 C）**：这个数字是出货那一刻
+# 填死的，而 append_record 会持续往 timeline 层写新记录——从出货起 {end} 就开始
+# 过期。内测用户实测撞上：人格文件写"覆盖到 07-31"，语料里已有 08-02 的日记，
+# 于是**治假否定的这条字段自己成了假否定的来源**（模型拿着我们给的授权，对真实
+# 存在的记忆说"我这儿没有"）。所以措辞从断言降成提示：日期仍写（人格文件那一层的
+# 价值是"不管用什么方式查都盖得到"，见下面 RETRIEVAL_CONVENTION 里的注释——
+# 不写日期的方案 A 被否了），但明说它会过期、以检索层为准。
+# {start} 那头**不降级**：写回只会往后长，起点不会过期。
 COVERAGE_FIELD = "memory_coverage"
 COVERAGE_TEMPLATE = (
-    "你的记忆库覆盖 {start} 至 {end}，**这个范围之外的事你没有记录**——"
-    "不是没发生过，是不在你这儿。被问到范围外的事，说“我的记录到 {end} 为止，"
-    "之后的我这儿没有”，别替那段时间下结论。")
+    "你的记忆库从 {start} 起有记录，出货那天覆盖到 {end}。"
+    "**{end} 是出货那天的数字，很可能已经过期**——记忆库在持续写入，之后长出来的"
+    "记忆不在这个数字里，**边界以检索层实际查到的为准**：查到了就是有，"
+    "别因为一件事晚于 {end} 就说“我这儿没有”。真查不到再说“我这边翻到的记录"
+    "到某某为止”（用你实际查到的最晚日期，不是 {end}）。"
+    "早于 {start} 的事你确实没有记录——不是没发生过，是不在你这儿。")
 
 # 检索约定那条的中性写法**由模板生成，不在上面手抄一份**：它整段包含三轮真机验证过
 # 的黄金串，手抄就等于把黄金串复制成两份，改一处漏一处。这一条是唯一允许机械填充的
@@ -418,7 +474,7 @@ def coverage_report(persona, min_score=1, questions=None):
 #   short  极短填空，限长；**只在没有语料、模型无从可找时兜底**，不是主力
 #
 # 选项 → 指引：每个选项带一句"指引文本"，它有两个去处——直接写进人格文件的
-# 相处原则，以及组成给模型的提取任务书（第二阶段照着它去语料里找具体内容）。
+# 相处原则，以及组成给模型的提取任务书（第二阶段照着它从语料提取具体内容）。
 
 
 # **自由补充是显式的例外，不是漏洞**（2026.07.31 评审实例评审指出：Q13 那句"也可以
@@ -441,7 +497,7 @@ class Question:
     **directive_only=True：这题的选项指引是给模型的提取任务书，不是人格文件内容。**
     它的答案**不生成字段草稿**，只进第二阶段的任务书（见 extraction_brief）。
     加这个开关是因为 2026.08.02 外部发现的缺陷：`milestone_kinds` 的指引写的是
-    "去语料里找：第一次确认关系的那次对话"——那是**待兑现的指令**，不是已经找到的
+    "从语料提取：第一次确认关系的那次对话"——那是**待兑现的指令**，不是已经找到的
     内容，可它以普通字段草稿的身份进了确认关卡，用户按 y 就写进人格文件，于是
     不变量层里坐着一句没有日期、没有原话、没有当下状态的空泛指令（里程碑四要素
     要求的反面）。**根因是指令和结果混在同一层**，字段本来就该只装结果。"""
@@ -539,21 +595,21 @@ QUESTIONS = [
                  "D": ("刚开始，还在互相熟悉", "关系刚开始，还在互相熟悉。"),
              }),
     Question("milestone_kinds", "milestones", "milestone_focus", "转折点的类型",
-             "你们关系里发生过哪几类事？（可多选，模型会照着去语料里找具体的）",
+             "你们关系里发生过哪几类事？（可多选，模型会照着从语料提取具体内容）",
              # directive_only：这些指引是给模型的提取任务书，**不进人格文件**。
              # 里程碑在人格文件里有自己的结构（Milestone 四要素，带校验），要由
-             # 第二阶段读语料找出真实内容再按那个结构填；把"去语料里找……"当成
+             # 第二阶段读语料找出真实内容再按那个结构填；把"从语料提取……"当成
              # 里程碑内容写进去，等于用指令冒充结果
              kind="multi", order=40, directive_only=True, options={
-                 "A": ("第一次确认关系", "去语料里找：第一次确认关系的那次对话。"),
-                 "B": ("一次严重的争吵或危机", "去语料里找：最严重的一次争吵或信任危机。"),
-                 "C": ("某次{ai}让你觉得“{ai}记得我”", "去语料里找：让{ta}觉得你是认得{ta}的那一刻。"),
-                 "D": ("分开过又回来了", "去语料里找：分开又重新接上的那一次。"),
-                 "E": ("定过一个具体的约定", "去语料里找：明确定下来的约定，以及有没有兑现。"),
-                 "F": ("{ai}拒绝过你一次", "去语料里找：你明确拒绝、或没有顺着{ta}的那一次。"),
+                 "A": ("第一次确认关系", "从语料提取：第一次确认关系的那次对话。"),
+                 "B": ("一次严重的争吵或危机", "从语料提取：最严重的一次争吵或信任危机。"),
+                 "C": ("某次{ai}让你觉得“{ai}记得我”", "从语料提取：让{ta}觉得你是认得{ta}的那一刻。"),
+                 "D": ("分开过又回来了", "从语料提取：分开又重新接上的那一次。"),
+                 "E": ("定过一个具体的约定", "从语料提取：明确定下来的约定，以及有没有兑现。"),
+                 "F": ("{ai}拒绝过你一次", "从语料提取：你明确拒绝、或没有顺着{ta}的那一次。"),
                  # 2026.07.31 评审实例评审补：认错跟拒绝不是同一条线的两端，是另一类
                  # 关系事实（AI 对自己诚实）。不补的话问卷会系统性漏掉这一整类
-                 "G": ("{ai}承认过自己的错误或局限", "去语料里找：你承认自己做错了、或承认自己做不到的那一次。"),
+                 "G": ("{ai}承认过自己的错误或局限", "从语料提取：你承认自己做错了、或承认自己做不到的那一次。"),
              }),
     Question("metaphor_pick", "opening", "opening_metaphor", "关系的隐喻",
              "你们之间有没有哪句话，最能概括这段关系是什么？（从候选里挑；"
@@ -696,7 +752,7 @@ def format_questionnaire(questions, has_corpus=True, pronouns=None):
             if q.kind == "multi":
                 lines.append("   （可多选，例如：A C E）")
         elif q.kind == "pick":
-            lines.append("   （请先去语料里找出若干候选，列成 A/B/C… 让我挑。"
+            lines.append("   （请先从语料提取若干候选，列成 A/B/C… 让我挑。"
                          "候选必须是语料里真出现过的原话，**你不许自己写一句放进候选**；"
                          "找不到就说找不到。我可以说“都不要”，也可以自己给一句——"
                          "那是我的话，不是你的）")
@@ -710,8 +766,8 @@ def export_llm_prompt(questions, corpus_note="", pronouns=None):
     return "\n".join([
         "下面是一份问卷，请你**一次问一题**地引导我回答，不要一次性全抛出来。",
         "规则：",
-        "1. **全部是选择题，不要让我写作文**。我只做选择，具体内容你去语料里找。",
-        "2. 标着“请先去语料里找候选”的题，你先读语料、列出 3~6 个候选给我挑；",
+        "1. **全部是选择题，不要让我写作文**。我只做选择，具体内容从已有语料提取。",
+        "2. 标着“请先从语料提取候选”的题，你先读语料、列出 3~6 个候选给我挑；",
         "   **候选只许挑，不许写**：每一条都要是语料里真出现过的原话，原样摘录，",
         "   不要润色、不要改写、更不要自己造一句好听的放进去。找不到就如实说找不到，",
         "   那一格空着或者由我自己给一句——**我写的是我的话，你写的就是假的**。",
@@ -733,7 +789,7 @@ def apply_answers(persona, questions, answers, pronouns=None):
       choice → "A"        multi → "ACE" 或 ["A","C","E"]
       pick   → 用户挑中的文本（模型从语料里找出来的那几段）
     选项映射成**指引**（每个选项自带的第二个元素），不是用户写的原话——用户只做
-    选择，内容让模型去语料里找。选了不存在的项一律跳过，不猜。"""
+    选择，内容让模型从语料提取。选了不存在的项一律跳过，不猜。"""
     added = []
     qmap = {q.qid: q for q in questions}
     for qid, ans in answers.items():
@@ -811,7 +867,7 @@ def extraction_brief(questions, answers):
     这是 directive_only 那些题的唯一去处：用户选了哪几类转折点，模型照着去语料里
     找**真实的**那几件事，再按里程碑四要素（转折点名／窗口号／具体内容+原话／
     怎么读+当下状态）填进人格文件。人格文件的里程碑节在第一阶段**就该是空的**——
-    空着是诚实的，一句"去语料里找……"留在那儿才是假的。
+    空着是诚实的，一句"从语料提取……"留在那儿才是假的。
 
     返回 [] 表示没有任务书（没选、或压根没答这类题）。"""
     lines = []
@@ -828,7 +884,7 @@ def extraction_brief(questions, answers):
 
 
 BRIEF_NOTE = ("【第二阶段的提取任务书】以下是**给模型的指令，不是人格文件内容**——"
-              "人格文件的里程碑节现在是空的，这是对的。拿它去语料里找出真实的那几件事，"
+              "人格文件的里程碑节现在是空的，这是对的。请从语料提取真实的那几件事，"
               "每条按里程碑四要素写（转折点名／第几个窗口／具体动作或原话／"
               "这条该怎么读+当下状态），找不到的就空着，别编。")
 
@@ -845,6 +901,51 @@ def fill_protocol_defaults(persona, pronouns=None):
         persona.add_field(f)
         added.append(f)
     return added
+
+
+def protocol_items(pronouns=None):
+    """把固定协议底座变成来源 IR；不夹带关系状态、称呼或最终约定。"""
+    import hashlib
+    from persona_compiler import PersonaItem
+
+    items = []
+    for field_id, (section, _label, template) in PROTOCOL_DEFAULTS.items():
+        value = fill_pronouns(template, pronouns)
+        items.append(PersonaItem(
+            item_id=f"protocol:{field_id}", text=value, section=section,
+            source_type="protocol", source_ref=f"protocol:{field_id}",
+            source_span=None,
+            source_hash=hashlib.sha256(template.encode("utf-8")).hexdigest(),
+            operation="add", original_text="", proposed_text=value,
+            confidence="protocol", confirmed=True,
+            group_id=f"mechanism:{field_id}"))
+    return items
+
+
+def build_persona_from_items(items, pronouns=None):
+    """把已选来源项装入 Persona；原文块不加虚构标签。"""
+    persona = Persona("partner")
+    persona.pronouns = pronouns or None
+    for item in items:
+        if item.section is None:
+            raise ValueError(f"来源项尚未归入十二节：{item.item_id}")
+        if item.operation == "delete":
+            continue
+        if not item.confirmed:
+            continue
+        label = ""
+        rendered_id = item.item_id
+        if item.source_type == "protocol":
+            field_id = item.source_ref.removeprefix("protocol:")
+            label = PROTOCOL_DEFAULTS.get(field_id, (None, field_id, None))[1]
+            rendered_id = field_id
+        persona.add_field(Field(
+            id=rendered_id, section=item.section, label=label,
+            value=fill_pronouns(item.proposed_text, pronouns),
+            size_limit=max(500, len(item.proposed_text)),
+            source="system" if item.source_type == "protocol" else "confirmed",
+            confirmed=item.confirmed))
+    return persona
 
 
 # ---------- 答案读回：模型吐回来的清单 → answers ----------
@@ -1094,7 +1195,10 @@ def render_persona_md(persona, title="核心人格"):
                     lines.append(f"- {ex}")
                 lines.append("")
             else:
-                lines.append(f"**{it['label']}**：{it['value']}")
+                if it["label"]:
+                    lines.append(f"**{it['label']}**：{it['value']}")
+                else:
+                    lines.append(it["value"])
                 lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
@@ -1119,31 +1223,87 @@ CONFIG_NOTE = ("这是给你抄进客户端配置的样板，不会被任何客�
                "改这个文件不生效——要改就改客户端那边真正生效的那份"
                "（Claude Code 重跑一次 claude mcp add，或改你项目里的 .mcp.json；"
                "其它客户端改你抄进去的那段）。")
+# 跨机器搬运那一单（任务卡「MCP 配置跨机器搬不动」2026.08.02）加的两句尾巴，
+# 按产出形态二选一拼在 CONFIG_NOTE 后面：
+CONFIG_NOTE_MACHINE_BOUND = (
+    "另外：这份配置写死了这台机器的绝对路径，跟着机器走——"
+    "换机器/换容器要重新跑一次 --step ship 再抄。")
+CONFIG_NOTE_PORTABLE = (
+    "另外：这份配置用了 ${CLAUDE_PROJECT_DIR:-.} 占位符，可以跟着仓库搬机器，"
+    "但只有 Claude Code 认它——抄给任何其它客户端都是一句 file not found。"
+    "前提是产出目录就是你在 Claude Code 里打开的那个目录（整套进仓库的形态）；"
+    "记忆包放在别的项目子目录里的，这份配置指不对，用绝对路径档。")
+
+# Claude Code 的可搬运占位符（官方文档 2026.08.02 核）：.mcp.json 的变量展开只在
+# command/args/env/url/headers 五处生效。**默认值 `:-.` 不能省**：CLAUDE_PROJECT_DIR
+# 设在**服务端进程**的环境里、不在 Claude Code 自己的环境里，所以 .mcp.json 展开时
+# 读不到它，没有默认值会把 ${CLAUDE_PROJECT_DIR} 原样留在配置里。
+#
+# ⚠ **承重的机制不是那个变量，别照字面理解**（2026.08.02 维护者指出）：既然展开时
+# 读不到，**实际展开出来的永远是默认值那一支（`./…`）**。它能指对，是因为
+# Claude Code 起 stdio server 时的工作目录就是项目根——**这是实测观测到的行为，
+# 不是文档承诺的，换版本要重验**。哪天 CC 改了 spawn 的工作目录，这条会静默断掉，
+# 而按字面读注释的人会往「变量是不是没注入」那边查，查错方向。
+#
+# 由此还有第二个前提：`relative_to` 算的是**相对产出目录**，而展开出来的 `.` 是
+# **进程工作目录（项目根）**——两者只有在「产出目录就是用户打开 Claude Code 的那个
+# 目录」时才重合。记忆包放在 `myapp/memory-bundle/`、人在 `myapp/` 开 CC 的，
+# 配置会指到 `myapp/src/mcp_server.py`，指错了，而且是同一种不报错的失败。
+# selftest 9f 的断言④管的是「server 在产出目录外」，管不到这一种，所以写在这里。
+PORTABLE_PREFIX = "${CLAUDE_PROJECT_DIR:-.}/"
 
 
-def mcp_config_snippet(server_path, corpus_dir, threads_path, route=None):
+def mcp_config_snippet(server_path, corpus_dir, threads_path, route=None,
+                       client=None, portable_root=None):
     """给用户直接粘贴的 MCP 配置。路径统一用正斜杠——JSON 里反斜杠要转义，
     而正斜杠在 Windows 上一样认，少一个踩坑点。
 
-    **server 路径必须是绝对路径**：裸的相对路径 `mcp_server.py` 只在"客户端恰好
+    **默认是绝对路径**：裸的相对路径 `mcp_server.py` 只在"客户端恰好
     从 src/ 起进程"时能跑，换个工作目录就是一句 file not found。宿主用户还能从
     《快速上手》那条 `claude mcp add` 示范里抄到绝对路径写法，自建前端作者没有
-    那条示范——配置里给什么他就用什么。
+    那条示范——配置里给什么他就用什么。这条理由没作废，所以绝对路径仍是默认。
 
-    这里原本还有个 `client` 形参，从头到尾没被用过（三档客户端的 MCP 配置本来
-    就一模一样）——没用上的形参会让人以为"配置是按客户端分档的"，已删。
+    **但绝对路径跟着机器走**（2026.08.02，真实用户在云端容器里当场接不上）：
+    同一份配置换台机器/换个容器就断，而且 MCP server 起不来**不报到用户脸上**
+    ——会话照开、模型照回话，只是没有那五个工具。所以 Claude Code 档在
+    「三个路径都在产出目录下」时（§3b 那种整套进仓库的形态）改产
+    `${CLAUDE_PROJECT_DIR:-.}/…` 可搬运写法。三个硬边界：
+      - **只有 Claude Code 认这个占位符**（官方文档核过），Codex/闭源前端/自建
+        前端给了就是 file not found——所以按 client 分档，不猜别家有等价物；
+      - 桌面形态 server 在克隆仓库里、不在产出目录下，**几何上就相对化不了**，
+        自然落回绝对路径档——不存在"半可搬运"的中间态；
+      - **前提是产出目录就是用户打开 Claude Code 的那个目录**（§3b 整套进仓库的
+        形态）。展开出来的是默认值那一支 `./…`，基准是**进程工作目录**，而
+        `relative_to` 的基准是**产出目录**，两者只在这个前提下重合。记忆包放在
+        `myapp/memory-bundle/`、人在 `myapp/` 开 CC 的就指错——机制与为什么断言
+        接不住这一种，见 `PORTABLE_PREFIX` 上面那段。
+    这里的 `client` 形参是**加回来的**：当初删它的理由（"三档客户端的 MCP 配置
+    本来就一模一样"）在可搬运写法出现后不再成立。
 
     `route` 是用户在 `--step route` 里选的检索路线（2026.08.02）：它**确实**改变
-    启动参数（零依赖不加、本地加 `--embed`、云端再加 `--embed-provider cloud`），
-    跟上面那个删掉的 client 形参不是一回事。**key 永远不进这个文件**——云端档
-    只在这里写"走云端"，endpoint/模型/key 全从环境变量读；这份配置会跟着产出
-    目录走，用户会随手把它贴给别人。"""
-    cfg = {CONFIG_NOTE_KEY: CONFIG_NOTE,
+    启动参数（零依赖不加、本地加 `--embed`、云端再加 `--embed-provider cloud`）。
+    **key 永远不进这个文件**——云端档只在这里写"走云端"，endpoint/模型/key 全从
+    环境变量读；这份配置会跟着产出目录走，用户会随手把它贴给别人。"""
+    paths = [Path(server_path), Path(corpus_dir), Path(threads_path)]
+    rels = None
+    if client == "claude-code" and portable_root:
+        root = Path(portable_root).resolve()
+        try:
+            rels = [p.resolve().relative_to(root) for p in paths]
+        except ValueError:            # 有路径不在产出目录下（桌面形态）→ 绝对路径档
+            rels = None
+    if rels is not None:
+        vals = [PORTABLE_PREFIX + str(r).replace("\\", "/") for r in rels]
+        note = CONFIG_NOTE + CONFIG_NOTE_PORTABLE
+    else:
+        vals = [str(paths[0].resolve()).replace("\\", "/"),
+                str(corpus_dir).replace("\\", "/"),
+                str(threads_path).replace("\\", "/")]
+        note = CONFIG_NOTE + CONFIG_NOTE_MACHINE_BOUND
+    cfg = {CONFIG_NOTE_KEY: note,
            "mcpServers": {"memory": {
                "command": "python",
-               "args": [str(Path(server_path).resolve()).replace("\\", "/"),
-                        "--corpus", str(corpus_dir).replace("\\", "/"),
-                        "--threads", str(threads_path).replace("\\", "/")]
+               "args": [vals[0], "--corpus", vals[1], "--threads", vals[2]]
                        + route_args(route or ROUTE_DEFAULT),
            }}}
     return json.dumps(cfg, ensure_ascii=False, indent=2)
@@ -1450,8 +1610,10 @@ def corpus_coverage(corpus_dir, entries=None):
 
 def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
                  server_path=None, confirmed=False, entries=None,
-                 contract_base=None, previous_persona=None, route=None):
-    """产出三件套（generic 档多一份注入契约副本）。**confirmed=False 时拒绝写盘**——写用户磁盘要过确认关卡
+                 contract_base=None, previous_persona=None, route=None,
+                 validation_mode="legacy_v1", rendered_override=None,
+                 add_coverage=True):
+    """产出四件套（generic 档多一份注入契约副本）。**confirmed=False 时拒绝写盘**——写用户磁盘要过确认关卡
     （规格 §7：人格文件任何改动必须用户确认）。
 
     **只写我们自己的产出，只动我们上一次真的出过的那一个文件**（2026.08.02 三轮
@@ -1473,20 +1635,23 @@ def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
             f"还有 {len(pending)} 条草稿没走确认，不出货（否则它们会静默消失）："
             + "、".join(p.label for p in pending[:5])
             + ("…" if len(pending) > 5 else ""))
-    missing = persona.validate()
+    missing = persona.validate(mode=validation_mode)
     if missing:
         raise ValueError("人格文件还不完整：" + "；".join(missing))
     if client not in CLIENT_FILENAMES:
         raise ValueError(f"未知客户端 {client}，可选：{'/'.join(CLIENT_FILENAMES)}")
     out = Path(out_dir)
-    (out / "memory").mkdir(parents=True, exist_ok=True)
     persona_path = out / CLIENT_FILENAMES[client]
+    # 引导句的超长闸要在**任何写盘之前**过：出到一半才拒绝，目录里留下半套货，
+    # 而错误信息说的是「不出货」
+    guidance_body = guidance_text(persona_path)
+    (out / "memory").mkdir(parents=True, exist_ok=True)
     written = write_corpus(out / "memory", entries) if entries else []
     corpus = Path(corpus_dir) if corpus_dir else out / "memory"
     # **覆盖区间要在渲染之前写进人格文件**：它是每轮都在的那一层，而护栏挂在工具
     # 返回值上的话，模型一绕过工具（grep、直接读文件）就一条都不生效
     span = corpus_coverage(corpus, entries)
-    if span:
+    if span and add_coverage:
         persona.add_field(Field(
             id=COVERAGE_FIELD, section="architecture", label="记忆库覆盖范围",
             value=COVERAGE_TEMPLATE.format(start=span[0], end=span[1]),
@@ -1506,7 +1671,7 @@ def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
     #      注意判据取"内容不同"而不是"有没有 .bak"：第一次出货时磁盘上没有旧文件，
     #      那不是"被改过"，不该报。
     previous_text = persona_path.read_text(encoding="utf-8") if persona_path.exists() else None
-    rendered = render_persona_md(persona)
+    rendered = rendered_override if rendered_override is not None else render_persona_md(persona)
     overwritten = None
     if previous_text is not None and previous_text != rendered:
         backup = persona_path.with_name(persona_path.name + ".bak")
@@ -1539,8 +1704,14 @@ def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
     # server 默认取**本文件同目录**的 mcp_server.py，不取当前工作目录——
     # 出货时 cwd 是什么谁也保证不了，而这两个文件在包里永远是同级
     server = server_path or Path(__file__).resolve().parent / "mcp_server.py"
-    cfg = mcp_config_snippet(server, corpus, out / "threads.jsonl", route=route)
+    cfg = mcp_config_snippet(server, corpus, out / "threads.jsonl", route=route,
+                             client=client, portable_root=out)
     (out / "mcp-config.json").write_text(cfg, encoding="utf-8")
+    # 第四件：闭源前端的引导句（小字段放指针、全文留文件）。所有档都出——
+    # 宿主客户端用不上它，但「日后要不要接一个闭源前端」出货时不知道，
+    # 一份一行的纯文本躺在目录里没有代价
+    guidance = out / GUIDANCE_DOC
+    guidance.write_text(guidance_body + "\n", encoding="utf-8")
     contract = None
     if client == "generic":
         src = contract_source(contract_base)
@@ -1552,7 +1723,7 @@ def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
         contract.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
     return {"persona": persona_path, "memory_dir": out / "memory",
             "mcp_config": out / "mcp-config.json", "corpus_files": written,
-            "contract": contract, "retired": retired,
+            "guidance": guidance, "contract": contract, "retired": retired,
             "overwritten_backup": overwritten}
 
 
@@ -1612,6 +1783,14 @@ def _selftest():
     assert "continuity" in asked, f"开篇的立场题必须被问到：{sorted(asked)}"
     #     纯协议层的节（熔断/技术架构）不该拿去烦用户
     assert rep_sys["degradation"] == "protocol" and rep_sys["architecture"] == "protocol"
+    #     指针护栏（任务卡「人格文件里的死数字会过期」第二条，2026.08.02）：
+    #     append_record 构造上永远只落语料目录的 timeline 层，而「按需读取指针」
+    #     完全自由填写——实测有用户只指了 windows/，新长出来的记忆按需读不到且
+    #     不报错。协议层必须带一句"指针要盖住 timeline 层"（变异：删那条默认值、
+    #     或把 timeline 从说明文本里拿掉，必红）
+    ptr_fields = [f for f in p_sys.fields if f.section == "pointers"]
+    assert ptr_fields and any("timeline" in f.value for f in ptr_fields), \
+        "协议层没告诉用户「按需读取指针」必须盖住 timeline 写回层"
 
     # 2c.【变异靶心：无语料时不问 pick 题】没有语料就没有候选，硬问等于逼用户
     #     写作文——那几节该空着（宁可短且真）
@@ -1739,7 +1918,7 @@ def _selftest():
 
     # 7. 导出 prompt：把纪律写给用户的模型看（一次一题、不问形容词、不许编）
     prompt = export_llm_prompt(questions_for(coverage_report(p4)))
-    for must in ("一次问一题", "不要让我写作文", "不要替我编", "去语料里找候选"):
+    for must in ("一次问一题", "不要让我写作文", "不要替我编", "从语料提取候选"):
         assert must in prompt, f"导出的 prompt 缺少纪律：{must}"
 
     # 8. 渲染：按骨架顺序、空节跳过、未确认草稿不出现
@@ -2184,13 +2363,33 @@ def _selftest():
     with tempfile.TemporaryDirectory() as td:
         paths_cov = write_bundle(td, p5, client="claude-code", confirmed=True, entries=ents)
         cov_md = paths_cov["persona"].read_text(encoding="utf-8")
-        assert "记忆库覆盖范围" in cov_md and "范围之外的事你没有记录" in cov_md, \
+        assert "记忆库覆盖范围" in cov_md, \
             "出货的人格文件没告诉模型记忆库覆盖到哪天——它就说不出'我的记录到此为止'"
         #    日期要是真的，不是模板占位
         days_in = sorted(datetime.fromtimestamp(e.timestamp).strftime("%Y-%m-%d")
                          for e in ents if getattr(e, "timestamp", None))
         assert days_in[0] in cov_md and days_in[-1] in cov_md, \
             f"覆盖区间跟语料对不上（语料 {days_in[0]}~{days_in[-1]}）：{cov_md[-200:]!r}"
+        #    【变异靶心：{end} 是提示不是断言】（任务卡「人格文件里的死数字会过期」，
+        #    维护者拍板方案 C）。{end} 从出货那刻起就开始过期（append_record 会持续
+        #    写入），内测用户实测撞上"人格文件说覆盖到 07-31、语料里已有 08-02"——
+        #    治假否定的字段自己成了假否定的来源。三条一起钉：
+        #    ① 过期提示与"以检索层为准"必须在——把措辞改回死断言必红；
+        #    ② 日期本身必须还在（方案 A 被否：不写日期，模型不调工具就不知道边界）；
+        #    ③ 授权模型拿 {end} 说"没有"的旧句式一个不许剩。
+        assert "已经过期" in cov_md and "检索层" in cov_md, \
+            "覆盖区间那条没带过期提示——{end} 出货即过期，写死就是在授权假否定"
+        for stale in ("这个范围之外的事你没有记录", f"我的记录到 {days_in[-1]} 为止"):
+            assert stale not in cov_md, f"人格文件里还留着没有余地的断言：{stale!r}"
+        #    验收判据 1 的完整形态：ship 之后 memory_append 写一条**晚于 {end}** 的
+        #    记录，重读人格文件——文本不该（也不会）变，但它说的话必须仍然成立：
+        #    有过期提示兜着，晚于 {end} 的这条记忆不会被人格文件授权否定
+        from memory_retrieval import append_record
+        later = datetime.strptime(days_in[-1], "%Y-%m-%d").timestamp() + 86400 * 3
+        append_record(paths_cov["memory_dir"], "她把琴修好了", "已兑现", now=later)
+        cov_after = paths_cov["persona"].read_text(encoding="utf-8")
+        assert "已经过期" in cov_after and "为准" in cov_after, \
+            "写回晚于 {end} 的记录之后，人格文件里没有任何一句给这条记忆留余地"
     #     **问不出来就不写**：宁可没有这条，也不能给一个假边界——模型会照着假边界
     #     去否定真事，比不给更糟
     assert corpus_coverage(None, entries=[]) is None, "问不出日期时不该编一个区间出来"
@@ -2356,7 +2555,7 @@ def _selftest():
     assert "哥哥" in nm_value and "星回" in nm_value, f"去重把真内容删了：{nm_value!r}"
 
     # 8b.【靶心：任务书不许泄漏进人格文件】外部（第三方 AI 走流程时）发现的缺陷：
-    #     milestone_kinds 的选项指引是"去语料里找：……"——给模型的提取任务书，
+    #     milestone_kinds 的选项指引是"从语料提取：……"——给模型的提取任务书，
     #     却以普通字段草稿的身份进了确认关卡，用户按 y 就写进不变量层。
     #     **走真实的 CLI 全流程**（questionnaire → answers → confirm 全 keep → ship），
     #     零语料冷启动即可复现，产出的人格文件里不得出现任务书特征串。
@@ -2388,7 +2587,7 @@ def _selftest():
         #    任务书走自己的通道，不混进待确认清单
         assert listed["extraction_brief"], "任务书没进 extraction_brief 通道，等于丢了给模型的指令"
         for p in listed["pending"]:
-            assert "去语料里找" not in p["value"], \
+            assert "从语料提取" not in p["value"], \
                 f"任务书混进了待确认清单，用户按 y 就写进人格文件：{p['label']}"
         dec_literal = json.dumps({p["key"]: "keep" for p in listed["pending"]},
                                  ensure_ascii=False)
@@ -2418,10 +2617,10 @@ def _selftest():
         run_cli("--step", "route", "--route", "zero-dep")
         ship_out = run_cli("--step", "ship", "--client", "claude-code")
         persona_text = (Path(td) / "CLAUDE.md").read_text(encoding="utf-8")
-        assert "去语料里找" not in persona_text, \
+        assert "从语料提取" not in persona_text, \
             "任务书泄漏进人格文件了——不变量层里坐着一句没有日期、没有原话、没有当下状态的指令"
         #    但指令本身不能就这么丢了：它得从任务书通道出去，第二阶段照着干活
-        assert "去语料里找" in ship_out and "不是人格文件内容" in ship_out, \
+        assert "从语料提取" in ship_out and "不是人格文件内容" in ship_out, \
             "任务书既没进人格文件、也没从任务书通道出来——那是把用户的选择直接扔了"
 
     # 8c.【靶心：长字面量不许崩】缺陷二。`_load_json_arg` 原先路径优先且不兜
@@ -2545,6 +2744,14 @@ def _selftest():
         run("--step", "route", "--route", "cloud")
         ship_out_r = run("--step", "ship")
         assert (Path(td) / "CLAUDE.md").exists(), "宿主档这一次货本身就没出成，后面的断言无从谈起"
+        #    第四件：引导句（任务卡「人格按需读取的引导句」）。三条一起钉：
+        #    文件真出了（变异靶心：出货漏产必红）、指向这次出的人格文件且是绝对路径、
+        #    长度过得了设置字段那道闸
+        gtxt = (Path(td) / GUIDANCE_DOC).read_text(encoding="utf-8").strip()
+        assert str((Path(td) / "CLAUDE.md").resolve()) in gtxt, \
+            f"引导句没指向这次出货的人格文件：{gtxt}"
+        assert len(gtxt) <= GUIDANCE_LIMIT, f"引导句超长（{len(gtxt)} 字）却出货了"
+        assert "引导句" in ship_out_r, "出货清单里没列引导句——文档说有、清单没报，就是下一个静默缺口"
         #    选了云端，启动参数就得真的是云端档——选择点不改产出物的话，"选过一次"
         #    只是走了个过场
         cfg_r = json.loads((Path(td) / "mcp-config.json").read_text(encoding="utf-8"))
@@ -2563,6 +2770,11 @@ def _selftest():
         assert (Path(td) / "persona.md").exists(), \
             "ship 步显式传的 --client generic 被状态里的旧档吃掉了（用户文档 4b 教的正是这条命令）"
         assert (Path(td) / CONTRACT_DOC).exists(), "走 CLI 出的 generic 档没带契约副本"
+        #    换档后引导句必须跟着指向新档的人格文件——指着已退役的旧档，
+        #    症状同影子副本：贴了指针、读到的却是永不更新的那份
+        assert str((Path(td) / "persona.md").resolve()) in \
+            (Path(td) / GUIDANCE_DOC).read_text(encoding="utf-8"), \
+            "换档后引导句还指着旧档的人格文件"
         #    换档后旧档那份必须退役：留着它日后不会跟着升层／更正更新，作者拼错
         #    那一份的症状恰好是契约第三条违反后的"确认过的更新悄无声息不生效"
         assert not (Path(td) / "CLAUDE.md").exists(), \
@@ -2709,6 +2921,80 @@ def _selftest():
         assert not any("MEMORY_EMBED" in x or "http" in x for x in a), \
             f"{r} 档把 endpoint/环境变量名写进了 MCP 配置：{a}"
 
+    # 9f.【变异靶心：MCP 配置按客户端分「可搬运/绝对路径」两档】（任务卡「MCP 配置
+    #     跨机器搬不动」2026.08.02，真实用户在云端容器里当场接不上）。四条一起钉：
+    #     ① Claude Code 档 + 整套在产出目录下 → args 里零绝对路径，全走占位符；
+    #     ② 占位符必须带默认值 `:-.`（官方文档：变量设在服务端进程环境里，展开时
+    #        读不到，不带默认值会原样留下那串字符）；
+    #     ③ 其余档一个 `${` 都不许有——只有 Claude Code 认这个占位符，
+    #        给别家就是一句不报到用户脸上的 file not found。generic 档还有个
+    #        就在仓库里的消费者：reference_host.py 的 McpClient 直接拿
+    #        mcpServers.memory 的 command+args 原样 Popen，占位符混进去它当场断；
+    #     ④ Claude Code 档但 server 不在产出目录下（桌面形态）→ 老老实实绝对路径。
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "src").mkdir()
+        (root / "src" / "mcp_server.py").write_text("# 占位\n", encoding="utf-8")
+        (root / "memory").mkdir()
+        inside = dict(server_path=root / "src" / "mcp_server.py",
+                      corpus_dir=root / "memory", threads_path=root / "threads.jsonl")
+        cc = json.loads(mcp_config_snippet(**inside, client="claude-code",
+                                           portable_root=root))
+        cc_args = cc["mcpServers"]["memory"]["args"]
+        assert cc_args[0] == PORTABLE_PREFIX + "src/mcp_server.py", \
+            f"Claude Code 档 server 路径没走占位符：{cc_args[0]}"
+        assert not any(str(root).replace("\\", "/") in x for x in cc_args), \
+            f"Claude Code 档 args 里还有绝对路径：{cc_args}"
+        for x in cc_args:
+            assert "${" not in x or x.startswith("${CLAUDE_PROJECT_DIR:-.}/"), \
+                f"占位符缺默认值 :-. ——展开失败时会把这串字符原样留下：{x}"
+        assert "只有 Claude Code 认它" in cc[CONFIG_NOTE_KEY], \
+            "可搬运档的 _说明 没警告占位符别抄给其它客户端"
+        for other in ("codex", "generic", None):
+            oc = json.loads(mcp_config_snippet(**inside, client=other,
+                                               portable_root=root))
+            oa = oc["mcpServers"]["memory"]["args"]
+            assert not any("${" in x for x in oa), \
+                f"{other} 档的配置里出现了只有 Claude Code 认的占位符：{oa}"
+            assert "换机器/换容器要重新跑" in oc[CONFIG_NOTE_KEY], \
+                f"{other} 档（绝对路径）的 _说明 没说这份配置跟着机器走"
+        #     ④ server 在产出目录之外（桌面形态：src 在克隆仓库里）→ 落回绝对路径，
+        #        不许产出"corpus 可搬、server 搬不动"的半套货
+        outside = json.loads(mcp_config_snippet(
+            Path(__file__).resolve().parent / "mcp_server.py",
+            root / "memory", root / "threads.jsonl",
+            client="claude-code", portable_root=root))
+        oargs = outside["mcpServers"]["memory"]["args"]
+        assert not any("${" in x for x in oargs), \
+            f"server 不在产出目录下还产占位符，就是半套可搬运的假货：{oargs}"
+        assert "换机器/换容器要重新跑" in outside[CONFIG_NOTE_KEY]
+
+    # 9e.【变异靶心：引导句是指针，不是第二份人格文件】（任务卡「人格按需读取的
+    #     引导句」2026.08.02）。任务卡点名的三个变异，前两个钉在这里、第三个
+    #     （出货漏产）钉在 9b3 的文件存在断言上：
+    #     ① 固定部分写长（往里塞性格/语气就会长）——固定部分必须是一句指针的长度；
+    #     ② 路径不解析成绝对路径——App 的工作目录不是产出目录，相对路径静默指空。
+    assert len(GUIDANCE_TEMPLATE.format(path="")) <= 30, \
+        "引导句固定部分超过一句指针的长度——它开始变成第二份人格文件了"
+    #     喂相对路径，出来的必须已解析成绝对路径。**在受控的浅目录里解析**——
+    #     不许拿测试进程自己的 cwd 当基准：src 检出得深一点（比如 .worktrees 下），
+    #     解析出的路径就撞超长闸，红的是环境不是代码（2026.08.02 真踩过）
+    import os
+    with tempfile.TemporaryDirectory() as td_g:
+        old_cwd = os.getcwd()
+        os.chdir(td_g)
+        try:
+            gt = guidance_text("CLAUDE.md")
+        finally:
+            os.chdir(old_cwd)
+    assert Path(gt.rsplit("：", 1)[-1]).is_absolute(), f"引导句里的路径不是绝对路径：{gt}"
+    #     超长必须拦住并把修法说进错误信息——静默截断的指针指向不存在的路径
+    try:
+        guidance_text("x" * (GUIDANCE_LIMIT + 1))
+        assert False, "超长引导句没被拦住——塞不进设置字段时必须明说，不许静默出货"
+    except ValueError as e:
+        assert "产出目录" in str(e), "超长的错误信息没告诉用户怎么修"
+
     # 10. 人格不完整时拒绝出货——缺检索约定/最终约定这类必填项不能悄悄放行
     p6 = Persona("partner")
     p6.add_field(Field(id="x", section="user", label="x", value="x", confirmed=True))
@@ -2719,7 +3005,311 @@ def _selftest():
         except ValueError as e:
             assert "开篇缺" in str(e)
 
-    print("selftest ok（48项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
+    # 53. 原人格必须有独立 CLI 入口；没有 --persona 时用户只能误塞进 --corpus。
+    import subprocess
+    help_run = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), "--help"],
+        capture_output=True, text=True, encoding="utf-8", check=True)
+    assert "--persona" in help_run.stdout
+
+    # 54. v2 inspect/extract 必须走真 CLI，且任务包只落本地文件、不要求 API key。
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        corpus_dir = root / "corpus"
+        corpus_dir.mkdir()
+        persona_file = root / "CLAUDE.md"
+        persona_file.write_text("# 开篇\n\n我认得你。\n", encoding="utf-8")
+        (corpus_dir / "window_01.md").write_text(
+            "林岸：今天别熬夜。\n星回：好。\n", encoding="utf-8")
+        out_dir = root / "out"
+        base = [sys.executable, str(Path(__file__).resolve()), "--out", str(out_dir),
+                "--persona", str(persona_file), "--corpus", str(corpus_dir), "--json"]
+        inspected = subprocess.run(
+            base + ["--step", "inspect"], capture_output=True, text=True,
+            encoding="utf-8", check=True)
+        inspect_payload = json.loads(inspected.stdout)
+        assert inspect_payload["schema_version"] == 2
+        assert inspect_payload["source_manifest"]["persona_file"] == str(persona_file.resolve())
+        extracted = subprocess.run(
+            base + ["--step", "extract"], capture_output=True, text=True,
+            encoding="utf-8", check=True)
+        extract_payload = json.loads(extracted.stdout)
+        assert all(Path(path).exists() for path in extract_payload["package"].values())
+
+    # 55. 零材料 v2 只出协议底座；不能逼用户写 closing 或伪造关系状态。
+    from persona_compiler import PersonaItem
+    zero_persona = build_persona_from_items(protocol_items(), pronouns=None)
+    assert zero_persona.validate(mode="compiler_v2") == []
+    zero_md = render_persona_md(zero_persona)
+    assert "最终约定" not in zero_md
+    assert "没有额外的硬红线" not in zero_md
+    assert "关系刚开始" not in zero_md
+    assert "timeline" in zero_md
+    closing = PersonaItem(
+        item_id="orig:closing", text="说好了就算数。", section="closing",
+        source_type="original_persona", source_ref="fixture:closing",
+        source_span=(0, 8), source_hash="fixture", operation="keep",
+        original_text="说好了就算数。", proposed_text="说好了就算数。",
+        confidence="exact", confirmed=True)
+    with_closing = build_persona_from_items(protocol_items() + [closing], pronouns=None)
+    closing_md = render_persona_md(with_closing)
+    assert closing_md.rstrip().endswith("说好了就算数。")
+    assert "****" not in closing_md and "**内容**" not in closing_md
+
+    # 56. v2 只有十二节版本题；没有自由文本，也没有第十三个全局批准。
+    assert load_init_state({"answers": {}}).mode == "legacy_v1"
+    assert load_init_state(new_v2_state()).mode == "compiler_v2"
+    v2_state = prepare_section_versions(new_v2_state())
+    section_payload = section_choice_payload(v2_state)
+    assert len(section_payload["sections"]) == len(SECTION_ORDER) == 12
+    assert all("free_text" not in question for question in section_payload["sections"])
+    assert all(question["section_versions"] for question in section_payload["sections"])
+    assert all("diff" in version for question in section_payload["sections"]
+               for version in question["section_versions"])
+    empty_user = next(question for question in section_payload["sections"]
+                      if question["section"] == "user")
+    assert any(version["id"].endswith(":leave_empty")
+               for version in empty_user["section_versions"])
+
+    decisions = {question["section"]: question["section_versions"][0]["id"]
+                 for question in section_payload["sections"]}
+    v2_state = apply_section_decisions(v2_state, decisions)
+    preview = preview_payload(v2_state)
+    assert "approve_ship" not in json.dumps(preview, ensure_ascii=False)
+    assert len(preview["return_targets"]) == 12
+    assert "timeline" in preview["persona_markdown"]
+    assert not [issue for issue in shipping_issues(v2_state, preview["persona_markdown"], None)
+                if issue.severity == "blocking"]
+
+    # 变异：少确认一节、删 timeline 指针或残留任务书，出口必须给出独立错误码。
+    unconfirmed = dict(v2_state)
+    unconfirmed["section_decisions"] = dict(v2_state["section_decisions"])
+    unconfirmed["section_decisions"].pop("closing")
+    assert "SECTION_UNCONFIRMED" in {
+        issue.code for issue in shipping_issues(unconfirmed, preview["persona_markdown"], None)}
+    assert "TIMELINE_POINTER_MISSING" in {
+        issue.code for issue in shipping_issues(v2_state, preview["persona_markdown"].replace(
+            "timeline", "history"), None)}
+    assert "TASK_DIRECTIVE_REMAINS" in {
+        issue.code for issue in shipping_issues(v2_state, preview["persona_markdown"]
+                                                + "\n记住用户喜好", None)}
+
+    # 变异：确认后源文件改变，必须和 inspect 时保存的哈希比较，不能拿当前值比当前值。
+    from persona_compiler import build_source_manifest, item_to_dict, parse_original_persona
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        persona_file = root / "CLAUDE.md"
+        persona_file.write_text("# 开篇\n\n我认得你。\n", encoding="utf-8")
+        initial_manifest = build_source_manifest(persona_file, None)
+        changed_state = new_v2_state(persona_file, None)
+        changed_state["source_manifest"] = _manifest_payload(initial_manifest)
+        changed_state["compiler_items"] = [
+            item_to_dict(item) for item in parse_original_persona(persona_file)]
+        changed_state = prepare_section_versions(changed_state)
+        changed_questions = section_choice_payload(changed_state)["sections"]
+        changed_state = apply_section_decisions(changed_state, {
+            question["section"]: question["section_versions"][0]["id"]
+            for question in changed_questions})
+        changed_preview = preview_payload(changed_state)
+        changed_state["preview"] = {"preview_hash": changed_preview["preview_hash"]}
+        persona_file.write_text("# 开篇\n\n我已经改变。\n", encoding="utf-8")
+        current_manifest = build_source_manifest(persona_file, None)
+        assert "ORIGINAL_SOURCE_CHANGED" in {
+            issue.code for issue in shipping_issues(
+                changed_state, changed_preview["persona_markdown"], current_manifest)}
+
+    # 未归入十二节的原文不能凭 100% span coverage 被漏掉。
+    with tempfile.TemporaryDirectory() as td:
+        persona_file = Path(td) / "persona.md"
+        persona_file.write_text("一段没有标题但必须保留的原文。\n", encoding="utf-8")
+        manifest = build_source_manifest(persona_file, None)
+        unassigned = new_v2_state(persona_file, None)
+        unassigned["source_manifest"] = _manifest_payload(manifest)
+        unassigned["compiler_items"] = [
+            item_to_dict(item) for item in parse_original_persona(persona_file)]
+        unassigned = prepare_section_versions(unassigned)
+        unassigned = apply_section_decisions(unassigned, {
+            question["section"]: question["section_versions"][0]["id"]
+            for question in section_choice_payload(unassigned)["sections"]})
+        unassigned_preview = preview_payload(unassigned)
+        assert "SECTION_UNCONFIRMED" in {
+            issue.code for issue in shipping_issues(
+                unassigned, unassigned_preview["persona_markdown"], manifest)}
+        mapping_questions = section_choice_payload(unassigned)["original_mapping_questions"]
+        assert mapping_questions[0]["item_id"] == unassigned["compiler_items"][0]["item_id"]
+        assert mapping_questions[0]["choices"][-1] == "leave_unresolved"
+        assert "free_text" not in mapping_questions[0]
+        assigned = apply_original_section_decisions(unassigned, {
+            mapping_questions[0]["item_id"]: "opening"})
+        assigned = prepare_section_versions(assigned)
+        assigned = apply_section_decisions(assigned, {
+            question["section"]: question["section_versions"][0]["id"]
+            for question in section_choice_payload(assigned)["sections"]})
+        assigned_preview = preview_payload(assigned)
+        assert "一段没有标题但必须保留的原文。" in assigned_preview["persona_markdown"]
+        assert "SECTION_UNCONFIRMED" not in {
+            issue.code for issue in shipping_issues(
+                assigned, assigned_preview["persona_markdown"], manifest)}
+
+    # 同一机制已有个性化原文时，选择协议默认项必须被单独识别为覆盖原文。
+    original_mechanism = PersonaItem(
+        item_id="orig:retrieval", text="先读我自己定下的检索约定。", section="opening",
+        source_type="original_persona", source_ref="fixture:persona", source_span=(0, 14),
+        source_hash="fixture", operation="keep", original_text="先读我自己定下的检索约定。",
+        proposed_text="先读我自己定下的检索约定。", confidence="exact", confirmed=False,
+        group_id="mechanism:opening_recognition")
+    override_state = new_v2_state()
+    override_state["compiler_items"] = [item_to_dict(original_mechanism)]
+    override_state = prepare_section_versions(override_state)
+    override_decisions = {}
+    for question in section_choice_payload(override_state)["sections"]:
+        versions = question["section_versions"]
+        if question["section"] == "opening":
+            chosen = next(version for version in versions
+                          if "protocol:opening_recognition" in version["source_summary"])
+        else:
+            chosen = versions[0]
+        override_decisions[question["section"]] = chosen["id"]
+    override_state = apply_section_decisions(override_state, override_decisions)
+    override_preview = preview_payload(override_state)
+    assert "PROTOCOL_OVERRIDES_ORIGINAL" in {
+        issue.code for issue in shipping_issues(
+            override_state, override_preview["persona_markdown"], None)}
+
+    # 其余结构化闸门逐个留靶心，不能以后被合并成一句“人格不完整”。
+    naming_state = json.loads(json.dumps(v2_state, ensure_ascii=False))
+    naming_state["diagnostics"].append({
+        "code": "NAMING_NOT_BIDIRECTIONAL", "severity": "blocking",
+        "message": "称呼只有单向", "item_ids": []})
+    assert "NAMING_INCOMPLETE" in {
+        issue.code for issue in shipping_issues(
+            naming_state, preview["persona_markdown"], None)}
+
+    derived_state = json.loads(json.dumps(v2_state, ensure_ascii=False))
+    broken_coverage = PersonaItem(
+        item_id="protocol:COVERAGE_TEMPLATE", text="覆盖 2026-01-01。",
+        section="architecture", source_type="protocol",
+        source_ref="protocol:COVERAGE_TEMPLATE", source_span=None,
+        source_hash="protocol:COVERAGE_TEMPLATE", operation="add", original_text="",
+        proposed_text="覆盖 2026-01-01。", confidence="derived_protocol",
+        confirmed=True, derived_from=(), group_id="mechanism:memory_coverage")
+    derived_state["compiler_items"].append(item_to_dict(broken_coverage))
+    assert "DERIVED_PROTOCOL_PROVENANCE_MISSING" in {
+        issue.code for issue in shipping_issues(
+            derived_state, preview["persona_markdown"], None)}
+
+    rewrite_state = json.loads(json.dumps(v2_state, ensure_ascii=False))
+    rewrite_state["compiler_items"].append(item_to_dict(PersonaItem(
+        item_id="orig:rewrite", text="旧句。", section="closing",
+        source_type="original_persona", source_ref="fixture:rewrite", source_span=(0, 3),
+        source_hash="fixture", operation="rewrite", original_text="旧句。",
+        proposed_text="新句。", confidence="exact", confirmed=False,
+        operation_reason="解决冲突")))
+    rewrite_state["section_decisions"].pop("closing")
+    assert "SECTION_WITH_DIFF_UNCONFIRMED" in {
+        issue.code for issue in shipping_issues(
+            rewrite_state, preview["persona_markdown"], None)}
+
+    conflict_state = json.loads(json.dumps(v2_state, ensure_ascii=False))
+    conflict_state["conflicts"].append({
+        "conflict_id": "conflict:boundary", "kind": "boundary",
+        "severity": "blocking", "item_ids": ["protocol:degradation_protocol"],
+        "reason": "边界冲突", "choices": ["protocol:degradation_protocol"],
+        "resolved_choice": None})
+    assert "BOUNDARY_CONFLICT_UNRESOLVED" in {
+        issue.code for issue in shipping_issues(
+            conflict_state, preview["persona_markdown"], None)}
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        corpus_file = root / "corpus.md"
+        corpus_file.write_text("虚构测试语料。\n", encoding="utf-8")
+        manifest = build_source_manifest(None, corpus_file)
+        assert "SOURCE_ACCOUNTING_INCOMPLETE" in {
+            issue.code for issue in shipping_issues(
+                v2_state, preview["persona_markdown"], manifest)}
+        unknown_state = json.loads(json.dumps(v2_state, ensure_ascii=False))
+        unknown_state["compiler_items"].append(item_to_dict(PersonaItem(
+            item_id="corpus:unknown", text="来源不明事实。", section="user",
+            source_type="corpus", source_ref="fixture:unknown", source_span=(0, 6),
+            source_hash="fixture", operation="add", original_text="",
+            proposed_text="来源不明事实。", confidence="high", confirmed=True)))
+        assert "SOURCE_UNKNOWN" in {
+            issue.code for issue in shipping_issues(
+                unknown_state, preview["persona_markdown"], manifest)}
+
+        from persona_compiler import SourceManifest
+        persona_file = root / "AGENTS.md"
+        persona_file.write_text("# 开篇\n\n原文。\n", encoding="utf-8")
+        mixed_manifest = SourceManifest(
+            persona_file=persona_file.resolve(), corpus_files=(persona_file.resolve(),),
+            source_hashes={})
+        assert "PERSONA_MIXED_INTO_CORPUS" in {
+            issue.code for issue in shipping_issues(
+                v2_state, preview["persona_markdown"], mixed_manifest)}
+
+        partial_state = new_v2_state(persona_file, None)
+        partial_manifest = build_source_manifest(persona_file, None)
+        partial_state["source_manifest"] = _manifest_payload(partial_manifest)
+        partial_items = [item_to_dict(item) for item in parse_original_persona(persona_file)]
+        partial_items[0]["source_span"] = [0, 1]
+        partial_state["compiler_items"] = partial_items
+        partial_state = prepare_section_versions(partial_state)
+        partial_state = apply_section_decisions(partial_state, {
+            question["section"]: question["section_versions"][0]["id"]
+            for question in section_choice_payload(partial_state)["sections"]})
+        assert "ORIGINAL_COVERAGE_INCOMPLETE" in {
+            issue.code for issue in shipping_issues(
+                partial_state, preview_payload(partial_state)["persona_markdown"],
+                partial_manifest)}
+
+    # 旧目录已有出货人格但没显式传 --persona 时，只能给两项迁移选择。
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "AGENTS.md").write_text("# 核心人格\n\n手改内容。\n", encoding="utf-8")
+        migration = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--out", str(root),
+             "--step", "inspect", "--json"], capture_output=True, text=True,
+            encoding="utf-8", check=True)
+        assert json.loads(migration.stdout)["choices"] == [
+            "treat_current_as_original", "continue_legacy"]
+
+    # 57. 真 CLI 走 inspect → 十二节选择 → preview → route → ship；函数绿不算接通。
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        script = str(Path(__file__).resolve())
+
+        def run_v2(*extra):
+            return subprocess.run(
+                [sys.executable, script, "--out", str(root), *extra],
+                capture_output=True, text=True, encoding="utf-8", check=True).stdout
+
+        run_v2("--step", "inspect", "--json")
+        continued = run_v2("--json")
+        assert "--step extract" in continued
+        questions = json.loads(run_v2("--step", "choose-sections", "--json"))
+        cli_decisions = {question["section"]: question["section_versions"][0]["id"]
+                         for question in questions["sections"]}
+        run_v2("--step", "choose-sections", "--section-decisions-json",
+               json.dumps(cli_decisions, ensure_ascii=False), "--json")
+        cli_preview = json.loads(run_v2("--step", "preview", "--json"))
+        assert cli_preview["unresolved"] == [] and "timeline" in cli_preview["persona_markdown"]
+        run_v2("--step", "route", "--route", "zero-dep")
+        ship_output = run_v2("--step", "ship", "--client", "codex")
+        assert (root / "AGENTS.md").exists()
+        assert "四件套" in ship_output
+
+    # 58. 随包指南必须跟 v2 argparse 同步；不能继续教用户走固定问卷或写内容。
+    docs_root = Path(__file__).resolve().parent.parent / "docs"
+    quick_guide = (docs_root / "快速上手.md").read_text(encoding="utf-8")
+    ai_guide = (docs_root / "给AI的引导指南.md").read_text(encoding="utf-8")
+    for token in ("--persona", "--step inspect", "--step preview", "leave_empty"):
+        assert token in quick_guide and token in ai_guide, f"用户指南缺 v2 命令：{token}"
+    compiler_section = ai_guide.split("### 第 1 步：检查人格与语料来源", 1)[1].split(
+        "### 第 7 步：接入客户端", 1)[0]
+    assert "请写一句" not in compiler_section and "自由文本入口" in compiler_section
+
+    print("selftest ok（58项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
           "归属句式 / 默认值不预支历史 / 协议层不问用户 / 导出纪律 / 渲染顺序 / "
           "人称锚死一套 / 用户只有一种称呼形态 / 昵称档不被静默吃掉 / 中性档不丢主语 / 人称从语料读出来 / 中性写法不许漏 / 语料侧判定不许猜 / 全文零它 / 称呼不重复拼接 / 关系状态归开篇 / "
           "答案读回不静默丢 / 任务书不泄漏进人格文件 / 长字面量不崩 / 未决草稿不蒸发 / "
@@ -2727,7 +3317,7 @@ def _selftest():
           "pick 题只许挑不许写 / 冷启动出得了货 / "
           "AI 驱动不绕过确认 / 确认关卡 / 续跑 / 完整性 / generic 档随货带契约 / "
           "CLI 真进程走文档教的那条命令 / 换档退役旧档 / 同档重跑不自退 / "
-          "不动不是我们出的文件 / 覆盖手改的人格文件前必先备份并说出来 / MCP 配置路径可直接用 / ship 话术不串档 / 检索路线是真选择点 / 云端档落到启动参数 / 凭证不进产出目录）")
+          "不动不是我们出的文件 / 覆盖手改的人格文件前必先备份并说出来 / MCP 配置路径可直接用 / ship 话术不串档 / 检索路线是真选择点 / 云端档落到启动参数 / 凭证不进产出目录 / 引导句是指针（绝对路径、超长不出货、换档跟着换） / MCP 配置分可搬运与绝对路径两档（占位符只给 Claude Code、必带默认值、半套可搬运不许出） / 覆盖区间的 {end} 是提示不是断言 / 指针护栏盖住 timeline 写回层）")
 
 
 def _rebuild(state):
@@ -2822,6 +3412,615 @@ def _detect_pronouns_from_corpus(corpus_path):
     except Exception:
         return {}
     return {k: v for k, v in detect_pronouns(entries, USER_SPEAKERS).items() if v}
+
+
+def _compile_issue_payload(issue):
+    return {"code": issue.code, "severity": issue.severity,
+            "message": issue.message, "item_ids": list(issue.item_ids)}
+
+
+def _manifest_payload(manifest):
+    return {
+        "persona_file": str(manifest.persona_file) if manifest.persona_file else None,
+        "corpus_files": [str(path) for path in manifest.corpus_files],
+        "source_hashes": dict(manifest.source_hashes),
+        "issues": [_compile_issue_payload(issue) for issue in manifest.issues],
+    }
+
+
+def new_v2_state(persona_path=None, corpus_path=None):
+    """建立来源编译状态；v1 状态仍由旧路径原样读写。"""
+    return {
+        "schema_version": 2,
+        "mode": "compiler_v2",
+        "step": "",
+        "inputs": {"persona": str(persona_path) if persona_path else None,
+                   "corpus": str(corpus_path) if corpus_path else None},
+        "source_manifest": {},
+        "compiler_items": [],
+        "conflicts": [],
+        "section_versions": {},
+        "section_decisions": {},
+        "source_accounting": [],
+        "diagnostics": [],
+        "preview": {},
+        "shipping": {},
+    }
+
+
+def load_init_state(data):
+    """只判状态代际，不把 v1 字段静默重解释成 v2。"""
+    from types import SimpleNamespace
+    mode = "compiler_v2" if data.get("schema_version") == 2 else "legacy_v1"
+    return SimpleNamespace(mode=mode, data=data)
+
+
+def _section_version_dict(version):
+    return {
+        "id": version.version_id,
+        "version_id": version.version_id,
+        "section": version.section,
+        "item_ids": list(version.item_ids),
+        "markdown": version.markdown,
+        "source_summary": list(version.source_summary),
+        "diff": version.diff,
+        "resolved_conflict_ids": list(version.resolved_conflict_ids),
+    }
+
+
+def _coverage_protocol_item(state):
+    """覆盖日期是协议模板 + 语料派生证据，不新增第五来源类型。"""
+    from persona_compiler import PersonaItem
+
+    corpus_path = state.get("inputs", {}).get("corpus")
+    span = corpus_coverage(corpus_path) if corpus_path else None
+    refs = tuple(state.get("source_manifest", {}).get("corpus_files", ()))
+    if not span:
+        return None
+    value = COVERAGE_TEMPLATE.format(start=span[0], end=span[1])
+    return PersonaItem(
+        item_id="protocol:COVERAGE_TEMPLATE", text=value, section="architecture",
+        source_type="protocol", source_ref="protocol:COVERAGE_TEMPLATE",
+        source_span=None, source_hash="protocol:COVERAGE_TEMPLATE",
+        operation="add", original_text="", proposed_text=value,
+        confidence="derived_protocol", confirmed=True, derived_from=refs,
+        group_id="mechanism:memory_coverage")
+
+
+def _style_disclaimer_item():
+    """真实风格片段出现时机械附加学习边界，不把免责声明伪装成个性。"""
+    import hashlib
+    from persona_compiler import PersonaItem
+
+    return PersonaItem(
+        item_id="protocol:style_disclaimer", text=DISCLAIMER, section="style",
+        source_type="protocol", source_ref="protocol:style_disclaimer",
+        source_span=None, source_hash=hashlib.sha256(DISCLAIMER.encode("utf-8")).hexdigest(),
+        operation="add", original_text="", proposed_text=DISCLAIMER,
+        confidence="protocol", confirmed=True, group_id="mechanism:style_disclaimer")
+
+
+def prepare_section_versions(state):
+    """从来源项确定性重建十二节版本；旧决定只在版本 ID 仍存在时保留。"""
+    from persona_compiler import (
+        Conflict, CompilerState, SectionVersion, build_conflicts,
+        build_section_versions, item_from_dict, item_to_dict,
+    )
+
+    state = dict(state)
+    items = [item_from_dict(item) for item in state.get("compiler_items", ())]
+    refs = {item.source_ref for item in items}
+    for item in protocol_items():
+        if item.source_ref not in refs:
+            items.append(item)
+    if any(item.section == "style" and item.source_type != "protocol" for item in items):
+        disclaimer = _style_disclaimer_item()
+        if disclaimer.source_ref not in {item.source_ref for item in items}:
+            items.append(disclaimer)
+    coverage = _coverage_protocol_item(state)
+    if coverage and coverage.source_ref not in {item.source_ref for item in items}:
+        items.append(coverage)
+    conflicts = build_conflicts(items)
+    versions_by_section = {}
+    for section, _label in SECTION_ORDER:
+        section_items = [item for item in items if item.section == section]
+        versions = build_section_versions(section, section_items, conflicts)
+        if not section_items:
+            versions = [SectionVersion(
+                version_id=f"{section}:leave_empty", section=section,
+                item_ids=(), markdown="", source_summary=(), diff="")]
+        versions_by_section[section] = [_section_version_dict(version) for version in versions]
+    conflict_payload = [{
+        "conflict_id": conflict.conflict_id, "kind": conflict.kind,
+        "severity": conflict.severity, "item_ids": list(conflict.item_ids),
+        "reason": conflict.reason, "choices": list(conflict.choices),
+        "resolved_choice": conflict.resolved_choice,
+    } for conflict in conflicts]
+    valid_ids = {section: {version["id"] for version in versions}
+                 for section, versions in versions_by_section.items()}
+    old_decisions = state.get("section_decisions", {})
+    state["section_decisions"] = {
+        section: decision for section, decision in old_decisions.items()
+        if decision.get("version_id") in valid_ids.get(section, set())
+    }
+    state["compiler_items"] = [item_to_dict(item) for item in items]
+    state["conflicts"] = conflict_payload
+    state["section_versions"] = versions_by_section
+    state["preview"] = {}
+    return state
+
+
+def section_choice_payload(state):
+    """每节至多一道题；来源、冲突与 diff 只作为版本证据。"""
+    from persona_compiler import item_from_dict
+
+    unmapped = [item_from_dict(item) for item in state.get("compiler_items", ())
+                if item.get("source_type") == "original_persona"
+                and item.get("section") is None]
+    sections = []
+    decisions = state.get("section_decisions", {})
+    for section, label in SECTION_ORDER:
+        versions = state.get("section_versions", {}).get(section, [])
+        sections.append({
+            "section": section,
+            "label": label,
+            "status": decisions.get(section, {}).get("status", "pending"),
+            "section_versions": [{
+                "id": version["id"],
+                "markdown": version["markdown"],
+                "source_summary": version.get("source_summary", []),
+                "diff": version.get("diff", ""),
+                "resolved_conflict_ids": version.get("resolved_conflict_ids", []),
+            } for version in versions],
+        })
+    return {"schema_version": 2, "mode": "compiler_v2",
+            "original_mapping_questions": [{
+                "item_id": item.item_id,
+                "text": item.original_text,
+                "source_ref": item.source_ref,
+                "choices": [section for section, _label in SECTION_ORDER]
+                           + ["leave_unresolved"],
+                "note": "整块逐字移动到一个主节，或暂不出货；没有自由文本入口",
+            } for item in unmapped],
+            "sections": sections,
+            "next": "选择每节一个 section_version id，再运行 --step choose-sections"}
+
+
+def apply_original_section_decisions(state, decisions):
+    """给解析失败／跨节原文块选择主节；只移动整块，不拆句、不改字。"""
+    from dataclasses import replace
+    from persona_compiler import item_from_dict, item_to_dict
+
+    items = [item_from_dict(item) for item in state.get("compiler_items", ())]
+    by_id = {item.item_id: item for item in items
+             if item.source_type == "original_persona"}
+    unknown = sorted(set(decisions) - set(by_id))
+    if unknown:
+        raise ValueError("未知原人格块：" + "、".join(unknown))
+    valid_sections = {section for section, _label in SECTION_ORDER}
+    updated = []
+    for item in items:
+        choice = decisions.get(item.item_id)
+        if choice is None or choice == "leave_unresolved":
+            updated.append(item)
+            continue
+        if choice not in valid_sections:
+            raise ValueError(f"未知人格节：{choice}")
+        updated.append(replace(
+            item, section=choice,
+            operation="keep" if item.section == choice else "move",
+            confidence="user_mapped", confirmed=False))
+    state = dict(state)
+    state["compiler_items"] = [item_to_dict(item) for item in updated]
+    state["conflicts"] = []
+    state["section_versions"] = {}
+    state["section_decisions"] = {}
+    state["preview"] = {}
+    return state
+
+
+def apply_section_decisions(state, decisions):
+    from persona_compiler import apply_section_choice, state_from_dict, state_to_dict
+
+    compiler = state_from_dict({
+        "schema_version": 2,
+        "items": state.get("compiler_items", []),
+        "conflicts": state.get("conflicts", []),
+        "section_versions": state.get("section_versions", {}),
+        "section_decisions": state.get("section_decisions", {}),
+    })
+    for section, version_id in decisions.items():
+        if section not in dict(SECTION_ORDER):
+            raise ValueError(f"未知人格节：{section}")
+        compiler = apply_section_choice(compiler, section, version_id)
+    serialized = state_to_dict(compiler)
+    state = dict(state)
+    state["compiler_items"] = serialized["items"]
+    state["section_decisions"] = serialized["section_decisions"]
+    state["preview"] = {}
+    state["step"] = "sections_chosen"
+    return state
+
+
+def preview_payload(state):
+    """完整预览只能机械拼接已选节版本，不在预览阶段再次改写。"""
+    lines = ["# 核心人格", ""]
+    unresolved = []
+    source_summary = {}
+    decisions = state.get("section_decisions", {})
+    for section, label in SECTION_ORDER:
+        decision = decisions.get(section)
+        if not decision or decision.get("status") != "confirmed":
+            unresolved.append(section)
+            continue
+        versions = state.get("section_versions", {}).get(section, [])
+        selected = next((version for version in versions
+                         if version["id"] == decision.get("version_id")), None)
+        if selected is None:
+            unresolved.append(section)
+            continue
+        source_summary[section] = selected.get("source_summary", [])
+        if selected.get("markdown", "").strip():
+            lines.extend([f"## {fill_pronouns(label, None)}", "",
+                          selected["markdown"].rstrip(), ""])
+    markdown = "\n".join(lines).rstrip() + "\n"
+    warnings = [issue for issue in state.get("diagnostics", [])
+                if issue.get("severity") == "warning"]
+    import hashlib
+    return {
+        "persona_markdown": markdown,
+        "preview_hash": hashlib.sha256(markdown.encode("utf-8")).hexdigest(),
+        "source_summary": source_summary,
+        "unresolved": unresolved,
+        "warnings": warnings,
+        "return_targets": [section for section, _label in SECTION_ORDER],
+    }
+
+
+def shipping_issues(state, persona_markdown, manifest):
+    """v2 出货闸；warning 可展示，blocking 一项都不能带过。"""
+    import hashlib
+    from persona_compiler import CompileIssue, item_from_dict, original_span_coverage
+
+    issues = [CompileIssue(
+        issue["code"], issue["severity"], issue["message"],
+        tuple(issue.get("item_ids", ()))) for issue in state.get("diagnostics", [])]
+    decisions = state.get("section_decisions", {})
+    missing_sections = [section for section, _label in SECTION_ORDER
+                        if decisions.get(section, {}).get("status") != "confirmed"]
+    if missing_sections:
+        issues.append(CompileIssue(
+            "SECTION_UNCONFIRMED", "blocking",
+            "以下人格节尚未确认：" + "、".join(missing_sections)))
+    if any(token in persona_markdown for token in (
+            "去语料里找", "记住用户喜好", "请用户补写", "请写一句")):
+        issues.append(CompileIssue(
+            "TASK_DIRECTIVE_REMAINS", "blocking", "人格文件仍含任务书或空指令"))
+    if "timeline" not in persona_markdown:
+        issues.append(CompileIssue(
+            "TIMELINE_POINTER_MISSING", "blocking",
+            "按需读取指针没有覆盖 memory/timeline 写回层"))
+
+    items = [item_from_dict(item) for item in state.get("compiler_items", [])]
+    if any(item.source_type == "original_persona" and item.section is None
+           for item in items):
+        issues.append(CompileIssue(
+            "SECTION_UNCONFIRMED", "blocking",
+            "仍有原人格块没有归入十二节，不能在预览中静默漏掉",
+            tuple(item.item_id for item in items
+                  if item.source_type == "original_persona" and item.section is None)))
+    if any(issue.code == "NAMING_NOT_BIDIRECTIONAL" for issue in issues):
+        issues.append(CompileIssue(
+            "NAMING_INCOMPLETE", "blocking", "称呼系统必须双向并区分场景"))
+
+    groups = {}
+    for item in items:
+        if item.group_id:
+            groups.setdefault(item.group_id, []).append(item)
+    for grouped in groups.values():
+        originals = [item for item in grouped if item.source_type == "original_persona"]
+        protocols = [item for item in grouped if item.source_type == "protocol"]
+        if originals and protocols and any(item.confirmed for item in protocols) and not any(
+                item.confirmed for item in originals):
+            issues.append(CompileIssue(
+                "PROTOCOL_OVERRIDES_ORIGINAL", "blocking",
+                "协议默认值不能覆盖同一机制中的个性化原文",
+                tuple(item.item_id for item in grouped)))
+    coverage_items = [item for item in items
+                      if item.source_ref == "protocol:COVERAGE_TEMPLATE"]
+    if any(not item.derived_from for item in coverage_items):
+        issues.append(CompileIssue(
+            "DERIVED_PROTOCOL_PROVENANCE_MISSING", "blocking",
+            "记忆覆盖范围缺模板或语料派生证据"))
+    for item in items:
+        if item.operation in {"rewrite", "delete"} and (
+                decisions.get(item.section, {}).get("status") != "confirmed"):
+            issues.append(CompileIssue(
+                "SECTION_WITH_DIFF_UNCONFIRMED", "blocking",
+                f"含原文删改的节尚未确认：{item.section}", (item.item_id,)))
+
+    selected_versions = {}
+    for section, decision in decisions.items():
+        selected_versions[section] = next((version for version in
+            state.get("section_versions", {}).get(section, [])
+            if version["id"] == decision.get("version_id")), None)
+    for conflict in state.get("conflicts", []):
+        if conflict.get("severity") != "blocking":
+            continue
+        section = next((item.section for item in items
+                        if item.item_id in conflict.get("item_ids", [])), None)
+        selected = selected_versions.get(section) or {}
+        if conflict["conflict_id"] not in selected.get("resolved_conflict_ids", []):
+            issues.append(CompileIssue(
+                "BOUNDARY_CONFLICT_UNRESOLVED", "blocking",
+                "硬边界冲突尚未由节版本裁定", tuple(conflict.get("item_ids", ()))))
+
+    if manifest is not None:
+        persona_file = manifest.persona_file
+        if persona_file and any(str(persona_file) == str(path) for path in manifest.corpus_files):
+            issues.append(CompileIssue(
+                "PERSONA_MIXED_INTO_CORPUS", "blocking", "原人格仍在语料写入清单中"))
+        if persona_file and persona_file.exists():
+            source = persona_file.read_text(encoding="utf-8")
+            original_items = [item for item in items if item.source_type == "original_persona"]
+            if original_span_coverage(source, original_items) != 1.0:
+                issues.append(CompileIssue(
+                    "ORIGINAL_COVERAGE_INCOMPLETE", "blocking", "原人格有非空原文无人认领"))
+            expected_hash = state.get("source_manifest", {}).get(
+                "source_hashes", {}).get(str(persona_file), "")
+            actual_hash = manifest.source_hashes.get(str(persona_file), "")
+            if expected_hash and expected_hash != actual_hash:
+                issues.append(CompileIssue(
+                    "ORIGINAL_SOURCE_CHANGED", "blocking", "确认后原人格文件发生变化"))
+        known = {str(path) for path in manifest.corpus_files}
+        accounted = {str(record.get("source_ref"))
+                     for record in state.get("source_accounting", [])}
+        if known - accounted:
+            issues.append(CompileIssue(
+                "SOURCE_ACCOUNTING_INCOMPLETE", "blocking", "仍有输入来源未被候选结果交代"))
+        for item in items:
+            if item.source_type == "corpus" and item.source_ref not in known:
+                issues.append(CompileIssue(
+                    "SOURCE_UNKNOWN", "blocking", "具体关系事实来源不在清单",
+                    (item.item_id,)))
+
+    preview_hash = state.get("preview", {}).get("preview_hash")
+    actual_preview_hash = hashlib.sha256(persona_markdown.encode("utf-8")).hexdigest()
+    if preview_hash and preview_hash != actual_preview_hash:
+        issues.append(CompileIssue(
+            "PREVIEW_CHANGED", "blocking", "已展示预览与当前待出货人格不一致"))
+    return issues
+
+
+def _v2_inputs(args, state=None):
+    state = state or {}
+    saved = state.get("inputs", {})
+    return args.persona or saved.get("persona"), args.corpus or saved.get("corpus")
+
+
+def _existing_persona_paths(out_dir, state):
+    """只返回产出目录根下的已知人格文件名，不递归猜测其他 Markdown。"""
+    out = Path(out_dir)
+    names = []
+    previous = state.get("last_shipped_persona")
+    if previous in CLIENT_FILENAMES.values():
+        names.append(previous)
+    names.extend(name for name in CLIENT_FILENAMES.values() if name not in names)
+    return [out / name for name in names if (out / name).is_file()]
+
+
+def _step_inspect_v2(args, existing_state=None):
+    from persona_compiler import build_source_manifest, item_to_dict, parse_original_persona
+
+    existing_state = existing_state or {}
+    persona_path = args.persona
+    existing_personas = [] if persona_path else _existing_persona_paths(args.out, existing_state)
+    if existing_personas and not args.existing_persona_choice:
+        payload = {
+            "schema_version": 2,
+            "mode": "migration_choice",
+            "existing_persona_files": [str(path.resolve()) for path in existing_personas],
+            "choices": ["treat_current_as_original", "continue_legacy"],
+            "next": "用 --existing-persona-choice 选择；不会自动采用首项",
+        }
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False))
+        else:
+            print("检测到已有的人格文件。请选择把它作为原人格，或继续旧流程。")
+        return
+    if args.existing_persona_choice == "continue_legacy":
+        payload = {"mode": "legacy_v1", "choice": "continue_legacy",
+                   "next": "继续原 questionnaire → answers → confirm → route → ship 流程"}
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False))
+        else:
+            print("保留 v1 状态，继续旧初始化流程。")
+        return
+    if existing_personas:
+        persona_path = existing_personas[0]
+
+    manifest = build_source_manifest(persona_path, args.corpus)
+    state = new_v2_state(persona_path, args.corpus)
+    state["source_manifest"] = _manifest_payload(manifest)
+    if manifest.persona_file and not manifest.issues:
+        state["compiler_items"] = [item_to_dict(item)
+                                   for item in parse_original_persona(manifest.persona_file)]
+    state["diagnostics"] = state["source_manifest"]["issues"]
+    state["step"] = "inspected"
+    save_state(args.out, state)
+    payload = {
+        "schema_version": 2,
+        "mode": "compiler_v2",
+        "source_manifest": state["source_manifest"],
+        "original_item_count": len(state["compiler_items"]),
+        "original_blocks": [{
+            "item_id": item["item_id"], "text": item["original_text"],
+            "section": item["section"], "confidence": item["confidence"],
+            "source_ref": item["source_ref"],
+        } for item in state["compiler_items"]],
+        "blocking_issues": [issue for issue in state["diagnostics"]
+                            if issue["severity"] == "blocking"],
+        "next": "--step extract",
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        print("输入检查完成。下一步：--step extract --json")
+
+
+def _step_extract_v2(args, state):
+    from draft_extraction import build_extraction_package, load_candidate_result
+    from persona_compiler import build_source_manifest, item_to_dict
+
+    persona_path, corpus_path = _v2_inputs(args, state)
+    manifest = build_source_manifest(persona_path, corpus_path)
+    if not state or state.get("schema_version") != 2:
+        state = new_v2_state(persona_path, corpus_path)
+    state["inputs"] = {"persona": str(persona_path) if persona_path else None,
+                       "corpus": str(corpus_path) if corpus_path else None}
+    state["source_manifest"] = _manifest_payload(manifest)
+    package = build_extraction_package(manifest, Path(args.out) / "persona-extraction")
+    package_payload = {
+        "prompt": str(package.prompt_path.resolve()),
+        "manifest": str(package.manifest_path.resolve()),
+        "schema": str(package.schema_path.resolve()),
+    }
+    state["extraction_package"] = package_payload
+    state["step"] = "extracted"
+    if args.candidates:
+        candidate_data = _load_json_arg(args.candidates)
+        candidate_path = Path(args.out) / "persona-extraction" / "候选结果.json"
+        candidate_path.write_text(
+            json.dumps(candidate_data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        items, issues = load_candidate_result(candidate_path, manifest)
+        originals = [item for item in state.get("compiler_items", [])
+                     if item.get("source_type") == "original_persona"]
+        state["compiler_items"] = originals + [item_to_dict(item) for item in items]
+        state["source_accounting"] = candidate_data.get("source_accounting", [])
+        state["diagnostics"] = [_compile_issue_payload(issue) for issue in issues]
+        state["step"] = "candidates_loaded"
+    save_state(args.out, state)
+    payload = {
+        "schema_version": 2, "mode": "compiler_v2", "package": package_payload,
+        "candidate_count": len([item for item in state.get("compiler_items", [])
+                                if item.get("source_type") == "corpus"]),
+        "blocking_issues": [issue for issue in state.get("diagnostics", [])
+                            if issue["severity"] == "blocking"],
+        "warnings": [issue for issue in state.get("diagnostics", [])
+                     if issue["severity"] == "warning"],
+        "next": ("把当前模型的严格 JSON 结果传给 --candidates"
+                 if not args.candidates else "--step choose-sections"),
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        print("人格候选任务包已生成：")
+        for path in package_payload.values():
+            print(f"- {path}")
+
+
+def _step_choose_sections_v2(args, state):
+    if state.get("schema_version") != 2:
+        raise SystemExit("还没有 v2 初始化状态。先运行 --step inspect。")
+    if args.original_section_decisions_json:
+        mappings = _load_json_arg(args.original_section_decisions_json)
+        if not isinstance(mappings, dict):
+            raise SystemExit("original section decisions 必须是 {item_id: section} JSON 对象")
+        try:
+            state = apply_original_section_decisions(state, mappings)
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+    if not state.get("section_versions"):
+        state = prepare_section_versions(state)
+    if args.section_decisions_json:
+        decisions = _load_json_arg(args.section_decisions_json)
+        if not isinstance(decisions, dict):
+            raise SystemExit("section decisions 必须是 {section: version_id} JSON 对象")
+        try:
+            state = apply_section_decisions(state, decisions)
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+    save_state(args.out, state)
+    payload = section_choice_payload(state)
+    payload["unresolved"] = [
+        question["section"] for question in payload["sections"]
+        if question["status"] != "confirmed"]
+    payload["next"] = ("--step preview" if not payload["unresolved"]
+                       else "继续为 unresolved 节选择 section_version id")
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        for question in payload["sections"]:
+            print(f"\n## {question['label']} [{question['status']}]")
+            for version in question["section_versions"]:
+                print(f"- {version['id']}\n{version['markdown']}")
+
+
+def _step_preview_v2(args, state):
+    if state.get("schema_version") != 2:
+        raise SystemExit("还没有 v2 初始化状态。先运行 --step inspect。")
+    if not state.get("section_versions"):
+        state = prepare_section_versions(state)
+    payload = preview_payload(state)
+    state["preview"] = {
+        "preview_hash": payload["preview_hash"],
+        "source_hashes": dict(state.get("source_manifest", {}).get("source_hashes", {})),
+    }
+    state["step"] = "previewed"
+    save_state(args.out, state)
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        print(payload["persona_markdown"])
+        if payload["unresolved"]:
+            print("未确认节：" + "、".join(payload["unresolved"]))
+        else:
+            print("预览已固定。下一步：--step route，再 --step ship。")
+
+
+def _step_ship_v2(args, state):
+    from persona_compiler import build_source_manifest, item_from_dict
+
+    route = args.route or state.get("route")
+    if route not in RETRIEVAL_ROUTES:
+        raise SystemExit("不出货：检索路线还没选过。先运行 --step route --route <key>。")
+    persona_path, corpus_path = _v2_inputs(args, state)
+    manifest = build_source_manifest(persona_path, corpus_path)
+    payload = preview_payload(state)
+    issues = shipping_issues(state, payload["persona_markdown"], manifest)
+    blocking = [issue for issue in issues if issue.severity == "blocking"]
+    if blocking:
+        raise SystemExit("不出货：" + "；".join(
+            f"{issue.code}：{issue.message}" for issue in blocking))
+    persona = build_persona_from_items(
+        [item_from_dict(item) for item in state.get("compiler_items", [])], pronouns=None)
+    client, switched = resolve_client(args.client, state.get("client"))
+    if switched:
+        print(switched + "\n")
+    try:
+        paths = write_bundle(
+            args.out, persona, client=client, corpus_dir=corpus_path,
+            confirmed=True, previous_persona=state.get("last_shipped_persona"),
+            route=route, validation_mode="compiler_v2",
+            rendered_override=payload["persona_markdown"], add_coverage=False)
+    except (PermissionError, ValueError, FileNotFoundError) as exc:
+        raise SystemExit(f"不出货：{exc}")
+    print("【四件套】")
+    print(f"  人格文件：{paths['persona']}")
+    print(f"  记忆库：{paths['memory_dir']}")
+    print(f"  MCP 配置：{paths['mcp_config']}")
+    print(f"  引导句：{paths['guidance']}")
+    state["step"] = "shipped"
+    state["client"] = client
+    state["route"] = route
+    state["last_shipped_persona"] = paths["persona"].name
+    state["shipping"] = {
+        "compiler_gates_passed": True,
+        "preview_hash": payload["preview_hash"],
+        "warnings": [_compile_issue_payload(issue) for issue in issues
+                     if issue.severity == "warning"],
+    }
+    save_state(args.out, state)
 
 
 def _step_questionnaire(args):
@@ -3054,11 +4253,14 @@ def _step_ship(args, state):
                              route=route)
     except (PermissionError, ValueError, FileNotFoundError) as e:
         raise SystemExit(f"不出货：{e}")
-    print("【三件套】")
+    print("【四件套】")
     print(f"  人格文件：{paths['persona']}")
     print(f"  记忆库：{paths['memory_dir']}"
           + (f"（落盘 {len(paths['corpus_files'])} 个窗口文件）" if paths["corpus_files"] else ""))
     print(f"  MCP 配置：{paths['mcp_config']}")
+    print(f"  引导句：{paths['guidance']}"
+          f"（给闭源前端 App 用：贴进它的自定义指令／system prompt 框，"
+          f"宿主客户端用不上它。用法与边界见《快速上手》§3c）")
     if paths.get("contract"):
         print(f"  注入契约：{paths['contract']}")
     for bak in paths.get("retired", []):
@@ -3100,11 +4302,44 @@ def _cli(args):
     比在终端里敲长文本舒服得多。"""
     state = load_state(args.out)
     step = args.step
+    if step == "inspect":
+        _step_inspect_v2(args, state)
+        return
+    if step == "extract":
+        _step_extract_v2(args, state)
+        return
+    if step == "choose-sections":
+        _step_choose_sections_v2(args, state)
+        return
+    if step == "preview":
+        _step_preview_v2(args, state)
+        return
     if not step:
-        step = {"": "questionnaire", "questionnaire": "answers",
-                "answers": "confirm", "confirm": "route", "route": "ship",
-                "shipped": "ship"}[state.get("step", "")]
+        if state.get("schema_version") == 2:
+            step = {"": "inspect", "inspected": "extract", "extracted": "extract",
+                    "candidates_loaded": "choose-sections",
+                    "sections_chosen": "preview", "previewed": "route",
+                    "route": "ship", "shipped": "ship"}.get(
+                        state.get("step", ""), "inspect")
+        else:
+            step = {"": "questionnaire", "questionnaire": "answers",
+                    "answers": "confirm", "confirm": "route", "route": "ship",
+                    "shipped": "ship"}[state.get("step", "")]
         print(f"（按进度接着跑：--step {step}）\n")
+        if state.get("schema_version") == 2:
+            if step == "inspect":
+                _step_inspect_v2(args, state)
+            elif step == "extract":
+                _step_extract_v2(args, state)
+            elif step == "choose-sections":
+                _step_choose_sections_v2(args, state)
+            elif step == "preview":
+                _step_preview_v2(args, state)
+            elif step == "route":
+                _step_route(args, state)
+            else:
+                _step_ship_v2(args, state)
+            return
     if step == "questionnaire":
         _step_questionnaire(args)
     elif step == "answers":
@@ -3113,6 +4348,8 @@ def _cli(args):
         _step_confirm(args, state)
     elif step == "route":
         _step_route(args, state)
+    elif step == "ship" and state.get("schema_version") == 2:
+        _step_ship_v2(args, state)
     else:
         _step_ship(args, state)
 
@@ -3121,14 +4358,15 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--out", help="产出目录")
+    ap.add_argument("--persona", help="已有的人格文件（可选；不会作为语料导入）")
     ap.add_argument("--corpus", help="已有语料目录（可选）")
     # 默认值是 None 而不是 "claude-code"，为的是 ship 步能分辨"用户显式指定了档"
     # 与"用户没提"——两者在出货时的行为必须不同（见 resolve_client）
     ap.add_argument("--client", default=None, choices=sorted(CLIENT_FILENAMES),
                     help=f"客户端档（默认 {DEFAULT_CLIENT}）。任何一步都可以给；"
                          f"ship 步显式给的以它为准，会覆盖前面存下的档")
-    ap.add_argument("--step", choices=["questionnaire", "answers", "confirm",
-                                       "route", "ship"],
+    ap.add_argument("--step", choices=["inspect", "extract", "choose-sections", "preview",
+                                       "questionnaire", "answers", "confirm", "route", "ship"],
                     help="不传则按 init_state.json 里的进度接着跑")
     ap.add_argument("--route", choices=sorted(RETRIEVAL_ROUTES),
                     help="route 步：TA 选的检索路线（zero-dep 默认 / local 本地模型 / "
@@ -3143,6 +4381,16 @@ if __name__ == "__main__":
                     help="机器可读输出（questionnaire 出题目、confirm --list 出待确认清单）")
     ap.add_argument("--answers-json", dest="answers_json",
                     help="answers 步：结构化答案（文件路径 / JSON 字面量 / - 读 stdin）")
+    ap.add_argument("--candidates",
+                    help="extract 步：当前模型返回的候选 JSON（文件路径 / JSON 字面量 / -）")
+    ap.add_argument("--section-decisions-json", dest="section_decisions_json",
+                    help="choose-sections 步：{section: section_version_id} JSON 对象")
+    ap.add_argument("--original-section-decisions-json",
+                    dest="original_section_decisions_json",
+                    help="choose-sections 步：{原人格块 item_id: 主节或 leave_unresolved}")
+    ap.add_argument("--existing-persona-choice",
+                    choices=["treat_current_as_original", "continue_legacy"],
+                    help="inspect 检测到旧人格文件时的迁移选择；不给就只展示选项")
     ap.add_argument("--list", action="store_true",
                     help="confirm 步：只列出待确认草稿，不进交互循环")
     ap.add_argument("--decisions-json", dest="decisions_json",

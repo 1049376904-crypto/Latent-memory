@@ -33,6 +33,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -280,6 +281,113 @@ def run_persona_compiler_cases():
         assert "手工追加：别把沉默解释成同意。" in migrated["persona_markdown"]
 
 
+def run_http_transport_case():
+    """HTTP 传输的**真进程**冒烟：另起一个 python 进程跑 `--http`，走裸 socket。
+
+    为什么非要它（2026.08.03 外部评审第 ④ 条）：`mcp_server` selftest 第 18 项是
+    **同进程起线程**——真端口不假，但"真进程"这三个字它担不起。而《快速上手》
+    的成色声明当时写的是「真端口自检与真进程冒烟盖着」，**拿一个近似的东西
+    冒充判据本身**（CLAUDE.md 第 10 条挡的正是这个形状）。要么改措辞，要么把
+    这一格补上——补上更值：真进程才盖得到 CLI 参数解析、起动横幅、
+    以及**跨进程落盘**（同进程线程共享内存，写回"看起来通了"可能只是内存）。
+
+    裸 socket 而不是 urllib：keep-alive 复用连接是手机 App 的常态形态，
+    urllib 每次新连接、发 `Connection: close`，那条路自检里已经有了（18b）。"""
+    import socket
+    with tempfile.TemporaryDirectory() as td:
+        corpus = Path(td) / "memory"
+        (corpus / "timeline").mkdir(parents=True)
+        (corpus / "timeline" / "window_01_2026-08-01.md").write_text(
+            "# 第1个窗口 · 2026-08-01\n\n## 2026-08-01 记\n阳台那盆绿萝换了新盆。\n"
+            "当下状态：缓苗中。\n", encoding="utf-8")
+        port = _free_port()
+        proc = subprocess.Popen(
+            [sys.executable, str(Path(__file__).parent / "mcp_server.py"),
+             "--corpus", str(corpus), "--http", f"127.0.0.1:{port}",
+             "--token", "smoke-token-2026"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            sock = _wait_port(port, proc)
+            def rpc(payload):
+                raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                sock.sendall(
+                    (f"POST /mcp HTTP/1.1\r\nHost: x\r\n"
+                     f"Authorization: Bearer smoke-token-2026\r\n"
+                     f"Content-Type: application/json\r\n"
+                     f"Content-Length: {len(raw)}\r\n\r\n").encode("utf-8") + raw)
+                return _recv_response(sock)
+            #    接缝⑥-1：真进程握手
+            r = rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+            assert "protocolVersion" in r, f"真进程握手没过：{r[:200]}"
+            #    接缝⑥-2：中文写回穿过真 HTTP（CLI 起的进程，stdout 不是协议流）
+            r = rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                     "params": {"name": "memory_append",
+                                "arguments": {"text": "绿萝缓过来了，抽了新叶。",
+                                              "current_state": "长势稳住了。"}}})
+            assert "已写进" in r, f"真进程写回没成：{r[:200]}"
+            #    接缝⑥-3：同一条连接复用（keep-alive）后检索命中——手机 App 的常态
+            r = rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                     "params": {"name": "memory_search",
+                                "arguments": {"query": "绿萝抽新叶"}}})
+            assert "抽了新叶" in r, f"复用连接后检索没命中：{r[:200]}"
+            sock.close()
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        #    接缝⑥-4：**跨进程落盘**——同进程线程共享内存，只有另起进程才证得了
+        #    "写回真的进了文件"。子进程已退出，这里从盘上重读
+        assert any("抽了新叶" in c for c in load_corpus(corpus).chunks), \
+            "HTTP 写回必须真的落盘——同进程测不出这一格（内存里有不等于盘上有）"
+
+
+def _free_port():
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _wait_port(port, proc, timeout=30.0):
+    """等子进程把端口打开并返回已连上的 socket；起不来就把它的 stderr 报出来。"""
+    import socket
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            err = proc.stderr.read().decode("utf-8", "replace")
+            raise AssertionError(f"HTTP server 进程没起来（退出码 {proc.returncode}）：{err}")
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=5)
+            s.settimeout(30)
+            return s
+        except OSError:
+            time.sleep(0.1)
+    raise AssertionError(f"等了 {timeout}s 端口 {port} 还没开")
+
+
+def _recv_response(sock):
+    """按 Content-Length 收满一条响应——单发 recv 常常只拿到头部，据此断言会随机红绿。"""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        d = sock.recv(65536)
+        if not d:
+            return buf.decode("utf-8", "replace")
+        buf += d
+    head, _, body = buf.partition(b"\r\n\r\n")
+    want = 0
+    for ln in head.decode("latin-1").split("\r\n")[1:]:
+        if ln.lower().startswith("content-length:"):
+            want = int(ln.split(":", 1)[1])
+    while len(body) < want:
+        d = sock.recv(65536)
+        if not d:
+            break
+        body += d
+    return (head + b"\r\n\r\n" + body).decode("utf-8", "replace")
+
+
 def _selftest():
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
@@ -419,10 +527,13 @@ def _selftest():
             "撤回账本该撑过重启——不然'改过来了'只活一个进程"
 
     run_persona_compiler_cases()
+    run_http_transport_case()
 
     print("selftest ok（端到端冒烟：导入 → 问卷 → 答卷解析 → 确认 → 四件套 → "
           "回读 → 握手 → 检索命中原文 → thread 往返 → 写回当场可查 → "
-          "重启后记录与权重都在 → 更正闭环撤回撑过重启，接缝断言六处）")
+          "重启后记录与权重都在 → 更正闭环撤回撑过重启 → "
+          "HTTP 传输真进程（另起进程起服务、裸 socket 握手写回）；\n"
+          "接缝断言：①–⑤ 出货链，⑥-1～⑥-4 HTTP 真进程（握手／中文写回／复用连接检索／跨进程落盘））")
 
 
 if __name__ == "__main__":

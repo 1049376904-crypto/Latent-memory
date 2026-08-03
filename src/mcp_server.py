@@ -537,6 +537,20 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None):
     state = {"sig": _corpus_signature(server.corpus_dir)
              if (server.corpus_dir and server.loader) else None}
 
+    class _Server(http.server.ThreadingHTTPServer):
+        def handle_error(self, request, client_address):
+            """客户端中途断开不许喷 traceback（跟 log_message 静音同一个理由）。
+
+            实测（2026.08.03 外部评审复验时量的）：客户端发到一半就走人——手机 App
+            切后台、断网的常态——socketserver 默认往 stderr 打完整 Traceback，
+            约 41 行一次。而 --http 的起动横幅也走 stderr，运维盯着终端会以为
+            服务崩了。断连类只吞掉；**真异常保留一行摘要**，不静默成"什么都没发生"。"""
+            exc = sys.exc_info()[1]
+            if isinstance(exc, (ConnectionError, TimeoutError)):
+                return
+            print(f"HTTP 请求处理异常（{client_address[0]}）："
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
+
     class _Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -703,7 +717,7 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None):
             else:
                 self._send(200, json.dumps(resp, ensure_ascii=False).encode("utf-8"))
 
-    return http.server.ThreadingHTTPServer((host, port), _Handler)
+    return _Server((host, port), _Handler)
 
 
 # ---------- 部署体检（任务卡"部署体检命令"） ----------
@@ -1736,8 +1750,9 @@ def _selftest():
           "无可靠命中明确说 / 撤回更正闭环 / 缺失率标注接线 / 实体标注接线 / "
           "部署体检只读 / 部署体检走真进程（相对路径解析开、空语料非零退出、"
           "每句一个 `##` 的导出要报切块警告）/ HTTP 传输真端口往返（鉴权 401、"
-          "非回环裸跑拒绝、Origin 403、通知 202、GET 405、批量 400、UTF-8 写回即查、"
-          "语料变化自动重读））")
+          "非回环裸跑拒绝、非 ASCII token 拒绝起动、Origin 403、路径 404、通知 202、"
+          "GET 405、批量 400、超限 413、chunked 501、keep-alive 下被拒后同连接重试、"
+          "UTF-8 写回即查、语料变化自动重读、同窗口手动上传不被写回吞掉））")
 
 
 if __name__ == "__main__":

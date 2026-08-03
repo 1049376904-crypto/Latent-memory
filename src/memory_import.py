@@ -4,7 +4,8 @@
 任务卡"通用导入翻译器层"）。
 
 中间标准格式一个：MemoryEntry {时间戳, 说话人, 文本, 标签?}（设计笔记 原设想）。
-翻译器四个，各来源 → 统一中间格式：
+翻译器六个（⚠ 原文写「四个」，Claude memories.json 与 projects/*.json 两支加进来时
+这行没跟着改；selftest 打印那行写的一直是六个），各来源 → 统一中间格式：
   parse_chatgpt_export   ChatGPT conversations.json（mapping 树，沿 current_node
                          回溯取当前分支——编辑重发产生的废弃分支不混进来）
   parse_claude_export    Claude 导出 json（chat_messages 列表，ISO 时间戳）

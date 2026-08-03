@@ -1111,7 +1111,11 @@ def load_corpus(corpus_dir, embed=False, recursive=True, provider=None, cache_pa
       > **同窗口号的邻层文件**（window_sibling）——index 层 36 个文件全是无标题
         纯段落、文件名也不带日期，本来 34/37 块落 mtime；但它跟 timeline 层同名
         同窗口号，是同一次会话的两种写法，借它的日期是有据可依的，不是猜
-      > mtime（最后兜底，全新 clone 会把全目录刷成同一时刻，基本没有排序信号）"""
+      > mtime（最后兜底。⚠ **它不是"基本没有排序信号"，是给出方向错误的信号**：
+        全新 clone／刚落盘会把这些块刷成"刚刚"，于是最没有日期依据的内容拿到全库
+        最新的时间戳，换窗召回按新鲜度排序时最旧的事实冒充最新的。2026.08.03 跨模型
+        实测量到过这条：那么一份语料下两家模型 0/6 答对当下状态。召回层已对这一档
+        改标「时间未知」不再打日期，`--doctor` 也有专门判据，但**根子仍是语料没日期**）"""
     if embed and cache_path is None and isinstance(corpus_dir, (str, Path)):
         cache_path = Path(corpus_dir) / ".embed_cache.json"
     index = MemoryIndex(embed=embed, provider=provider, cache_path=cache_path or None)

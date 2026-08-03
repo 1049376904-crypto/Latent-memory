@@ -21,3 +21,7 @@ mcp-config.json
 /注入契约.md
 # 换客户端档时旧人格文件退役成的 .bak，同样是用户的私人内容
 *.bak
+# 人格候选提取的任务包与回填结果（初始化 extract 那一步产在 <出货目录>/persona-extraction/）。
+# 里面「人格候选输入清单.json」记着你语料文件的路径和哈希、「候选结果.json」直接装着
+# 从语料里抽出来的人格原文——都是你的私人内容，跟 memory/ 同等对待
+persona-extraction/

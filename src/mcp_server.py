@@ -12,7 +12,9 @@ MCP server 外壳参考实现（任务卡"MCP-server外壳"，规格 §9 未决�
 这条被写成可断言的形式：**外壳返回的文本逐字等于底层库函数的返回值**，谁在
 适配层里重新实现格式化，selftest 立刻红（见 selftest 第 4 项）。
 
-零依赖：不引 mcp SDK，stdlib 手写 JSON-RPC over stdio，跟本项目其余部分同风格。
+零依赖：不引 mcp SDK，stdlib 手写 JSON-RPC，跟本项目其余部分同风格。传输两条：
+stdio（默认，宿主拉起）与 Streamable HTTP（--http，2026.08.03 加，给只认 HTTP 的
+闭源前端直连，替掉 supergateway 桥——为什么与边界见 make_http_server 上面那段）。
 协议按官方规格 2025-06-18 实现（initialize / notifications/initialized /
 tools/list / tools/call，字段名与错误分层均照规格），**已查证不凭记忆写**。
 
@@ -37,18 +39,26 @@ stdio 只能由宿主拉起（手动 `nohup` 必崩）、懒加载每次调用�
 用法：
   python mcp_server.py --selftest
   python mcp_server.py --corpus <md目录> [--threads <threads.jsonl>]   # stdio 服务
+  python mcp_server.py --corpus <md目录> --http 8765 --token <口令>    # HTTP 服务
   python mcp_server.py --doctor --corpus <md目录> [--threads <threads.jsonl>]  # 部署体检
 客户端配置（Claude Desktop 之类）里把上面第二条命令填成 server 启动命令即可；
+只认 HTTP 的客户端（Kelivo/Operit 这类）用第三条起服务、客户端里填地址与 token
+（公网仍要域名 + 反代管 TLS，见《快速上手》§3c 部署形态二）；
 配完接不上、或者不确定 --corpus 指对了没有时，把同一行参数换成 --doctor 跑一次
 （体检只读，不往语料目录写任何东西）。
 """
 
 import argparse
+import hmac
+import http.server
 import io
+import ipaddress
 import json
 import os
 import sys
+import threading
 import time
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
@@ -196,7 +206,7 @@ class MemoryServer:
 
     def __init__(self, index=None, thread_store=None, search_topN=5, recall_topN=3,
                  corpus_dir=None, weights_path=None, retractions_path=None,
-                 entities_path=None):
+                 entities_path=None, loader=None):
         # 两个 topN 分开（2026.07.31 真实语料冒烟后拆的）：显式检索是用户/模型
         # 主动问一件事，多给几条值；开场召回每次换窗都付一遍，条数要克制
         self.index = index if index is not None else MemoryIndex().build()
@@ -218,8 +228,35 @@ class MemoryServer:
             self.index.load_weights(weights_path)
         # 实体标注（图谱可插拔升级）：语料目录下有 .entities.json 就接上——
         # 实体边在 build 时算，接上后要重建一次索引才生效
+        self.entities_path = entities_path
         if entities_path is not None and self.index.load_entities(entities_path):
             self.index.build()
+        # loader：怎么从盘上重建索引（常驻 HTTP 形态的重读用）。stdio 懒加载
+        # 每次调用重读语料所以用不上；不传则常驻形态检测到语料变化时明确不重读
+        self.loader = loader
+        # 本进程自己写过哪些语料文件（常驻 HTTP 形态的指纹记账用）。
+        # 为什么要精确到路径而不是"handle 之后重算一遍指纹"：那样会把**同一个请求
+        # 窗口里用户手动上传的 md 一起吞进基线**，那次上传再也不触发重读——
+        # 正好是自动重读这个特性要治的静默形态（2026.08.03 外部评审指出的竞态）
+        self.written_paths = set()
+
+    def _reload_from_disk(self):
+        """语料目录有文件级变化时从盘上重建索引（常驻 HTTP 形态专用）。
+
+        治的是 supergateway 时代那条实测过的静默坑：常驻 server 只在启动时读一次
+        语料，手动上传进目录的 md 一条都看不到、不报错，直到重启。能这么重建的
+        前提是**内存里没有只活在内存的账**：写回落盘（append_record）、撤回落盘
+        （每次 correct 后 save_retractions）、权重落盘（每次 search 后 save_weights），
+        重建后按各自的 sidecar 路径重新接上即可，无损。
+        SessionRecall 只换 index 引用，会话内状态（距上次召回的字数）保留。"""
+        self.index = self.loader()
+        if self.retractions_path is not None:
+            self.index.load_retractions(self.retractions_path)
+        if self.weights_path is not None:
+            self.index.load_weights(self.weights_path)
+        if self.entities_path is not None and self.index.load_entities(self.entities_path):
+            self.index.build()
+        self.recall.index = self.index
 
     # ---------- 三个工具：只转发，不实现 ----------
 
@@ -272,6 +309,7 @@ class MemoryServer:
         # 不然"我记下了"之后当场问它还查不到，模型会顺势说"没有记录"
         self.index.add(chunk_text, meta)
         self.index.build()
+        self.written_paths.add(str(path))    # 常驻形态的指纹记账（见 __init__ 注释）
         return f"已写进第 {meta['window']} 个窗口（{path.name}）。"
 
     def _tool_memory_correct(self, args, now=None):
@@ -304,6 +342,7 @@ class MemoryServer:
                 raise ToolError(msg + f" 但更正内容写入失败：{e}")
             self.index.add(chunk_text, meta)
             self.index.build()
+            self.written_paths.add(str(path))    # 同 memory_append，见 __init__ 注释
             # 追溯链补上：让账本能回答"哪条记录改了哪条"，不只是"这条被撤了"。
             # 只能在更正写完之后回填——新块的内容哈希这时才存在
             self.index.link_correction(old_idx, chunk_text)
@@ -411,6 +450,274 @@ class MemoryServer:
             if resp is not None:
                 stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
                 stdout.flush()
+
+
+# ---------- HTTP 传输（Streamable HTTP，2026.08.03） ----------
+#
+# 为什么要有这条：闭源前端（Kelivo/Operit 这类）只认 Streamable HTTP，此前用户
+# 只能拿 npm 的 supergateway 把 stdio 桥一层。外部实测撞出来的四个坑全在桥上：
+# ① supergateway 服务端模式**没有任何入站鉴权**——memory_search 读全库、
+#    memory_append 可写入，端口被扫到记忆库就既可读又可写；
+# ② 默认 SSE 输出与客户端的 Streamable HTTP 不匹配（`Transport disconnected`）；
+# ③ 进程僵死（在但端口不通）要 pkill 重启；
+# ④ 常驻只在启动时读一次语料，手动加的 md 静默看不到。
+# 原生实现把四个一起治：鉴权内置且非回环裸跑直接拒绝起动、只说 Streamable HTTP、
+# 少一个常驻进程、语料变化自动重读（_reload_from_disk）。
+# 零依赖不破：http.server 是标准库。TLS 不在这做——闭源前端不认自签证书
+# （两家独立实测），公网仍然要域名 + 反代（Caddy）那条路，反代顺手把 TLS 管了。
+#
+# 规格面（刻意做小，都是规格允许的服务器侧选择）：
+#   POST 单条 JSON-RPC 消息 → application/json 单条响应；通知 → 202 空身；
+#   GET（SSE 长流）→ 405 不提供，本 server 没有服务器主动推送的场景；
+#   DELETE（会话终止）→ 200 空操作，本 server 无会话态、不发 Mcp-Session-Id；
+#   JSON 数组（批量）→ 400（批量已从 2025-06 规格移除）。
+
+_HTTP_BODY_LIMIT = 10 * 1024 * 1024     # 单请求上限：正常一条 tools/call 远小于此
+# 被拒的请求最多吞多少 body 来保住 keep-alive（见 _drain）。超过就作废连接——
+# 声明了超大长度的客户端多半根本没打算发完，等它等于把线程挂死
+_HTTP_DRAIN_LIMIT = 64 * 1024
+_HTTP_DRAIN_TIMEOUT = 5.0
+
+
+def http_bind_guard(host, token):
+    """起动前的两道守卫：token 必须是 ASCII；非回环地址必须有 token。都是拒绝起动。
+
+    **token 非 ASCII 也拒绝**（2026.08.03 外部实测）：HTTP 头是 latin-1，中文口令
+    客户端根本发不出去（`UnicodeEncodeError`），就算发出去 `hmac.compare_digest`
+    对非 ASCII str 直接抛 `TypeError` → 500。而失败形态是**服务看起来起来了、
+    横幅也打了，就是连不上**——用户拿中文当口令是很可能的事，这正是本项目最怕的
+    静默形态，所以在起动这一步就拦掉，跟下面绑定守卫同一个待遇。
+
+    supergateway 那条路的头号坑就是"先跑通再说"地对公网开无鉴权端口——跑通那一刻
+    记忆库已经暴露。这里把它做成出不了门的形态（同 guidance_text 超长拒绝出货的
+    思路：失败要响，不静默）。回环上裸跑放行——本机 proot／反代在前的形态，
+    鉴权在外层。"""
+    if token:
+        try:
+            token.encode("ascii")
+        except UnicodeEncodeError:
+            raise ValueError(
+                "token 只能用 ASCII 字符（字母／数字／符号）：HTTP 头按 latin-1 编码，"
+                "中文之类的口令客户端根本发不出去，而服务照样起得来——失败形态是"
+                "「看起来起来了、就是连不上」。换一串英文数字口令再起。")
+        return
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = host in ("localhost",)
+    if not loopback:
+        raise ValueError(
+            f"拒绝在非回环地址（{host}）上裸跑：没配 token 的 HTTP 端口等于把记忆库"
+            f"公开成既可读又可写。加 --token（或环境变量 MEMORY_HTTP_TOKEN），"
+            f"或绑回 127.0.0.1 由带鉴权的反向代理转发。")
+
+
+def _corpus_signature(corpus_dir):
+    """语料目录的文件级指纹（路径+mtime+大小）。只看 .md——sidecar（.weights.json
+    每次检索都落盘）进指纹的话每个请求都会触发假重读。
+
+    ⚠ glob 到 stat 之间文件可能已被删（并发整理语料），**漏掉它就行、不许抛**
+    （2026.08.03 外部评审：这里抛 FileNotFoundError 会变成 500）——文件没了本身
+    就是一次语料变化，指纹里少一条正好让下一次比较发现它。"""
+    out = []
+    for p in corpus_files(corpus_dir):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        out.append((str(p), st.st_mtime_ns, st.st_size))
+    return tuple(out)
+
+
+def make_http_server(server, host="127.0.0.1", port=8765, token=None):
+    """MemoryServer → 绑好端口的 ThreadingHTTPServer（不启动；.serve_forever() 是
+    调用方的事——selftest 要拿着实例开线程、取真端口、shutdown）。"""
+    http_bind_guard(host, token)
+    lock = threading.Lock()                  # index 的增删改建都不是线程安全的：串行化
+    state = {"sig": _corpus_signature(server.corpus_dir)
+             if (server.corpus_dir and server.loader) else None}
+
+    class _Server(http.server.ThreadingHTTPServer):
+        def handle_error(self, request, client_address):
+            """客户端中途断开不许喷 traceback（跟 log_message 静音同一个理由）。
+
+            实测（2026.08.03 外部评审复验时量的）：客户端发到一半就走人——手机 App
+            切后台、断网的常态——socketserver 默认往 stderr 打完整 Traceback，
+            约 41 行一次。而 --http 的起动横幅也走 stderr，运维盯着终端会以为
+            服务崩了。断连类只吞掉；**真异常保留一行摘要**，不静默成"什么都没发生"。"""
+            exc = sys.exc_info()[1]
+            if isinstance(exc, (ConnectionError, TimeoutError)):
+                return
+            print(f"HTTP 请求处理异常（{client_address[0]}）："
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):           # 默认逐请求刷 stderr，个人部署只是噪声
+            pass
+
+        def _send(self, code, body=b"", ctype="application/json; charset=utf-8",
+                  extra=()):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            for k, v in extra:
+                self.send_header(k, v)
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def _drain(self):
+            """把没读的请求体吞掉，返回是否吞干净了。
+
+            **不吞就是下一个请求必坏**（2026.08.03 外部实测）：HTTP/1.1 默认
+            keep-alive，401 直接返回时残留的 body 会被当成下一个请求的**请求行**
+            解析，于是「先探一次拿 401 → 带 token 重试」这个再普通不过的姿势，
+            第二发收到 400 + HTML 错误页。手机 App 复用连接是常态，而 selftest 里
+            urllib 每次新连接、发 `Connection: close`——**这一格自检天然盖不住，
+            判据必须走裸 socket**（见 18b）。
+
+            ⚠ **吞不动的时候绝不能傻等**（第一版修法自己踩的坑）：413 那格客户端
+            多半根本没打算发完那么多字节，`read(n)` 会把这个线程挂死；chunked、
+            长度不合法同理。所以三种情况直接判连接作废：读不动、大到不值得读、
+            读超时。作废走的是显式 `Connection: close` 响应头，不是只在服务端
+            改个标志——客户端得知道这条连接不能再用了。"""
+            te = self.headers.get("Transfer-Encoding")
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                n = -1
+            if te or n < 0 or n > _HTTP_DRAIN_LIMIT:
+                return False
+            old = self.connection.gettimeout()
+            try:
+                self.connection.settimeout(_HTTP_DRAIN_TIMEOUT)
+                while n > 0:
+                    chunk = self.rfile.read(min(n, 8192))
+                    if not chunk:
+                        return False
+                    n -= len(chunk)
+            except OSError:                  # 超时／对端断了：连接作废，不挂线程
+                return False
+            finally:
+                try:
+                    self.connection.settimeout(old)
+                except OSError:
+                    pass
+            return True
+
+        def _deny(self, code, msg, extra=()):
+            extra = list(extra)
+            if not self._drain():
+                self.close_connection = True
+                extra.append(("Connection", "close"))
+            self._send(code, json.dumps({"error": msg}, ensure_ascii=False)
+                       .encode("utf-8"), extra=extra)
+
+        def _gate(self):
+            """路径 + 鉴权 + Origin 三道闸。过了返回 True。"""
+            # 路径校验（2026.08.03 外部评审：文档教人填 /mcp，实际任何路径都收，
+            # 无害但跟文档不一致）。放行根路径是给"填地址时漏了 /mcp"留的余地——
+            # 那是最常见的手滑，收下比回 404 让人排查半天强
+            if urllib.parse.urlsplit(self.path).path.rstrip("/") not in ("", "/mcp"):
+                self._deny(404, f"没有这个端点：{self.path}——本 server 只在 /mcp 上收")
+                return False
+            if token:
+                got = self.headers.get("Authorization") or ""
+                if not hmac.compare_digest(got, f"Bearer {token}"):
+                    self._deny(401, "缺少或错误的 Bearer token",
+                               extra=[("WWW-Authenticate", "Bearer")])
+                    return False
+            # Origin 校验（规格的 DNS rebinding 防线）：App 客户端不发 Origin，
+            # 发了且不是本机的只会是浏览器页面在拿本地端口当跳板
+            origin = self.headers.get("Origin")
+            if origin:
+                h = (urllib.parse.urlsplit(origin).hostname or "").lower()
+                if h not in ("localhost", "127.0.0.1", "::1"):
+                    self._deny(403, f"Origin 不被信任：{origin}")
+                    return False
+            return True
+
+        def do_GET(self):
+            if not self._gate():
+                return
+            self._deny(405, "本 server 不提供 SSE 长流，请用 POST（Streamable HTTP）",
+                       extra=[("Allow", "POST, DELETE")])
+
+        def do_DELETE(self):
+            if not self._gate():
+                return
+            self._send(200)                  # 无会话态，终止是空操作
+
+        def do_POST(self):
+            if not self._gate():
+                return
+            # chunked 明确不支持，**且报错要指对方向**（2026.08.03 外部实测）：
+            # 原先不带 Content-Length 时 length 取 0、读到空串，报的是
+            # 「请求体不是合法的 UTF-8 JSON」——把人往"我的 JSON 写错了"引，
+            # 而真因是传输编码不匹配。这跟 supergateway 时代那个「默认 SSE 与
+            # 客户端不匹配」是同形物：传输层没对上，报错还指错地方。
+            # 501 是规格给这种情况的码（服务器不支持该功能）。
+            if self.headers.get("Transfer-Encoding"):
+                return self._deny(
+                    501, f"不支持 Transfer-Encoding: "
+                         f"{self.headers.get('Transfer-Encoding')}——本 server 只收带 "
+                         f"Content-Length 的整条 JSON-RPC 消息。这是传输编码不匹配，"
+                         f"不是你的 JSON 写错了；客户端若有「分块传输/流式上传」开关，"
+                         f"关掉即可。")
+            if self.headers.get("Content-Length") is None:
+                return self._deny(411, "缺 Content-Length：本 server 只收带长度的整条消息")
+            try:
+                length = int(self.headers.get("Content-Length"))
+                if length < 0:
+                    raise ValueError
+            except ValueError:
+                return self._deny(400, "Content-Length 不合法")
+            if length > _HTTP_BODY_LIMIT:
+                return self._deny(413, "请求体超限")
+            try:
+                msg = json.loads(self.rfile.read(length).decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return self._deny(400, "请求体不是合法的 UTF-8 JSON")
+            if isinstance(msg, list):
+                return self._deny(400, "不支持 JSON-RPC 批量（2025-06 规格已移除）")
+            if not isinstance(msg, dict):
+                return self._deny(400, "请求体要是一条 JSON-RPC 消息对象")
+            with lock:
+                # 常驻形态的重读：语料目录文件级变化（手动上传/删除 md）→ 从盘重建。
+                # ⚠ **指纹要在 handle 之后重算、而且只认自己写的那次变化**
+                # （2026.08.03 外部评审指出的竞态）：原先 handle 后无条件刷新指纹，
+                # 于是「一次 memory_append 与用户手动上传落在同一个请求窗口」时，
+                # 那次上传会被自己的刷新永久吞掉、再也不触发重读——正好是这个特性
+                # 要治的静默形态。改法：handle 前后各取一次，**只把 server 自己写回
+                # 造成的差异并进基线**（after 与 before 的差集里属于自己写回的部分
+                # 无从区分，所以退一步取更安全的一侧：若 handle 期间指纹又变了，
+                # 保留 before，让下一个请求去发现并重读——宁可多重读一次，
+                # 不可漏掉一次）。
+                if state["sig"] is not None:
+                    sig = _corpus_signature(server.corpus_dir)
+                    if sig != state["sig"]:
+                        server._reload_from_disk()
+                        state["sig"] = sig
+                resp = server.handle(msg)
+                if state["sig"] is not None and server.written_paths:
+                    # **只折进 server 自己写的那几个文件**，其余差异留着让下一个
+                    # 请求去发现——手动上传就落在"其余"里，不会被自己的刷新吞掉。
+                    # 顺带：只读请求（memory_search 是绝大多数）written_paths 是空的，
+                    # 这里整个跳过，不再每个请求 stat 全库两遍
+                    base = {p: (m, s) for p, m, s in state["sig"]}
+                    for p, m, s in _corpus_signature(server.corpus_dir):
+                        if p in server.written_paths:
+                            base[p] = (m, s)
+                    state["sig"] = tuple(sorted((p, m, s) for p, (m, s) in base.items()))
+                    server.written_paths = set()
+            if resp is None:
+                self._send(202)              # 通知：202 空身（规格）
+            else:
+                self._send(200, json.dumps(resp, ensure_ascii=False).encode("utf-8"))
+
+    return _Server((host, port), _Handler)
 
 
 # ---------- 部署体检（任务卡"部署体检命令"） ----------
@@ -1205,11 +1512,247 @@ def _selftest():
         code, out = run_doctor(td)
         assert code != 0 and "--corpus" in out, f"缺 --corpus 要被拦下：{code} {out}"
 
-    print("selftest ok（17项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层 / "
+    # 18.【HTTP 传输·真端口往返】（2026.08.03「连不上 MCP 只好上 supergateway」
+    #     那单）：supergateway 的四个实测坑逐个变成这里的一格——无鉴权（→401 两格
+    #     ＋非回环裸跑拒绝）、传输不匹配（→握手/工具表/UTF-8 真 HTTP 往返）、
+    #     常驻不重读语料（→手动放 md 下一个请求就查到）；外加 Origin 防线、
+    #     通知 202、GET 405、批量 400 三条规格面。
+    import urllib.request
+    import urllib.error
+    try:
+        http_bind_guard("0.0.0.0", None)
+        assert False, "非回环 + 无 token 必须拒绝起动——跑通的那一刻记忆库就暴露了"
+    except ValueError as e18:
+        assert "token" in str(e18), "拒绝的报错要指向修法（--token / 绑回环）"
+    http_bind_guard("127.0.0.1", None)       # 回环裸跑放行：反代在前的形态
+    http_bind_guard("0.0.0.0", "s3cret")     # 配了 token 的公开绑定放行
+    with tempfile.TemporaryDirectory() as td:
+        (_P(td) / "timeline").mkdir()
+        (_P(td) / "timeline" / "window_01_2026-08-01.md").write_text(
+            "# 第1个窗口 · 2026-08-01\n\n## 2026-08-01 记\n试养了一盆绿萝。\n"
+            "当下状态：长势正常。\n", encoding="utf-8")
+        loader18 = lambda: load_corpus(td)
+        srv18 = MemoryServer(index=loader18(), thread_store=ThreadStore(),
+                             corpus_dir=td,
+                             retractions_path=_P(td) / ".retractions.json",
+                             loader=loader18)
+        httpd = make_http_server(srv18, host="127.0.0.1", port=0, token="s3cret")
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        base18 = f"http://127.0.0.1:{httpd.server_address[1]}/mcp"
+
+        def post18(payload, tok="s3cret", origin=None, method="POST"):
+            req = urllib.request.Request(
+                base18, data=(json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                              if payload is not None else None), method=method)
+            if tok:
+                req.add_header("Authorization", f"Bearer {tok}")
+            if origin:
+                req.add_header("Origin", origin)
+            req.add_header("Content-Type", "application/json")
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    return r.status, r.read().decode("utf-8")
+            except urllib.error.HTTPError as e:
+                return e.code, e.read().decode("utf-8")
+
+        lst18 = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        #     鉴权两格（变异：把 _gate 的 token 检查删掉 → 这两条红）
+        assert post18(lst18, tok=None)[0] == 401, "无 token 必须 401"
+        assert post18(lst18, tok="wrong")[0] == 401, "错 token 必须 401"
+        #     Origin 防线（DNS rebinding：浏览器页面拿本地端口当跳板）
+        assert post18(lst18, origin="https://evil.example")[0] == 403
+        #     握手 → 工具表 → 通知 202
+        code18, body18 = post18({"jsonrpc": "2.0", "id": 2, "method": "initialize",
+                                 "params": {}})
+        assert code18 == 200 and "protocolVersion" in body18
+        code18, body18 = post18(lst18)
+        assert code18 == 200 and "memory_search" in body18
+        code18, body18 = post18({"jsonrpc": "2.0",
+                                 "method": "notifications/initialized"})
+        assert code18 == 202 and not body18, "通知回 202 空身，不回 JSON-RPC 响应"
+        #     中文 UTF-8 真 HTTP 往返：写回 → 当场检索命中（同 stdio 第 9 项的病灶）
+        code18, body18 = post18({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                                 "params": {"name": "memory_append",
+                                            "arguments": {"text": "绿萝换了大一号的盆。",
+                                                          "current_state": "适应中。"}}})
+        assert code18 == 200 and "已写进" in body18
+        code18, body18 = post18({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                                 "params": {"name": "memory_search",
+                                            "arguments": {"query": "绿萝换盆"}}})
+        assert code18 == 200 and "大一号的盆" in body18, \
+            f"中文该原样穿过 HTTP 并命中：{body18}"
+        #     常驻自动重读（变异：把 do_POST 里的指纹检查删掉 → 这条红）：
+        #     手动上传 md 是 supergateway 时代实测过的静默坑——常驻只在启动读一次，
+        #     新语料一条都查不到且不报错
+        (_P(td) / "timeline" / "window_09_2026-08-02.md").write_text(
+            "# 第9个窗口 · 2026-08-02\n\n## 2026-08-02 记\n手动上传：入手了一台"
+            "折叠望远镜。\n当下状态：还没开箱。\n", encoding="utf-8")
+        code18, body18 = post18({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                                 "params": {"name": "memory_search",
+                                            "arguments": {"query": "望远镜"}}})
+        assert code18 == 200 and "折叠望远镜" in body18, \
+            "语料目录手动加的 md 必须下一个请求就查得到——不重读是静默的"
+        #     规格面三格：GET 无长流、DELETE 空操作、批量已移除
+        assert post18(None, method="GET")[0] == 405
+        assert post18(None, method="DELETE")[0] == 200
+        code18, body18 = post18([lst18])
+        assert code18 == 400 and "批量" in body18
+        #     路径：文档教人填 /mcp，别的端点要明确 404（根路径放行是手滑余地）
+        assert post18(lst18)[0] == 200
+        req_bad = urllib.request.Request(
+            f"http://127.0.0.1:{httpd.server_address[1]}/nope",
+            data=json.dumps(lst18).encode(), method="POST")
+        req_bad.add_header("Authorization", "Bearer s3cret")
+        try:
+            urllib.request.urlopen(req_bad, timeout=10)
+            assert False, "未知端点要 404"
+        except urllib.error.HTTPError as e:
+            assert e.code == 404
+
+        # 18b.【keep-alive 下被拒的请求必须吞掉 body·变异靶心】（2026.08.03 外部实测）
+        #     ⚠ **这一格只能走裸 socket**：上面 urllib 每次新连接、发 Connection: close，
+        #     所以它天然盖不住——而手机 App 复用连接是常态，「先探一次拿 401 →
+        #     带 token 重试」这个最普通的姿势就撞这个坑。不吞 body 的话残留会被
+        #     当成下一个请求的**请求行**，第二发收到 400 + HTML 错误页。
+        #     变异：把 _deny 里的 _drain() 去掉 → 这条红
+        import socket as _socket
+        raw = json.dumps(lst18).encode()
+
+        def _recv_http(sock):
+            """收完整一条响应——**必须按 Content-Length 收满**：单发 recv 常常只
+            拿到头部，body 还在路上，据此断言等于随机红绿。"""
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                d = sock.recv(65536)
+                if not d:
+                    return buf.decode("utf-8", "replace")
+                buf += d
+            head, _, body = buf.partition(b"\r\n\r\n")
+            want = 0
+            for ln in head.decode("latin-1").split("\r\n")[1:]:
+                if ln.lower().startswith("content-length:"):
+                    want = int(ln.split(":", 1)[1])
+            while len(body) < want:
+                d = sock.recv(65536)
+                if not d:
+                    break
+                body += d
+            return (head + b"\r\n\r\n" + body).decode("utf-8", "replace")
+
+        def _raw_post(sock, tok=None, extra_hdr=""):
+            h = (f"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                 f"Content-Length: {len(raw)}\r\n")
+            if tok:
+                h += f"Authorization: Bearer {tok}\r\n"
+            sock.sendall((h + extra_hdr + "\r\n").encode() + raw)
+            return _recv_http(sock)
+
+        sk = _socket.create_connection(("127.0.0.1", httpd.server_address[1]))
+        sk.settimeout(10)
+        first = _raw_post(sk)                       # 无 token → 401
+        assert "401" in first.split("\r\n")[0], first.split("\r\n")[0]
+        second = _raw_post(sk, tok="s3cret")        # 同一条连接重试 → 必须是 200
+        assert "200" in second.split("\r\n")[0], \
+            f"401 之后同连接重试必须正常——被拒的请求没吞掉 body：{second.splitlines()[0]}"
+        assert "memory_search" in second, "重试那发要真的拿到工具表"
+        sk.close()
+        #     413 分支同形（超限也要吞）：谎报一个超大 Content-Length 但不发那么多，
+        #     server 该在读之前就拒掉，且连接不许被污染
+        sk = _socket.create_connection(("127.0.0.1", httpd.server_address[1]))
+        sk.settimeout(10)
+        sk.sendall((f"POST /mcp HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer s3cret\r\n"
+                    f"Content-Length: {_HTTP_BODY_LIMIT + 1}\r\n\r\n").encode())
+        assert "413" in sk.recv(65536).decode("utf-8", "replace").split("\r\n")[0]
+        sk.close()
+
+        # 18c.【chunked 明确不支持，且报错指对方向·变异靶心】（2026.08.03 外部实测）
+        #     原先走到"请求体不是合法的 UTF-8 JSON"，把人往「我 JSON 写错了」引，
+        #     真因是传输编码不匹配——跟 supergateway 时代「默认 SSE 与客户端不匹配」
+        #     同形物。变异：把 Transfer-Encoding 那一支删掉 → 这条红
+        sk = _socket.create_connection(("127.0.0.1", httpd.server_address[1]))
+        sk.settimeout(10)
+        sk.sendall((f"POST /mcp HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer s3cret\r\n"
+                    f"Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    ).encode() + f"{len(raw):x}\r\n".encode() + raw + b"\r\n0\r\n\r\n")
+        ck = sk.recv(65536).decode("utf-8", "replace")
+        assert "501" in ck.split("\r\n")[0], f"chunked 要回 501 不是 400：{ck.splitlines()[0]}"
+        assert "Transfer-Encoding" in ck and "JSON 写错" in ck, \
+            "报错必须指向传输编码，并明说不是 JSON 的问题——指错方向就是这条的病灶"
+        sk.close()
+        httpd.shutdown()
+
+    # 18d.【非 ASCII token 拒绝起动·变异靶心】（2026.08.03 外部实测）：中文口令
+    #     server 起得来、横幅照打，但 HTTP 头是 latin-1，客户端发不出去；
+    #     compare_digest 对非 ASCII str 直接抛 TypeError → 500。失败形态是
+    #     「看起来起来了、就是连不上」，所以在起动这一步拦。
+    #     变异：把 token.encode("ascii") 那一支删掉 → 这条红
+    try:
+        http_bind_guard("127.0.0.1", "口令abc")
+        assert False, "非 ASCII token 必须拒绝起动——不然失败形态是静默的"
+    except ValueError as e18b:
+        assert "ASCII" in str(e18b), "报错要说清是 ASCII 的问题并给修法"
+    http_bind_guard("127.0.0.1", "s3cret-2026")     # ASCII 照常放行
+
+    # 18e.【自动重读不许吞掉同窗口的手动上传·变异靶心】（2026.08.03 外部评审的竞态）：
+    #     原先 handle 之后无条件重算指纹，于是一次 memory_append 与用户手动上传
+    #     落在同一个请求窗口时，那次上传被自己的刷新吞掉、**再也不触发重读**——
+    #     正好是这个特性要治的静默形态。改法是只把 server 自己写过的路径折进基线。
+    #     变异：把 written_paths 那套换回 state["sig"] = _corpus_signature(...) → 这条红
+    with tempfile.TemporaryDirectory() as td:
+        (_P(td) / "timeline").mkdir()
+        (_P(td) / "timeline" / "window_01_2026-08-01.md").write_text(
+            "# 第1个窗口 · 2026-08-01\n\n## 2026-08-01 记\n养了绿萝。\n"
+            "当下状态：正常。\n", encoding="utf-8")
+        loader18e = lambda: load_corpus(td)
+        srv18e = MemoryServer(index=loader18e(), thread_store=ThreadStore(),
+                              corpus_dir=td, loader=loader18e)
+        httpd18e = make_http_server(srv18e, host="127.0.0.1", port=0, token="s3cret")
+        threading.Thread(target=httpd18e.serve_forever, daemon=True).start()
+        b18e = f"http://127.0.0.1:{httpd18e.server_address[1]}/mcp"
+
+        def call18e(payload):
+            rq = urllib.request.Request(b18e, data=json.dumps(payload).encode(),
+                                        method="POST")
+            rq.add_header("Authorization", "Bearer s3cret")
+            with urllib.request.urlopen(rq, timeout=10) as r:
+                return r.read().decode("utf-8")
+
+        # ⚠ **上传必须落在 handle 期间**，这才是竞态窗口：写在请求之前的话，
+        #   do_POST 的前置指纹检查当场就逮住它，反而测不到这一格（第一版夹具
+        #   就这么造错了，变异不红——夹具错了跟钉子失效长得一模一样）。
+        real_handle, done18e = srv18e.handle, []
+
+        def handle_then_upload(msg, now=None):
+            r = real_handle(msg, now=now)
+            if not done18e:                  # 只插一次
+                done18e.append(1)
+                (_P(td) / "timeline" / "window_09_2026-08-02.md").write_text(
+                    "# 第9个窗口 · 2026-08-02\n\n## 2026-08-02 记\n"
+                    "手动上传：买了折叠望远镜。\n当下状态：还没开箱。\n",
+                    encoding="utf-8")
+            return r
+
+        srv18e.handle = handle_then_upload
+        call18e({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                 "params": {"name": "memory_append",
+                            "arguments": {"text": "顺手记一条别的。",
+                                          "current_state": "无。"}}})
+        srv18e.handle = real_handle
+        got18e = call18e({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                          "params": {"name": "memory_search",
+                                     "arguments": {"query": "望远镜"}}})
+        assert "折叠望远镜" in got18e, \
+            "同窗口里的手动上传不许被自己的写回吞掉——吞掉就再也不重读了（静默）"
+        httpd18e.shutdown()
+
+    print("selftest ok（18项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层 / "
           "完整链路 / stdio / UTF-8 / 写回当场可查 / 用进撑过重启 / "
           "无可靠命中明确说 / 撤回更正闭环 / 缺失率标注接线 / 实体标注接线 / "
           "部署体检只读 / 部署体检走真进程（相对路径解析开、空语料非零退出、"
-          "每句一个 `##` 的导出要报切块警告））")
+          "每句一个 `##` 的导出要报切块警告）/ HTTP 传输真端口往返（鉴权 401、"
+          "非回环裸跑拒绝、非 ASCII token 拒绝起动、Origin 403、路径 404、通知 202、"
+          "GET 405、批量 400、超限 413、chunked 501、keep-alive 下被拒后同连接重试、"
+          "UTF-8 写回即查、语料变化自动重读、同窗口手动上传不被写回吞掉））")
 
 
 if __name__ == "__main__":
@@ -1225,6 +1768,13 @@ if __name__ == "__main__":
                     help="embedding 提供方：local（默认，需 fastembed）/ local:<模型> / "
                          "cloud（云端 HTTP，endpoint 与模型走 MEMORY_EMBED_* 环境变量，"
                          "key 只从环境变量读；**语料会发到那家服务商**）")
+    ap.add_argument("--http", metavar="[HOST:]PORT",
+                    help="改走 Streamable HTTP（省略 HOST 默认 127.0.0.1）——给只认 "
+                         "HTTP 的客户端（Kelivo/Operit 这类）直连用，不再需要 "
+                         "supergateway 桥。非回环地址必须配 token，否则拒绝起动")
+    ap.add_argument("--token",
+                    help="HTTP 传输的 Bearer token（也可用环境变量 MEMORY_HTTP_TOKEN；"
+                         "客户端侧填进 bearerToken/Authorization 头）")
     args = ap.parse_args()
     if args.selftest:
         _selftest()
@@ -1239,13 +1789,30 @@ if __name__ == "__main__":
         # 权重文件放语料目录下，起点号不带 .md——不会被 load_corpus 当语料吃进去
         # 块向量缓存（.embed_cache.json）同理，由 load_corpus 默认落在这里：
         # 没有它，云端档每次起服务都要把全库重算一遍
-        MemoryServer(index=load_corpus(args.corpus, embed=args.embed,
-                                       provider=(resolve_provider(args.embed_provider)
-                                                 if args.embed else None)),
-                     thread_store=ThreadStore(args.threads),
-                     corpus_dir=args.corpus,
-                     weights_path=Path(args.corpus) / ".weights.json",
-                     retractions_path=Path(args.corpus) / ".retractions.json",
-                     entities_path=Path(args.corpus) / ".entities.json").serve_stdio()
+        loader = lambda: load_corpus(args.corpus, embed=args.embed,
+                                     provider=(resolve_provider(args.embed_provider)
+                                               if args.embed else None))
+        srv = MemoryServer(index=loader(),
+                           thread_store=ThreadStore(args.threads),
+                           corpus_dir=args.corpus,
+                           weights_path=Path(args.corpus) / ".weights.json",
+                           retractions_path=Path(args.corpus) / ".retractions.json",
+                           entities_path=Path(args.corpus) / ".entities.json",
+                           loader=loader)
+        if args.http:
+            host, _, port = args.http.rpartition(":")
+            host = host or "127.0.0.1"
+            token = args.token or os.environ.get("MEMORY_HTTP_TOKEN") or None
+            try:
+                httpd = make_http_server(srv, host=host, port=int(port), token=token)
+            except ValueError as e:
+                ap.error(str(e))
+            # 起动横幅进 stderr（stdio 传输里 stdout 是协议流，这里沿用习惯）
+            print(f"Streamable HTTP 服务在 http://{host}:{httpd.server_address[1]} "
+                  f"（鉴权：{'Bearer token' if token else '无——仅限回环+外层反代'}；"
+                  f"语料变化自动重读）", file=sys.stderr)
+            httpd.serve_forever()
+        else:
+            srv.serve_stdio()
     else:
         ap.print_help()

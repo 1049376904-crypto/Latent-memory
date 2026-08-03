@@ -15,7 +15,7 @@
 成本要点：**查询向量缓存**。扫 N 个 floor 档，每档都跑真实 retrieve()——不缓存的话
 同一条查询要向服务商要 N 次向量，复现成本高一个量级。这里把 provider.embed 包一层
 按 (文本, is_query) 记忆化：块向量走 VectorCache（建库一次），查询向量每条只要一次，
-之后 20 个档全是本地余弦。真实路径一步没绕（判据不接受脚本自拼 rank_lists 的捷径）。
+之后 21 个档全是本地余弦。真实路径一步没绕（判据不接受脚本自拼 rank_lists 的捷径）。
 
 局限（如实）：absent 侧若在你的语料上被词面闸先漏（我们两份语料都是），floor 高低
 不改变 absent 空手率——此时「编造燃料」才是 absent 侧的有效读数，空手率那列只是
@@ -93,7 +93,7 @@ def run_floor(idx: MemoryIndex, floor, present, absent_valid, topn=5):
     for q, _ in absent_valid:
         if floor is not None:
             vs = idx._vector_scores(q)
-            fuel += sum(1 for v in vs if v is not None and v > floor)
+            fuel += sum(1 for v in vs if v > floor)  # embed 模式下无 None,不设死防御
         if not idx.retrieve(q, topN=topn):
             empty += 1
     return hits, fuel, empty

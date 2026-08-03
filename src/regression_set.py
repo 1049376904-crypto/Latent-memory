@@ -779,6 +779,9 @@ def report(embed=False, provider_spec=None):
           "（跑的是真实 retrieve 路径，不是脚本自拼）")
     print("  ⚠ 只消融排序，消融不掉候选资格：候选闸先于 routes 算，"
           "所以词面路的贡献这张表天然看不见")
+    print("  ⚠ 所以「关掉 bm25 四类分数一个没变」**不能读成「词面路独立贡献是 0」**"
+          "（2026.08.03 外部标定方就是这么读的，还据此说跟 README 对不上）——"
+          "那句话这张表证不了，量它要拆 lexical_admit，不是关 routes")
     full = {"bm25", "vector", "graph", "weight"}
     for off in ("bm25", "vector", "graph", "weight"):
         s = score(mk(), routes=full - {off})

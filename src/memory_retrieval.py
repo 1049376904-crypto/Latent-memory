@@ -1470,12 +1470,17 @@ def _selftest(embed=False):
     #      "门槛跟着到了不该用它的模型上"。后者更危险——0.45 是 bge-small-zh-v1.5
     #      的余弦标度，换个模型标度就变了，照抄不会报错、只会让"库里没有就说没有"
     #      无声失灵（那正是通往编造的那条流水线）。
+    #      ⚠ 夹具用 `UNCALIBRATED_FIXTURE_MODEL`（一个永远不会进标定表的假模型名），
+    #      不用真实模型名：bge-m3 在这儿当过一阵夹具，2026.08.03 它一被标定（外部
+    #      PR #4，0.60），这条和下面整个索引的靶心当场全红。**修法是换夹具名，不是
+    #      删断言**——它们守的是"未标定绝不退回 0.45"这个最坏方向。
     from embedding_provider import (HTTPCloudProvider, LocalProvider,
-                                    _fake_transport, get_hit_floor)
+                                    _fake_transport, get_hit_floor,
+                                    UNCALIBRATED_FIXTURE_MODEL)
     _env = {"MEMORY_EMBED_API_KEY": "k"}
-    uncal = HTTPCloudProvider("https://api.example.com/v1/embeddings", "BAAI/bge-m3",
+    uncal = HTTPCloudProvider("https://api.example.com/v1/embeddings", UNCALIBRATED_FIXTURE_MODEL,
                               transport=_fake_transport(), env=_env)
-    assert get_hit_floor("BAAI/bge-m3") is None, "这条断言的前提：bge-m3 还没标定过"
+    assert get_hit_floor(UNCALIBRATED_FIXTURE_MODEL) is None, "这条断言的前提：这个夹具模型没标定过"
     idx_uncal = MemoryIndex(embed=True, provider=uncal)
     assert idx_uncal.vec_floor is None and not idx_uncal.vec_calibrated, \
         "未标定的模型必须如实是 None，不许退回 0.45"

@@ -59,18 +59,41 @@ BGE_ZH_QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章：
 # 表里没有 = 未标定，get_hit_floor 返回 None，绝不退回别的模型的数字。
 #   bge-small-zh-v1.5：0.45，2026.08.01 在 602 块真实语料上复核过（依据、局限和
 #     "它其实管不住 BM25 那一路"这件事，写在 memory_retrieval.EMBED_HIT_FLOOR 那段）。
-#   bge-m3：0.60，2026.08.03 外部标定（`lu7899112-source`，1144 块真实中文语料）。
-#     方法：真实 retrieve 路径上把 floor 从 0.30 扫到 0.70，同时量 gold=1 的 20 题
-#     命中和「编造题下向量路独立放行的块数」两条曲线。0.58–0.62 是稳定平台
-#     （命中 17–18/20，比不开闸 +1~2；放行趋零），取 0.60 站平台中间。
-#     依据与局限：单一语料（中文原子记忆）；absent 那一侧在该语料上被词面闸
-#     先漏（0/9），floor 高低对它无影响，故这次标定管住的是"放行垃圾的量"，
-#     管不住词面路——和 bge-small-zh 那条"管不住 BM25 一路"的局限同构。
-#     另证：bge-m3 标度确实远高于 bge-small-zh（0.60 vs 0.45），照抄必翻车。
+#   bge-m3（云端档常见选择）：0.60，**外部标定，我们未复现**——
+#     出处：外部贡献者「星迟 & Ember」，公开仓库 PR #4，1144 块真实中文语料。
+#     方法：走**真实 retrieve() 路径**（不是脚本拼 rank_lists）把 floor 从 0.30
+#       扫到 0.70，**同时量两条曲线**——gold=1 的 20 题命中，和"编造题下向量路
+#       独立放行的块数"（后者就是"floor 太松时向量路给编造递多少材料"）。
+#     他们自报的两条局限照原话收：**单一语料形态**（中文原子记忆，块中位较短），
+#       别的语料形态请复测再信；**absent 那一侧在他们语料上是被词面闸先漏的
+#       （0/9，与 floor 无关）**——所以这次标定管住的是向量路，词面路仍敞着
+#       （与 bge-small-zh 那条"管不住 BM25 一路"的已知局限同构）。
+#     **选点规则（这条比数字值钱）**：两个候选点的测量值在噪声内等价时，
+#       取**两个方向都退化得体**的那个。0.62 与 0.58 同属平台边缘——0.58 的 18/20
+#       靠某个金标块压线，0.62 的上邻 0.64 已进衰退区——0.60 是唯一双向都有
+#       一格余量的点。⚠ **我们标 0.45 那次没有这条判据**：只量了 present 一侧，
+#       平台边缘和平台中间在我们眼里长得一样。
 HIT_FLOOR_BY_MODEL = {
     "BAAI/bge-small-zh-v1.5": 0.45,
     "BAAI/bge-m3": 0.60,
 }
+
+# **第三类口径：外部标定**。模型 → 标定出处（人话，会原样进 describe() 给用户看）。
+# 表里有 = 这个数是别人量的、我们没复现；表里没有 = 我们自己量的。先例口径是
+# **收但标着，不是收了就当自己量的**——出处藏在用户看不见的注释里等于没标。
+# ⚠ **出处只影响那句话怎么说，不影响这个数怎么用**，所以它单独一张表，不把
+# HIT_FLOOR_BY_MODEL 的值改成元组／字典带出处：`get_hit_floor()` 必须继续返回
+# 纯 float——memory_retrieval 那条向量路判据直接拿它比大小，改结构要动所有调用方。
+# 顺带一个好处：将来我们自己复核过，**从这张表里删一行**就升级成「已标定」，
+# 数一个字都不用改。
+EXTERNAL_CALIBRATED = {
+    "BAAI/bge-m3": "外部贡献者 星迟 & Ember，1144 块中文语料，PR #4",
+}
+
+# 自检夹具：一个**永远不会进标定表**的模型名，专门用来守"未标定绝不退回 0.45"
+# 这个最坏方向。⚠ 别再拿真实模型名当这个夹具——bge-m3 当了一阵，2026.08.03 它
+# 一被标定，两个文件里的夹具当场全红。名字取成明显虚构的，免得有人以为它能跑。
+UNCALIBRATED_FIXTURE_MODEL = "example-org/uncalibrated-test-embed"
 
 # 云端批量大小：一次请求塞多少块。经验值——足够摊薄往返开销，又不至于撞上各家的
 # 请求体上限。建库时才会用到批量，查询永远是 1 条。
@@ -131,13 +154,23 @@ def get_hit_floor(model, env=None):
     return HIT_FLOOR_BY_MODEL.get(model)
 
 
-def _floor_note(floor, env=None):
-    """describe() 里那句门槛说明。**用户自己设的覆盖值要标出来是他设的**——
-    出了偏差那是他的标定，不是我们标定表里的数，两件事不能混着说。"""
+def _floor_note(floor, env=None, model=None):
+    """describe() 里那句门槛说明。**三类分开说，不许混**：
+
+    - **用户自己设的覆盖值**：标明是他设的——出了偏差那是他的标定，不是我们表里的数；
+    - **外部标定**（`EXTERNAL_CALIBRATED`）：点名出处、并写明我们未复现。数字功能上
+      照用、floor 真生效，只在口径上跟"我们量的"分开；
+    - 剩下的才是**我们自己量过**的那一类。
+
+    第二类是 2026.08.03 新加的（收外部 PR #4 的 bge-m3 标定）：**收但标着，不是收了
+    就当自己量的**。出处必须落在用户看得见的这句话里——藏在注释里等于没标。"""
     if floor is None:
         return "命中门槛**未标定**"
     if hit_floor_override(env) is not None:
         return f"命中门槛 {floor}（**你自己设的覆盖值**，不是我们量的）"
+    source = EXTERNAL_CALIBRATED.get(model)
+    if source:
+        return f"命中门槛 {floor}（**外部标定**：{source}；我们未复现）"
     return f"命中门槛 {floor}（已标定）"
 
 
@@ -206,7 +239,7 @@ class LocalProvider(EmbeddingProvider):
     def describe(self):
         prefix = "加 bge 中文指令前缀" if self.query_prefix else "不加 query 前缀"
         return (f"本地模型 {self.model}（fastembed / 本地 CPU）；"
-                f"语料不出本机；{_floor_note(self.hit_floor())}；{prefix}")
+                f"语料不出本机；{_floor_note(self.hit_floor(), model=self.model)}；{prefix}")
 
 
 class HTTPCloudProvider(EmbeddingProvider):
@@ -283,7 +316,7 @@ class HTTPCloudProvider(EmbeddingProvider):
         from urllib.parse import urlparse
         host = urlparse(self.endpoint).netloc or self.endpoint
         floor = self.hit_floor()
-        cal = _floor_note(floor, self._env)
+        cal = _floor_note(floor, self._env, model=self.model)
         prefix = "加 bge 中文指令前缀" if self.query_prefix else "不加 query 前缀"
         return (f"云端服务 {host} 的 {self.model}；"
                 f"**查询和被检索的内容都会发到这家服务商**；"
@@ -409,11 +442,13 @@ def _selftest():
 
     # 1.【key 只走环境变量，且不许漏进任何产出】——这条是纪律不是优化，所以断言
     #    要覆盖所有会被别人看到的出口：id / describe / 缓存文件。
+    #    ⚠ 这里的模型名兼作第 5 条的**未标定夹具**，所以用 UNCALIBRATED_FIXTURE_MODEL
+    #    而不是某个真实模型名——真实模型名随时会被标定，那天这条就成假红了。
     env = {ENV_ENDPOINT: "https://api.example.com/v1/embeddings",
-           ENV_MODEL: "BAAI/bge-m3", "MEMORY_EMBED_API_KEY": "sk-绝密-不该出现"}
+           ENV_MODEL: UNCALIBRATED_FIXTURE_MODEL, "MEMORY_EMBED_API_KEY": "sk-绝密-不该出现"}
     tr = _fake_transport()
     p = resolve_provider("cloud", env=env, transport=tr)
-    assert isinstance(p, HTTPCloudProvider) and p.model == "BAAI/bge-m3"
+    assert isinstance(p, HTTPCloudProvider) and p.model == UNCALIBRATED_FIXTURE_MODEL
     assert "sk-绝密" not in p.id and "sk-绝密" not in p.describe(), "key 漏进了 id/describe"
     assert p.key_env == DEFAULT_KEY_ENV
 
@@ -434,7 +469,7 @@ def _selftest():
     v_single = p.embed([texts[5]])[0]
     assert max(abs(a - b) for a, b in zip(v_single, vecs[5])) < 1e-9, "分批把顺序弄乱了"
 
-    # 4.【query 前缀按模型走】：bge-m3 不加（官方说不需要），bge-zh 要加
+    # 4.【query 前缀按模型走】：认不出来的模型不加（bge-m3 官方也说不需要），bge-zh 要加
     assert resolve_provider("cloud", env=env, transport=tr).query_prefix == ""
     assert LocalProvider(DEFAULT_LOCAL_MODEL).query_prefix == BGE_ZH_QUERY_PREFIX
     assert query_prefix_for("BAAI/bge-m3") == ""
@@ -446,7 +481,7 @@ def _selftest():
     # 5.【门槛表是标定表不是默认值表】：没量过的模型必须是 None。
     #    这条是本任务卡的硬要求——照抄 0.45 会让"库里没有就说没有"无声失灵。
     assert get_hit_floor(DEFAULT_LOCAL_MODEL) == 0.45
-    assert get_hit_floor("BAAI/bge-m3") is None, "未标定的模型不许有门槛数字"
+    assert get_hit_floor(UNCALIBRATED_FIXTURE_MODEL) is None, "未标定的模型不许有门槛数字"
     assert p.hit_floor() is None and "未标定" in p.describe()
 
     # 6.【缓存：建库算一次，第二次起服务一条都不重算】
@@ -525,20 +560,47 @@ def _selftest():
     # 10.【采纳自外部 PR #1：门槛覆盖口，但设歪了要当没设】
     #     覆盖口是给"自己量过"的人开的。**非法值绝不能悄悄变成 0**——门槛为 0
     #     等于门槛不存在，而那是这条最坏的失效方向（"库里没有就说没有"当场归零）。
-    assert get_hit_floor("BAAI/bge-m3", env={}) is None, "没设覆盖时，未标定模型仍该是 None"
-    assert get_hit_floor("BAAI/bge-m3", env={ENV_HIT_FLOOR: "0.62"}) == 0.62, \
+    assert get_hit_floor(UNCALIBRATED_FIXTURE_MODEL, env={}) is None, "没设覆盖时，未标定模型仍该是 None"
+    assert get_hit_floor(UNCALIBRATED_FIXTURE_MODEL, env={ENV_HIT_FLOOR: "0.62"}) == 0.62, \
         "自己量过的覆盖值该生效——不然只能改源码"
     for bad in ("abc", "", "  ", "1.5", "-2", "nan"):
-        got = get_hit_floor("BAAI/bge-m3", env={ENV_HIT_FLOOR: bad})
+        got = get_hit_floor(UNCALIBRATED_FIXTURE_MODEL, env={ENV_HIT_FLOOR: bad})
         assert got is None, f"非法覆盖值 {bad!r} 该当没设（得到 {got}），绝不能落成 0"
     #     覆盖值要在 describe() 里标明是用户设的，不许混进"我们标定过"
     note = _floor_note(0.62, {ENV_HIT_FLOOR: "0.62"})
     assert "你自己设的" in note and "已标定" not in note, \
         f"覆盖值被说成了我们的标定值：{note}"
 
-    print("selftest ok（10 项：key 不外泄 / 缺 key 报错 / 分批不乱序 / 前缀按模型 / "
+    # 11.【第三类口径：外部标定】（2026.08.03，收外部 PR #4 的 bge-m3 标定 0.60）
+    #     **数字功能上照用、floor 真生效**，只在口径上跟"我们量的"分开——先例是
+    #     "收但标着"，不是"收了就当自己量的"。
+    assert get_hit_floor("BAAI/bge-m3") == 0.60, "外部标定的数该跟自己量的一样真生效"
+    #     ⚠ 靶心：**必须是纯 float**。把出处塞进表值（元组／字典）是最容易顺手做的
+    #     那种"顺便重构"，而 memory_retrieval 那条向量路判据直接拿它比大小。
+    assert type(get_hit_floor("BAAI/bge-m3")) is float, \
+        "get_hit_floor 必须返回纯 float——出处走 EXTERNAL_CALIBRATED，不许耦进这个返回值"
+    ext = HTTPCloudProvider("https://api.example.com/v1/embeddings", "BAAI/bge-m3",
+                            transport=_fake_transport(), env={"MEMORY_EMBED_API_KEY": "k"})
+    d_ext = ext.describe()
+    #     ⚠ 靶心：出处要落在**用户看得见的那句话**里。把 _floor_note() 的第三支删掉
+    #     （退回"已标定"）时这条必红——藏在注释里的出处等于没标。
+    for must in ("外部标定", "星迟 & Ember", "1144 块中文语料", "PR #4", "我们未复现"):
+        assert must in d_ext, f"外部标定的口径缺了「{must}」：{d_ext}"
+    assert "（已标定）" not in d_ext, "外部标定不许被说成我们自己量的"
+    #     三类互不串味：我们自己量的那格照旧说"已标定"，覆盖值照旧说"你自己设的"
+    note_own = _floor_note(0.45, {}, model=DEFAULT_LOCAL_MODEL)
+    assert "（已标定）" in note_own and "外部标定" not in note_own, \
+        f"我们自己量的被说成了外部标定：{note_own}"
+    note_ov = _floor_note(0.55, {ENV_HIT_FLOOR: "0.55"}, model="BAAI/bge-m3")
+    assert "你自己设的" in note_ov and "外部标定" not in note_ov, \
+        f"覆盖值被说成了外部标定：{note_ov}"
+    assert get_hit_floor("BAAI/bge-m3", env={ENV_HIT_FLOOR: "0.55"}) == 0.55, \
+        "自己量过的人给的覆盖值，在外部标定过的模型上同样该优先"
+
+    print("selftest ok（11 项：key 不外泄 / 缺 key 报错 / 分批不乱序 / 前缀按模型 / "
           "未标定即 None / 缓存只算一次 / 坏缓存不致命 / 未知档报错 / "
-          "超长块截断（发出去的截、本地的不动）/ 门槛覆盖口（设歪了当没设））")
+          "超长块截断（发出去的截、本地的不动）/ 门槛覆盖口（设歪了当没设）/ "
+          "第三类口径「外部标定」（数照用、出处进用户可见文本、返回值仍是纯 float））")
 
 
 if __name__ == "__main__":

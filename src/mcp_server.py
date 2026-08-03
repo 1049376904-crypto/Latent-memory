@@ -54,7 +54,8 @@ from pathlib import Path
 
 # 同目录模块，import 不触发各自的 CLI
 from memory_retrieval import (MemoryIndex, load_corpus, append_record, corpus_files,
-                              query_miss_rate, miss_rate_note, annotate_block)
+                              query_miss_rate, miss_rate_note, annotate_block,
+                              _chunk_key)
 from embedding_provider import resolve_provider
 # 切块下界与体检的切块成色检查**共用同一个判据**，不各抄一份
 from chunking_experiment import chunk_body as _chunk_body, chunk_heading
@@ -605,8 +606,23 @@ def diagnose(corpus_dir, threads_path=None, embed=False):
         if n == 0:
             add(WARN, name, f"{what}在，但没有一条对得上当前语料——按内容哈希对号入座，"
                             "语料被编辑过或换了目录就会全部失效（文件还在，等于没有）。")
+            continue
+        # 孤儿条目（2026.08.03 外部缺陷报告逼出来的一格）：账本条目对不上任何现存块
+        # 就是死账——**部分孤儿比全孤儿隐蔽得多**：接上的那几条让上面那格报 OK，
+        # 孤儿那条静默失效。撤回账本的孤儿尤其要命：撤回看着成功了、落盘了、
+        # 体检全绿，重启后被撤回的旧说法照常召回。此前 append 手拼块文本与
+        # 重启重切不一致就是这么漏网的（那个根因已修，这格防的是同形状的下一个）。
+        cur_keys = {_chunk_key(c) for c in index.chunks}
+        orphans = [k for k in json.loads(p.read_text(encoding="utf-8"))
+                   if k not in cur_keys]
+        if orphans:
+            add(WARN, name, f"{what}接上 {n} 块，但有 {len(orphans)} 条孤儿条目"
+                            f"对不上任何现存块（键：{'、'.join(orphans[:3])}"
+                            f"{' 等' if len(orphans) > 3 else ''}）——这些账等于已静默"
+                            f"失效；若是撤回账本，对应的旧记录会照常被召回。多半是"
+                            f"块正文被编辑过、或旧版本手拼块文本留下的死账。")
         else:
-            add(OK, name, f"{what}接上 {n} 块")
+            add(OK, name, f"{what}接上 {n} 块，无孤儿条目")
     index.build()                       # 实体边在 build 时算，接上后要重建一次
 
     # 写回落点：memory_append/memory_correct 要往这里写。只用 os.access 判，
@@ -934,6 +950,29 @@ def _selftest():
         assert s12b.index.retraction_log, "重启后撤回账本该从盘上回来"
         assert json.loads(rp.read_text(encoding="utf-8")), "账本文件要真在盘上（可追溯）"
 
+    # 12c.【同会话 append→撤回，重启仍生效·变异靶心】（2026.08.03 外部缺陷报告，
+    #      真机 7232 块语料上抓到）：新建窗口文件的首块，手拼返回值与重启重切的
+    #      文件态块不一致（H1 被向下并进首块），撤回账本键成孤儿，「已撤回」只活
+    #      一个进程——触发的恰是最自然的用法：刚记完当场改。上面第 12 项盖不到
+    #      这一格：它的旧块是合成的、不在盘上，只验账本回来了、验不了**重新对上号**。
+    #      变异：append_record 改回手拼 chunk_text → 这段红
+    with tempfile.TemporaryDirectory() as td:
+        rp = _P(td) / ".retractions.json"
+        mk12c = lambda: MemoryServer(index=load_corpus(td), thread_store=ThreadStore(),
+                                     corpus_dir=td, retractions_path=rp)
+        s_a12c = mk12c()
+        call(s_a12c, "memory_append",
+             {"text": "她想去的展览在下周三，先记着。", "current_state": "还没买票。"}, now)
+        ok12c = call(s_a12c, "memory_correct",
+                     {"quote": "下周三", "reason": "记错了，是下周四"}, now)
+        assert ok12c["isError"] is False and "已撤回" in ok12c["content"][0]["text"]
+        s_b12c = mk12c()                               # 重启：语料与账本都从盘上回来
+        assert s_b12c.index.retracted, \
+            "重启后撤回必须重新对上号（此前这里是空集：账本键是手拼块文本的孤儿）"
+        r12c = call(s_b12c, "memory_search", {"query": "展览是哪天"}, now)
+        assert "下周三" not in r12c["content"][0]["text"], \
+            "被撤回的旧说法重启后不许再被召回——跟更正并排出现比撤回失败更糟"
+
     # 12b.【缺失率标注接线：两条路径都要带上】高缺失率查询无论"查到了"还是
     #      "没查到"，都该把那句可核对的话交给模型——空结果那条尤其重要，它是
     #      模型决定"如实说没找到"还是"拿沾边的记录去圆"的分水岭
@@ -1045,6 +1084,16 @@ def _selftest():
         (c2 / ".weights.json").write_text('{"deadbeef": 2.0}', encoding="utf-8")
         w = {c["title"]: c for c in diagnose(c2)}
         assert w[".weights.json"]["level"] == WARN and "对得上" in w[".weights.json"]["detail"]
+        #     部分孤儿比全孤儿隐蔽得多（2026.08.03 外部缺陷报告逼出来的一格）：
+        #     接上的那几条让这格报 OK，孤儿那条静默失效——若是撤回账本，被撤回的
+        #     旧说法照常召回。变异：把孤儿检查删掉（n>0 直接报 OK）→ 这条红
+        from memory_retrieval import _chunk_key as _ck14
+        good_key = _ck14(load_corpus(c2).chunks[0])
+        (c2 / ".weights.json").write_text(
+            json.dumps({good_key: 2.0, "deadbeef00000000": 3.0}), encoding="utf-8")
+        o14 = {c["title"]: c for c in diagnose(c2)}
+        assert o14[".weights.json"]["level"] == WARN and "孤儿" in o14[".weights.json"]["detail"], \
+            "账本部分对得上时，孤儿条目必须点名报出来——OK 不许挡住死账"
 
     # 15.【部署体检·走真进程，从相对路径 cwd 起】上面第 14 项全是函数级断言，
     #     它有两个够不着的地方，而返工的三条缺陷恰好都藏在那里：

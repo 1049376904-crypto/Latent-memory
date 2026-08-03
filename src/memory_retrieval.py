@@ -1199,13 +1199,25 @@ def append_record(corpus_dir, text, current_state, window=None, now=None):
         existing = sorted(timeline.glob(f"window_{window:02d}_*.md"))
         path = existing[0] if existing else timeline / f"window_{window:02d}_{day}.md"
 
-    chunk_text = f"## {day} 记\n{text.strip()}\n当下状态：{current_state.strip()}"
+    record = f"## {day} 记\n{text.strip()}\n当下状态：{current_state.strip()}"
     if path.exists():
         path.write_text(path.read_text(encoding="utf-8").rstrip() +
-                        "\n\n" + chunk_text + "\n", encoding="utf-8")
+                        "\n\n" + record + "\n", encoding="utf-8")
     else:
-        path.write_text(f"# 第{window}个窗口 · {day}\n\n" + chunk_text + "\n",
+        path.write_text(f"# 第{window}个窗口 · {day}\n\n" + record + "\n",
                         encoding="utf-8")
+    # 返回的块必须是**从刚写完的文件里重新切出来的**，不是手拼的 record——
+    # 手拼等于把切块规则抄第二份（外部缺陷报告 2026.08.03，真机 7232 块语料上抓到）：
+    # 新建窗口文件时 chunk_heading 会把无正文的 H1 标题行向下并进第一块，
+    # 文件态块 = "# 第N个窗口…\n## {day} 记\n…"，而手拼的 record 没有 H1——
+    # 两者 _chunk_key 不同，凡按内容哈希记账的（撤回账本、replaced_by 追溯链、
+    # 权重持久化）**同会话记的账重启后全部对不上号、静默失效**。
+    # 刚追加的记录永远在文件最后一块（我们自己写的 timeline 文件节节有正文，
+    # 不存在尾部无正文块把边界搅乱的形态）。
+    # ⚠ 已知上限，别写成"彻底一致了"：单条 append 正文自带空行且总长超过
+    # chunk_heading 的 max_chars 时，这节会被切成多块，[-1] 只拿到尾块——
+    # 那种形态下内存态与文件态本来就不可能是同一块，--doctor 的孤儿撤回检查兜底。
+    chunk_text = chunk_heading(path.read_text(encoding="utf-8"))[-1]
     meta = {"source": path.name, "heading": f"{day} 记", "timestamp": now,
             "timestamp_source": "append", "window": window, "layer": "timeline"}
     return path, chunk_text, meta
@@ -1937,6 +1949,31 @@ def _selftest(embed=False):
         assert all(m["timestamp_source"] != "mtime" for m in rt.meta), \
             "写回的文件不该有任何块落 mtime 兜底"
         assert {m["window"] for m in rt.meta} == {1, 2}
+        #  【内存态＝文件态·变异靶心】（2026.08.03 外部缺陷报告，真机 7232 块语料
+        #    上抓到）：append 返回的块必须与重启后 load_corpus 重切出的块**逐字相同**
+        #    ——新建窗口文件时 chunk_heading 把无正文的 H1 向下并进第一块，
+        #    手拼的返回值没有 H1，_chunk_key 就对不上；凡按内容哈希记账的
+        #    （撤回账本、replaced_by、权重）同会话记的账重启后全部静默失效。
+        #    变异：把 chunk_text 改回手拼 record → 下面这批全红
+        assert chunk1 in rt.chunks, "append 返回的块要在重启重切出的块里逐字找得到"
+        assert chunk1.startswith("# 第1个窗口"), \
+            "新建窗口文件的首块带被并下来的 H1——返回值必须是文件态的形状，不是手拼的"
+        #    真实时序整链：建库 → append（跨天 → 新建窗口文件）→ 同会话撤回 →
+        #    落盘 → 重启。这正是外部报告的触发序列（刚记完当场改，最自然的用法）
+        idxA = load_corpus(td)
+        pA, chunkA, metaA = append_record(td, "临时记一条，这句措辞不太对。",
+                                          "回头改。", now=t0 + 86400 * 4)
+        idxA.add(chunkA, metaA)
+        idxA.build()
+        idxA.retract("措辞不太对", "当场发现记错了", now=t0 + 86400 * 4 + 60)
+        rpA = Path(td) / ".retractions.json"
+        idxA.save_retractions(rpA)
+        idxB = load_corpus(td)                        # 重启：从盘上重建
+        assert idxB.load_retractions(rpA) == 1, \
+            "同会话 append→撤回 的账重启后必须对得上号（手拼块文本时这里是 0，静默失效）"
+        assert all("措辞不太对" not in x["text"]
+                   for x in idxB.retrieve("那条临时记录写了什么", topN=5)), \
+            "被撤回的旧说法重启后不许再被召回——'撤回成功'不许只活一个进程"
 
     print("selftest ok" + ("（含真embedding路径）" if embed else "（零依赖）"))
 

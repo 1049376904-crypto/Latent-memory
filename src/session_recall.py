@@ -76,13 +76,25 @@ def _clip(text, limit):
 
 def _time_label(meta):
     """召回片段的时间标注——防时间感塌陷的第一道措施：注入的记忆必须带着"这是什么
-    时候的事"，否则新窗口容易把旧片段读成正在发生。mtime 兜底的近似时间戳前加 ≈，
-    缺时间戳标"时间未知"，都不假装精确。"""
+    时候的事"，否则新窗口容易把旧片段读成正在发生。**没有真实日期依据的一律标
+    「时间未知」**：缺时间戳的，以及只能退到 mtime 的。
+
+    **mtime 档从"≈某日"改成「时间未知」（2026.08.03，跨模型实测逼出来的）**：
+    原先 mtime 兜底会打 `≈2026.08.03` 这种标签，看着"只是不太精确"，实际是
+    **假装知道**——mtime 在全新 clone／刚落盘的语料上就是"今天"，于是最没有时间
+    依据的片段拿到了全库最新的日期，仲裁句照规则把它端成当下状态。
+    实测（DS／`glm-5.2` 各 3 次独立会话，同一夹具 A/B）：**改前 0/6 答对当下状态、
+    5/6 被无日期那条冒充现状**（另 1 次检索没命中、C 没出现，不计冒充）；
+    **改后冒充现状 0/6**，答对 5/6——剩下那 1 次同样是 `memory_search` 没命中、
+    诚实说“没找到”，不是冒充。
+    排序一个字没动（那条仍排在召回块第一），**只把"假装知道"换成"如实说不知道"
+    就够了**——这也是为什么没有采纳"让 mtime 档不参与新鲜度排序"那个更重的方案：
+    真实语料里 mtime 占比可以很高（本项目那份加 window_sibling 之前 34/37），
+    让它们整体退出新鲜度，等于把换窗召回要救的"刚被冲掉的最近上下文"一起关掉。"""
     ts = meta.get("timestamp")
-    if ts is None:
+    if ts is None or meta.get("timestamp_source") == "mtime":
         return "时间未知"
-    label = datetime.fromtimestamp(ts).strftime("%Y.%m.%d")
-    return "≈" + label if meta.get("timestamp_source") == "mtime" else label
+    return datetime.fromtimestamp(ts).strftime("%Y.%m.%d")
 
 
 def format_recall_block(results, max_item_chars=DEFAULT_MAX_ITEM_CHARS):
@@ -238,12 +250,20 @@ def _selftest():
     assert "时间未知" in head_line and "不当作当下状态" in head_line, \
         "缺时间戳那一格必须有说法——它是'旧事实冒充现状'最容易钻的一格"
 
-    # 9. 时间标注不假装精确：mtime 近似戳前加 ≈，缺时间戳标"时间未知"
+    # 9.【不假装知道·变异靶心】没有真实日期依据的一律标「时间未知」：缺时间戳的，
+    #    以及只能退到 mtime 的。**mtime 那档 2026.08.03 从 "≈某日" 改过来**，
+    #    因为 mtime 在全新 clone／刚落盘的语料上就是"今天"，打一个日期出去等于
+    #    让最没有时间依据的片段拿到全库最新的日期，仲裁句会照规则把它端成当下状态。
+    #    实测 A/B（DS／glm-5.2 各 3 次独立会话）：改前冒充现状 5/6、答对 0/6；
+    #    改后冒充现状 0/6、答对 5/6（各有 1 次检索没命中，不计冒充）。
+    #    ⚠ 这条断言守的就是那次实测的结论，**别顺手改回带日期的形态**。
     idx9 = MemoryIndex()
     idx9.add("近似时间的事", {"heading": "近似", "timestamp": now - DAY, "timestamp_source": "mtime"})
     idx9.add("没有时间的事", {"heading": "没戳"})
     b9 = SessionRecall(idx9, topN=2).on_session_start(now=now)
-    assert re.search(r"\[≈\d{4}\.\d{2}\.\d{2}·近似\]", b9), "mtime 兜底的时间戳带 ≈"
+    assert "[时间未知·近似]" in b9, "mtime 兜底的块必须标时间未知——打日期就是假装知道"
+    assert not re.search(r"\[≈?\d{4}\.\d{2}\.\d{2}·近似\]", b9), \
+        "mtime 那档不许出现任何日期形态的标签（带不带 ≈ 都不行）"
     assert "[时间未知·没戳]" in b9, "缺时间戳标时间未知，不崩"
 
     # 10. 自查指令跟着每次注入走：换窗和压缩触发的块尾都带

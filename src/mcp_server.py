@@ -550,22 +550,37 @@ def diagnose(corpus_dir, threads_path=None, embed=False):
         add(WARN, "分层", "没有索引层（父目录名叫 index 的才算）。不算错，但命中率会低一档："
                           "索引层是每会话一条高密度摘要，专门喂检索。")
 
-    # 时间戳成色：mtime 兜底不是"不太准"，是全错且整齐地错——复制目录/重新 clone
-    # 会把全目录 mtime 刷成同一时刻，一整批记忆拿到同一个假时间，换窗召回按新鲜度
-    # 排序，这一错就整个乱套
+    # 时间戳成色：mtime 兜底不是"不太准"，是**方向错误**——复制目录/重新 clone 会把
+    # 全目录 mtime 刷成"刚刚"，于是最没有时间依据的块拿到全库最新的日期，
+    # 换窗召回按新鲜度排序时**最旧的事实冒充最新的**（2026.08.03 跨模型实测：
+    # 这么一份语料下两家模型 0/6 答对当下状态）。
     srcs = {}
     for m in index.meta:
         srcs[m.get("timestamp_source")] = srcs.get(m.get("timestamp_source"), 0) + 1
     detail = "、".join(f"{k} {v} 块" for k, v in sorted(srcs.items(), key=lambda x: -x[1]))
     n_mtime = srcs.get("mtime", 0)
     ratio = n_mtime / len(index.chunks)
-    if ratio > _MTIME_WARN_RATIO:
+    # 判据二（2026.08.03 补，**与比例无关**）：只要有 mtime 档的块比全库最新的
+    # 真日期块还"新"，就报——**危险的恰恰是混合且占比低的情况**：绝大多数块有日期、
+    # 少数几块落 mtime，那几块的时间戳就是"今天"，稳稳压过所有真日期，
+    # 而占比 5% 连比例判据的门都够不着，于是静默。比例判据看的是"有多少块没日期"，
+    # 这条看的是"没日期的块会不会骑到有日期的头上"，两件事。
+    real_ts = [m["timestamp"] for m in index.meta
+               if m.get("timestamp") is not None and m.get("timestamp_source") != "mtime"]
+    mtime_ts = [m["timestamp"] for m in index.meta
+                if m.get("timestamp") is not None and m.get("timestamp_source") == "mtime"]
+    outranks = bool(real_ts) and bool(mtime_ts) and max(mtime_ts) > max(real_ts)
+    if ratio > _MTIME_WARN_RATIO or outranks:
         bad = sorted({m["source"] for m in index.meta
                       if m.get("timestamp_source") == "mtime"})
         add(WARN, "时间戳来源",
-            f"{detail}——{ratio:.0%} 的块只能退到文件修改时间。它不是"
-            "“不太准”，是全错且整齐地错：复制一遍目录或重新 clone，全目录 mtime 会被"
-            "刷成同一时刻，换窗召回的新鲜度排序整个失效。修法是把日期写进文件名"
+            f"{detail}——{ratio:.0%} 的块只能退到文件修改时间。它不是“不太准”，"
+            "**是方向错误**：复制一遍目录或重新 clone，这些块的时间会被刷成“刚刚”，"
+            "于是最没有日期依据的内容拿到全库最新的时间戳，"
+            "**换窗召回会把最旧的事实当成你现在的状态端出来**"
+            + ("（**这份语料已经是这种形态**：落 mtime 的块比所有带真日期的块都新）"
+               if outranks else "")
+            + "。修法是把日期写进文件名"
             f"（window_04_2026-06-17.md 这种）或标题行。落 mtime 的文件："
             f"{'、'.join(bad[:5])}{' 等' if len(bad) > 5 else ''}")
     else:
@@ -1116,6 +1131,26 @@ def _selftest():
         assert "`##`" in out3, f"要告诉人去看哪儿（语料里的 `##`）：{out3}"
         #    变异：去掉 _chunk_body 的首行判断（整块都当正文）/ 把阈值放到 1.0
         #    / 只报块数不报块长 → 各自红
+
+        #    【mtime 骑到真日期头上·变异靶心】（2026.08.03 补）比例判据看的是
+        #    "有多少块没日期"，这条看的是"没日期的块会不会骑到有日期的头上"。
+        #    **危险的恰恰是占比低的情况**：绝大多数块有日期、少数几块落 mtime，
+        #    那几块的时间戳就是"刚刚"，稳稳压过所有真日期，而占比连 20% 的门都
+        #    够不着 → 静默。这里造的正是那种语料：4 块带日期、1 块落 mtime（20%
+        #    不过阈值），必须靠新判据报出来。
+        混合 = _P(td) / "混合"
+        混合.mkdir()
+        for d in ("2026-06-01", "2026-06-02", "2026-06-03", "2026-06-04"):
+            (混合 / f"window_01_{d}.md").write_text(
+                f"# 窗口 · {d}\n\n那天做了些事，记一笔留着以后看。", encoding="utf-8")
+        (混合 / "没有日期的备忘.md").write_text(
+            "这条没有任何日期依据，落盘时间就是刚刚。", encoding="utf-8")
+        code, out_mix = run_doctor(td, "--corpus", "混合")
+        assert "⚠ 时间戳来源" in out_mix, \
+            f"少数几块落 mtime 却比所有真日期都新时必须报警（比例判据够不着这一格）：{out_mix}"
+        assert "最旧的事实当成你现在的状态" in out_mix or "方向错误" in out_mix, \
+            f"WARN 正文要说清后果是方向错误，不是“没有排序信号”：{out_mix}"
+        #    变异：把 outranks 那一支删掉（只留比例判据）→ 这条红
 
         #    缺 --corpus：argparse 拦下，同样是真进程才盖得到的一格
         code, out = run_doctor(td)

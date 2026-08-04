@@ -39,11 +39,12 @@ stdio 只能由宿主拉起（手动 `nohup` 必崩）、懒加载每次调用�
 用法：
   python mcp_server.py --selftest
   python mcp_server.py --corpus <md目录> [--threads <threads.jsonl>]   # stdio 服务
-  python mcp_server.py --corpus <md目录> --http 8765 --token <口令>    # HTTP 服务
+  python mcp_server.py --corpus <md目录> --http 127.0.0.1:8765 --token <口令>  # HTTP 服务
   python mcp_server.py --doctor --corpus <md目录> [--threads <threads.jsonl>]  # 部署体检
 客户端配置（Claude Desktop 之类）里把上面第二条命令填成 server 启动命令即可；
 只认 HTTP 的客户端（Kelivo/Operit 这类）用第三条起服务、客户端里填地址与 token
-（公网仍要域名 + 反代管 TLS，见《快速上手》§3c 部署形态二）；
+（`--http` 的参数是 `[HOST:]PORT`，**省略 HOST 只绑回环、别的机器连不到**；
+公网仍要域名 + 反代管 TLS，见《快速上手》§3c 部署形态二）；
 配完接不上、或者不确定 --corpus 指对了没有时，把同一行参数换成 --doctor 跑一次
 （体检只读，不往语料目录写任何东西）。
 """
@@ -477,6 +478,116 @@ _HTTP_BODY_LIMIT = 10 * 1024 * 1024     # 单请求上限：正常一条 tools/c
 # 声明了超大长度的客户端多半根本没打算发完，等它等于把线程挂死
 _HTTP_DRAIN_LIMIT = 64 * 1024
 _HTTP_DRAIN_TIMEOUT = 5.0
+# 被拒请求留痕的刷屏防线（见 _make_deny_logger）：一个窗口里最多逐条打多少行、
+# 窗口有多长。绑了 0.0.0.0 就会被扫，401/404 能刷满终端、撑爆重定向到的文件
+_HTTP_DENY_LOG_MAX = 60
+_HTTP_DENY_LOG_WINDOW = 60.0
+
+
+def _log_sanitize(s, limit):
+    """要写进日志的那截字符串：不可打印字符换成 `?`，超长截断。
+
+    客户端能塞进请求行的东西不受我们控制（路径里放 `\\r\\n` 就能伪造出一整行
+    假日志，放几 KB 就能把终端顶满），而这行日志的用处正是让人一眼看清，
+    所以进日志前一律过这道。"""
+    s = "".join(ch if ch.isprintable() else "?" for ch in str(s))
+    return s if len(s) <= limit else s[:limit] + "…"
+
+
+def _make_deny_logger():
+    """造一个「被拒请求留痕」的记录函数（每个 HTTP server 一份自己的计数器）。
+
+    **为什么要有它**（2026.08.04 立卡）：八种拒绝（401/403/404/405/411/413/400/501）
+    的原因 `_deny()` 每条都写得很清楚，但那句话只进**响应体**，而多数 MCP 客户端
+    不显示响应体，用户看到的是「Transport disconnected」之类的通用失败；服务端这边
+    `log_message` 整个静音，于是**两头都不说话，八种原因在用户那里长成同一个样子**。
+
+    ⚠ **`log_message` 的静音不掀掉**：它静音的理由（个人部署逐请求刷屏是纯噪声）
+    依然成立，这里只在它旁边开一个窄口子——**非 2xx 才留痕，正常请求照旧不打**。
+
+    刷屏防线：一个窗口里最多逐条打 `_HTTP_DENY_LOG_MAX` 行，超出的压掉。
+    ⚠ **压掉的条数必须说出来**——「压掉但不说」等于用一个新的静默去修一个旧的
+    静默，那就白做了。所以窗口结束时补一行「过去一分钟另有 X 条被拒未逐条列出」，
+    而且是**定时器兜底**：不能靠「下一个被拒请求来的时候顺手补」，那样一阵扫描
+    打完就没下文了的话，那 X 条就真的没人说了。
+    ⚠ ThreadingHTTPServer 是多线程的，计数器配自己的一把小锁（不复用 index 那把，
+    那把锁的是整段检索，等它等于把留痕挂在业务后面）。"""
+    lock = threading.Lock()
+    st = {"t0": None, "n": 0, "dropped": 0, "timer": None}
+
+    def _settle_locked():
+        """窗口翻页：清计数，返回要补打的那行（没压掉东西就 None）。调用方持锁。"""
+        if st["timer"] is not None:
+            st["timer"].cancel()
+            st["timer"] = None
+        dropped, st["dropped"] = st["dropped"], 0
+        st["t0"], st["n"] = None, 0
+        return f"过去一分钟另有 {dropped} 条被拒未逐条列出" if dropped else None
+
+    def _on_timeout():
+        with lock:
+            line = _settle_locked()
+        if line:
+            print(line, file=sys.stderr)
+
+    def emit(line):
+        out = []
+        with lock:
+            now = time.monotonic()
+            if st["t0"] is None or now - st["t0"] >= _HTTP_DENY_LOG_WINDOW:
+                closing = _settle_locked()
+                if closing:
+                    out.append(closing)
+                st["t0"], st["n"] = now, 0
+            if st["n"] < _HTTP_DENY_LOG_MAX:
+                st["n"] += 1
+                out.append(line)
+            else:
+                st["dropped"] += 1
+                if st["timer"] is None:
+                    t = threading.Timer(
+                        max(0.0, st["t0"] + _HTTP_DENY_LOG_WINDOW - now), _on_timeout)
+                    t.daemon = True      # 别让这只表拖住进程退出
+                    st["timer"] = t
+                    t.start()
+        for x in out:
+            print(x, file=sys.stderr)
+
+    return emit
+
+
+def _is_loopback(host):
+    """绑定地址是不是回环。`localhost` 走名字判断，其余按 IP 解析；解析不了的
+    （域名、空串）一律当非回环——**判不准时往严的那边倒**：那样守卫会要求 token、
+    横幅会多打一行提醒，两个方向的错都是"多提醒一次"，不是"漏掉一次"。"""
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host in ("localhost",)
+
+
+def http_tls_notice(host):
+    """非回环绑定时该多打的那一行（回环返回 None）。纯函数，起动横幅那边调。
+
+    **为什么要有这一行**（2026.08.04 外部实测促成）：`http_bind_guard` 挡的是
+    "非回环裸跑不配 token"，**它不挡"没有 TLS"**——配了 token 就照常起动，于是
+    用户走在一条裸 HTTP 暴露公网的路上，token 与 `memory_search` 返回的记忆内容
+    全程明文，而**没有任何人提醒过他**。那位用户自己提的建议是"检测到 token 已配
+    就提示绑定地址"，方向要反过来：token 已配说明他知道要鉴权，**真正没被提醒的
+    是 TLS**。
+
+    ⚠ **只提示，不拒绝起动**：拒绝会把"临时绑 `0.0.0.0` 验证一下"这条路堵死，
+    而那正是他这次定位根因的办法（怀疑过 SSE 格式、怀疑过桥接残留，最后是改绑定
+    地址才连上）。
+    ⚠ **不看 token**：token 与 TLS 是两件事，配了 token 也照样提醒——做成"有 token
+    就不提示"等于把唯一一次提醒的机会送给最不需要它的人。"""
+    if _is_loopback(host):
+        return None
+    return (f"⚠ 绑的是非回环地址（{host}）：这条链路没有 TLS，token 与 "
+            f"memory_search 返回的记忆内容在网上都是明文，拿到 token 的人既能读"
+            f"全库、也能写进去。推荐绑 127.0.0.1、公网那一跳交给反向代理"
+            f"（Caddy／nginx）管 TLS；只是临时验证的话，至少上防火墙限制来源，"
+            f"并把这个 token 当已经泄露过来处理。")
 
 
 def http_bind_guard(host, token):
@@ -501,11 +612,7 @@ def http_bind_guard(host, token):
                 "中文之类的口令客户端根本发不出去，而服务照样起得来——失败形态是"
                 "「看起来起来了、就是连不上」。换一串英文数字口令再起。")
         return
-    try:
-        loopback = ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        loopback = host in ("localhost",)
-    if not loopback:
+    if not _is_loopback(host):
         raise ValueError(
             f"拒绝在非回环地址（{host}）上裸跑：没配 token 的 HTTP 端口等于把记忆库"
             f"公开成既可读又可写。加 --token（或环境变量 MEMORY_HTTP_TOKEN），"
@@ -534,6 +641,7 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None):
     调用方的事——selftest 要拿着实例开线程、取真端口、shutdown）。"""
     http_bind_guard(host, token)
     lock = threading.Lock()                  # index 的增删改建都不是线程安全的：串行化
+    deny_log = _make_deny_logger()           # 被拒请求留痕（带刷屏上限，见那个函数）
     state = {"sig": _corpus_signature(server.corpus_dir)
              if (server.corpus_dir and server.loader) else None}
 
@@ -607,7 +715,41 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None):
                     pass
             return True
 
+        def _log_deny(self, code, msg):
+            """被拒的请求在 stderr 上留一行（八条拒绝全走 `_deny`，所以落点只有这一处）。
+
+            形如：`被拒 404 GET /nope 来自 127.0.0.1：没有这个端点`
+            ——状态码、方法、**剥掉 query 的**路径、客户端 IP、原因短语。
+
+            ⚠ **三条硬边界（「为了让人能排查」而写进日志，正好是明文那张卡在防的
+            事的另一个出口——日志会被重定向进文件、会被贴进 issue 找人帮看）**：
+
+            1. **`Authorization` 的任何内容都不打**，一个字符都不打。401 只记
+               「缺少或错误的 Bearer token」，不记收到的是什么——「只打前 4 位帮
+               用户对一下」也不行。
+            2. **不打请求体**。400「请求体不是合法的 UTF-8 JSON」时最想附上的就是
+               那段 body，**恰恰最不能附**：那里面是 `memory_search` 的问句和
+               `memory_append` 的正文，是用户最私密的记忆。413 同理。
+            3. **路径剥掉 query string**：`_deny(404, ...)` 把整个 `self.path` 回给
+               对方没问题（是他自己发的），但**写进日志就落盘了**，而有些客户端
+               习惯把 token 塞 `?token=`。所以这里用 `urlsplit(self.path).path`，
+               **不用 `self.path`**。
+
+            原因短语取 `msg` 的**第一个分隔符之前**那截：各调用点把客户端来的值
+            （路径、Origin、`Transfer-Encoding` 的值）都插在分隔符之后，切掉即可。
+            ⚠ **以后新增 `_deny` 调用点，变量插值必须放在「：」「: 」「——」之后**，
+            否则它会跟着原因短语进日志。"""
+            reason = msg
+            for sep in ("：", ": ", "——", "\n"):
+                reason = reason.split(sep, 1)[0]
+            path = urllib.parse.urlsplit(self.path).path
+            ip = self.client_address[0] if self.client_address else "?"
+            deny_log(f"被拒 {code} {_log_sanitize(self.command or '?', 16)} "
+                     f"{_log_sanitize(path, 120)} 来自 {_log_sanitize(ip, 60)}："
+                     f"{_log_sanitize(reason, 80)}")
+
         def _deny(self, code, msg, extra=()):
+            self._log_deny(code, msg)
             extra = list(extra)
             if not self._drain():
                 self.close_connection = True
@@ -1699,6 +1841,55 @@ def _selftest():
         assert "ASCII" in str(e18b), "报错要说清是 ASCII 的问题并给修法"
     http_bind_guard("127.0.0.1", "s3cret-2026")     # ASCII 照常放行
 
+    # 18f.【非回环绑定多打一行 TLS 提醒·真进程，两个绑法都跑】（2026.08.04 外部实测
+    #     促成）：`http_bind_guard` 挡的是"非回环裸跑不配 token"，**不挡"没有 TLS"**，
+    #     于是配了 token 的用户走在裸 HTTP 暴露公网的路上、全程没人提醒过他。
+    #     ⚠ **必须起真进程**：提醒是在 `__main__` 里打的，只断纯函数就是"函数绿、
+    #     生产路径死"那张脸——把 `__main__` 里那两行删掉，纯函数断言一条都不会红。
+    #     ⚠ **两个绑法都要跑**：只跑非回环那次证明不了"回环时不吵"。
+    #     ⚠ **非回环那次带着 token 跑**：提醒不许看 token（token 与 TLS 是两件事），
+    #     做成"有 token 就不提示"这一格要红。
+    #     ⚠ 两次都断"横幅在"：否则进程压根没起来也能让"不含 TLS"那条恒真（假绿）。
+    #     变异：删掉 `__main__` 里打 notice 那两行 / 让 http_tls_notice 恒返回 None /
+    #           改成 token 已配就不打 → 各自红
+    def run_banner(corpus_dir, bind, *extra):
+        """起真进程跑 `--http`，收横幅那几行，然后掐掉。返回 stderr 文本。"""
+        proc = subprocess.Popen(
+            [sys.executable, str(here / "mcp_server.py"), "--corpus", str(corpus_dir),
+             "--http", bind, *extra],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+        got = []
+        pump = threading.Thread(target=lambda: got.extend(proc.stderr), daemon=True)
+        pump.start()
+        deadline = time.time() + 20
+        while time.time() < deadline and not any("语料变化自动重读" in x for x in got):
+            time.sleep(0.05)
+        time.sleep(0.5)          # 提醒行紧跟在横幅后面，给它落地的时间
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+        pump.join(timeout=5)
+        return "".join(got)
+
+    with tempfile.TemporaryDirectory() as td:
+        (_P(td) / "timeline").mkdir()
+        (_P(td) / "timeline" / "window_01_2026-08-01.md").write_text(
+            "# 第1个窗口 · 2026-08-01\n\n## 2026-08-01 记\n试养了一盆绿萝。\n"
+            "当下状态：长势正常。\n", encoding="utf-8")
+        out_pub = run_banner(td, "0.0.0.0:0", "--token", "s3cret-2026")
+        assert "Streamable HTTP 服务在" in out_pub, \
+            f"非回环 + token 必须照常起动（只提示、不拒绝）：{out_pub}"
+        assert "TLS" in out_pub, \
+            f"绑非回环要多打一行 TLS 提醒——配了 token 也照打：{out_pub}"
+        assert "127.0.0.1" in out_pub and "反向代理" in out_pub, \
+            f"提醒里要给出修法（绑回环 + 反代管 TLS），不能只说一句「有风险」：{out_pub}"
+        out_lo = run_banner(td, "127.0.0.1:0")
+        assert "Streamable HTTP 服务在" in out_lo, \
+            f"回环裸跑照常起动（反代在前的形态）：{out_lo}"
+        assert "TLS" not in out_lo, f"回环上不许吵这一句：{out_lo}"
+
     # 18e.【自动重读不许吞掉同窗口的手动上传·变异靶心】（2026.08.03 外部评审的竞态）：
     #     原先 handle 之后无条件重算指纹，于是一次 memory_append 与用户手动上传
     #     落在同一个请求窗口时，那次上传被自己的刷新吞掉、**再也不触发重读**——
@@ -1751,6 +1942,159 @@ def _selftest():
             "同窗口里的手动上传不许被自己的写回吞掉——吞掉就再也不重读了（静默）"
         httpd18e.shutdown()
 
+    # 18g.【被拒的请求在服务端要留一行·四个靶心】（2026.08.04 立卡）：八种拒绝的
+    #     原因 `_deny` 每条都写清楚了，但那句话只进**响应体**，多数 MCP 客户端不显示；
+    #     服务端 `log_message` 整个静音，于是**两头都不说话**，八种原因在用户那里
+    #     长成同一个样子（「连不上」）。落点只有 `_deny` 一处（八条全走它）。
+    #     ⚠ **靶心二必须跟靶心一一起跑**：只跑靶心一的话，「正确实现」与「把
+    #     `log_message` 的静音整个掀掉」在证据上长得一模一样。
+    #     ⚠ 取证靠把 `sys.stderr` 换成 StringIO（`print(..., file=sys.stderr)` 每次
+    #     现查属性，替换全局有效）。这一格在进程内起 server，**不走起动横幅**，
+    #     所以捕到的行就是请求行本身；靶心二据此断"一行都没有"。
+    #     变异：① 删掉 `_deny` 里那行 `self._log_deny(...)` → 靶心一红；
+    #           ② 把 `_log_deny` 里的 `urlsplit(...).path` 换回 `self.path` → 靶心三红；
+    #           ③ 删掉 `_settle_locked` 里返回「另有 X 条」那一行（只保留上限压制）
+    #              → 靶心四红。
+    import socket as _socket18g
+    with tempfile.TemporaryDirectory() as td:
+        (_P(td) / "timeline").mkdir()
+        (_P(td) / "timeline" / "window_01_2026-08-01.md").write_text(
+            "# 第1个窗口 · 2026-08-01\n\n## 2026-08-01 记\n试养了一盆绿萝。\n"
+            "当下状态：长势正常。\n", encoding="utf-8")
+        loader18g = lambda: load_corpus(td)
+        srv18g = MemoryServer(index=loader18g(), thread_store=ThreadStore(),
+                              corpus_dir=td,
+                              retractions_path=_P(td) / ".retractions.json",
+                              loader=loader18g)
+        httpd18g = make_http_server(srv18g, host="127.0.0.1", port=0, token="s3cret")
+        threading.Thread(target=httpd18g.serve_forever, daemon=True).start()
+        port18g = httpd18g.server_address[1]
+        b18g = f"http://127.0.0.1:{port18g}"
+
+        def hit18g(path="/mcp", tok="s3cret", origin=None, method="POST", body=None):
+            req = urllib.request.Request(b18g + path, data=body, method=method)
+            if tok:
+                req.add_header("Authorization", f"Bearer {tok}")
+            if origin:
+                req.add_header("Origin", origin)
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    return r.status
+            except urllib.error.HTTPError as e:
+                e.read()
+                return e.code
+
+        def cap18g(fn):
+            """跑一段，返回它在 stderr 上留下的全部文本。"""
+            buf, old = io.StringIO(), sys.stderr
+            sys.stderr = buf
+            try:
+                fn()
+            finally:
+                sys.stderr = old
+            return buf.getvalue()
+
+        good18g = json.dumps({"jsonrpc": "2.0", "id": 1,
+                              "method": "tools/list"}).encode("utf-8")
+
+        #     靶心一（要说话）：401/403/404/405 各发一次 → **各出现一行**，
+        #     且那行同时含状态码、方法、路径、客户端 IP。
+        #     ⚠ 判的是四条各自出现，不是"stderr 非空"。
+        def _four():
+            assert hit18g(tok="wrong", body=good18g) == 401
+            assert hit18g(origin="https://evil.example", body=good18g) == 403
+            assert hit18g(path="/nope", method="GET") == 404
+            assert hit18g(method="GET") == 405
+
+        out18g = cap18g(_four)
+        for code18g, meth18g, path18g in (("401", "POST", "/mcp"), ("403", "POST", "/mcp"),
+                                          ("404", "GET", "/nope"), ("405", "GET", "/mcp")):
+            hits = [ln for ln in out18g.splitlines()
+                    if ln.startswith(f"被拒 {code18g} ")]
+            assert len(hits) == 1, f"{code18g} 要在 stderr 上留且只留一行：{out18g!r}"
+            assert meth18g in hits[0] and f" {path18g} " in hits[0] \
+                and "127.0.0.1" in hits[0], \
+                f"那一行要同时含方法、路径、客户端 IP：{hits[0]!r}"
+
+        #     靶心二（不许多说）：一次正常往返 → stderr 上**不出现任何请求行**。
+        #     断的是"一个字符都没有"：`log_message` 的静音一旦被掀掉，
+        #     这里会冒出 `"POST /mcp HTTP/1.1" 200 -` 那种访问日志。
+        def _ok():
+            assert hit18g(body=json.dumps(
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                 "params": {"name": "memory_search",
+                            "arguments": {"query": "绿萝"}}}).encode("utf-8")) == 200, \
+                "正常的 tools/call 该 200——它不 200 的话下面那条恒真（假绿）"
+
+        ok18g = cap18g(_ok)
+        assert ok18g == "", \
+            f"正常请求不许留痕——`log_message` 的静音不许被掀掉：{ok18g!r}"
+
+        #     靶心三（不许说漏嘴）：三条硬边界各钉一枚哨兵。
+        def _leak():
+            assert hit18g(tok="wrong-SENTINELA", body=good18g) == 401
+            assert hit18g(path="/nope?token=SENTINELB", method="GET") == 404
+            assert hit18g(body=b"{not json SENTINELC") == 400
+
+        leak18g = cap18g(_leak)
+        assert "SENTINELA" not in leak18g, f"Authorization 一个字符都不许进日志：{leak18g!r}"
+        assert "SENTINELB" not in leak18g, \
+            f"路径要剥掉 query（有客户端把 token 塞 ?token=）：{leak18g!r}"
+        assert "SENTINELC" not in leak18g, \
+            f"请求体不许进日志（里面是 memory_search 的问句／memory_append 的正文）：{leak18g!r}"
+        n404 = [ln for ln in leak18g.splitlines() if ln.startswith("被拒 404 ")]
+        assert len(n404) == 1 and " /nope " in n404[0], \
+            f"剥完 query 那行的路径要正好是 /nope：{n404!r}"
+
+        #     靶心四（上限不静默）：一个窗口内连发 200 条被拒 → 逐条行 ≤ 60，
+        #     **且出现「另有 140 条」那一行**（数目对得上）。压掉不说等于用一个
+        #     新的静默去修一个旧的静默。
+        #     ⚠ 窗口临时缩短到 5 秒，否则要等一分钟；同时**断这 200 发确实落在
+        #     一个窗口里**——夹具太慢导致窗口翻页，跟"上限失效"长得一样。
+        old_win = _HTTP_DENY_LOG_WINDOW
+        globals()["_HTTP_DENY_LOG_WINDOW"] = 5.0
+        try:
+            buf18g, old_err = io.StringIO(), sys.stderr
+            sys.stderr = buf18g
+            try:
+                t018g = time.monotonic()
+
+                def burst_one():
+                    """一条 keep-alive 连接上连发 20 个 404。
+                    ⚠ **10 条连接并发发**：单连接串行跑 200 发要 8 秒多
+                    （每发都吃一次 delayed-ACK，回环上实测 ~43ms），会跨出窗口。"""
+                    sk = _socket18g.create_connection(("127.0.0.1", port18g))
+                    sk.settimeout(10)
+                    for _ in range(20):
+                        sk.sendall(b"GET /nope HTTP/1.1\r\nHost: x\r\n\r\n")
+                        _recv_http(sk)    # 按 Content-Length 收满，理由见 18b
+                    sk.close()
+
+                ths18g = [threading.Thread(target=burst_one) for _ in range(10)]
+                for t in ths18g:
+                    t.start()
+                for t in ths18g:
+                    t.join(timeout=20)
+                burst18g = time.monotonic() - t018g
+                # 溢出那行由定时器在窗口末尾补打，等它
+                dead18g = time.monotonic() + 12
+                while time.monotonic() < dead18g and "另有" not in buf18g.getvalue():
+                    time.sleep(0.05)
+            finally:
+                sys.stderr = old_err
+            burst_out = buf18g.getvalue()
+        finally:
+            globals()["_HTTP_DENY_LOG_WINDOW"] = old_win
+        assert burst18g < 4.0, \
+            f"夹具太慢：这 200 发没落在同一个 5 秒窗口里（用了 {burst18g:.1f}s），" \
+            f"下面的 60／140 不作数——先修夹具，别当成上限失效"
+        each18g = [ln for ln in burst_out.splitlines() if ln.startswith("被拒 ")]
+        assert len(each18g) == _HTTP_DENY_LOG_MAX, \
+            f"逐条行要正好压到上限 {_HTTP_DENY_LOG_MAX} 行，实得 {len(each18g)}"
+        assert f"过去一分钟另有 {200 - _HTTP_DENY_LOG_MAX} 条被拒未逐条列出" in burst_out, \
+            f"压掉的条数必须说出来，且数目对得上：{burst_out!r}"
+        httpd18g.shutdown()
+
     # 19. CLI 入口必须把 stdout 锁成 UTF-8（`--doctor` 打的是中文报告）。第 8 项
     #     锁的是 stdio 传输那条流（serve_stdio 自己包 UTF-8），管不到 `print`。
     #     ⚠ **在 Linux／默认 UTF-8 的机器上这条恒真，在那儿跑不算验过**：变异要在
@@ -1767,7 +2111,11 @@ def _selftest():
           "每句一个 `##` 的导出要报切块警告）/ HTTP 传输真端口往返（鉴权 401、"
           "非回环裸跑拒绝、非 ASCII token 拒绝起动、Origin 403、路径 404、通知 202、"
           "GET 405、批量 400、超限 413、chunked 501、keep-alive 下被拒后同连接重试、"
-          "UTF-8 写回即查、语料变化自动重读、同窗口手动上传不被写回吞掉）/ "
+          "UTF-8 写回即查、语料变化自动重读、同窗口手动上传不被写回吞掉、"
+          "非回环绑定的起动横幅多打一行 TLS 提醒／回环时不打——真进程两个绑法都跑、"
+          "被拒的请求在服务端留一行（码／方法／剥掉 query 的路径／客户端 IP／原因，"
+          "正常请求照旧不打，token 与请求体不进日志，刷屏上限 60 行且溢出条数补一行）"
+          "）/ "
           "CLI 入口把 stdout 锁成 UTF-8（⚠ 变异要在 PYTHONIOENCODING=gbk 下跑，"
           "默认 UTF-8 的机器上这条恒真））")
 
@@ -1796,7 +2144,8 @@ if __name__ == "__main__":
     ap.add_argument("--http", metavar="[HOST:]PORT",
                     help="改走 Streamable HTTP（省略 HOST 默认 127.0.0.1）——给只认 "
                          "HTTP 的客户端（Kelivo/Operit 这类）直连用，不再需要 "
-                         "supergateway 桥。非回环地址必须配 token，否则拒绝起动")
+                         "supergateway 桥。非回环地址必须配 token，否则拒绝起动；"
+                         "绑非回环还会多打一行 TLS 提醒——那条链路是裸 HTTP")
     ap.add_argument("--token",
                     help="HTTP 传输的 Bearer token（也可用环境变量 MEMORY_HTTP_TOKEN；"
                          "客户端侧填进 bearerToken/Authorization 头）")
@@ -1836,6 +2185,10 @@ if __name__ == "__main__":
             print(f"Streamable HTTP 服务在 http://{host}:{httpd.server_address[1]} "
                   f"（鉴权：{'Bearer token' if token else '无——仅限回环+外层反代'}；"
                   f"语料变化自动重读）", file=sys.stderr)
+            # 非回环绑定多打一行 TLS 提醒：只提示、不拒绝起动，也不看有没有配 token
+            notice = http_tls_notice(host)
+            if notice:
+                print(notice, file=sys.stderr)
             httpd.serve_forever()
         else:
             srv.serve_stdio()

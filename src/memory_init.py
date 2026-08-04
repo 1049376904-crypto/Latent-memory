@@ -40,6 +40,7 @@
 import argparse
 import json
 import re
+import shutil
 import sys
 from collections import namedtuple
 from datetime import datetime
@@ -1350,23 +1351,16 @@ mtime 在这里不是"不太准"，是**全错且整齐地错**——重新下�
 """
 
 
-def write_corpus(memory_dir, entries, gap_seconds=1800, start_window=1):
-    """导入的中间格式条目（memory_import.MemoryEntry）→ timeline/ 下的 md。
+_WINDOW_NO_RE = re.compile(r"^window_(\d+)")
 
-    一个会话一个文件，按时间间隔断开（同 entries_to_index 的自然边界判据）。
+CORPUS_OVERWRITE_CODE = "CORPUS_TIMELINE_OVERWRITE"
 
-    **文件名带日期**，因为文件名日期是 parse_chunk_timestamp 的最高优先级来源——
-    真实语料那次 95.6% 的块落到 mtime 兜底，根子就是文件名不带日期。我们自己生成
-    的语料没有理由重蹈；日期来自条目时间戳，是有据可依的，不是猜的。整段没有时间
-    戳的会话就不写日期，也不编一个。
 
-    index/ 建出来但留空，见 INDEX_README。"""
-    mem = Path(memory_dir)
-    timeline = mem / "timeline"
-    timeline.mkdir(parents=True, exist_ok=True)
-    (mem / "index").mkdir(parents=True, exist_ok=True)
-    (mem / "index" / "README.txt").write_text(INDEX_README, encoding="utf-8")
+def plan_corpus_files(entries, gap_seconds=1800, start_window=1):
+    """条目 → {窗口号: (文件名, 正文)}，**一个字都不落盘**。
 
+    单独拆出来是为了让写入侧的护栏能在**任何写盘之前**判完（同引导句超长闸那条
+    理由：出到一半才拒绝，目录里留下半套货，而错误信息说的是「不出货」）。"""
     sessions, cur, last_ts = [], [], None
     for e in entries:
         ts = getattr(e, "timestamp", None)
@@ -1379,7 +1373,7 @@ def write_corpus(memory_dir, entries, gap_seconds=1800, start_window=1):
     if cur:
         sessions.append(cur)
 
-    written = []
+    planned = {}
     for n, sess in enumerate(sessions, start_window):
         stamps = [e.timestamp for e in sess if getattr(e, "timestamp", None)]
         day = datetime.fromtimestamp(min(stamps)).strftime("%Y-%m-%d") if stamps else None
@@ -1387,10 +1381,125 @@ def write_corpus(memory_dir, entries, gap_seconds=1800, start_window=1):
         head = f"# 第{n}个窗口" + (f" · {day}" if day else "")
         body = [f"{e.speaker}：{e.text}" if getattr(e, "speaker", "") else e.text
                 for e in sess]
-        (timeline / name).write_text(head + "\n\n" + "\n".join(body) + "\n",
-                                     encoding="utf-8")
+        planned[n] = (name, head + "\n\n" + "\n".join(body) + "\n")
+    return planned
+
+
+def corpus_overwrite_conflicts(timeline, planned):
+    """本次出货会改掉磁盘上哪些窗口 → 排好序的窗口号列表（空表＝写下去不损失任何东西）。
+
+    **判据落在目录层，不逐文件各判**（任务卡写死的）：逐文件各自决定要不要备份，
+    会出现「一部分窗口备份了、一部分没有」的半覆盖，那比全覆盖更难排查。所以这里
+    只回答一个是非题——整个 timeline 会不会变样——由调用方对**整个目录**做处置。
+
+    **判据取「内容不同」，不是「有没有 .bak」**（与人格文件那侧同口径）：第一次出货
+    时目录是空的，那不是覆盖；同一份语料原样重跑一遍，写出来跟磁盘上一模一样，
+    也不是覆盖——那两种都不该拦。
+
+    同一个窗口号换了文件名（日期变了）也算改动：老文件不会被删，于是同号两份并排
+    躺着，检索层读到的是哪一份取决于遍历顺序——这跟内容被覆盖一样是损坏，只是更
+    难看出来。"""
+    timeline = Path(timeline)
+    if not timeline.is_dir():
+        return []
+    existing = {}
+    for p in sorted(timeline.glob("*.md")):
+        m = _WINDOW_NO_RE.match(p.name)
+        if m:
+            existing.setdefault(int(m.group(1)), {})[p.name] = p.read_text(encoding="utf-8")
+    conflicts = []
+    for n, (name, text) in planned.items():
+        current = existing.get(n)
+        if current and current != {name: text}:
+            conflicts.append(n)
+    return sorted(conflicts)
+
+
+def backup_corpus_dir(timeline):
+    """把整个 timeline 目录备份一份，返回备份目录路径。**只加不减**：不删原目录、
+    不动原文件，也**不覆盖已经存在的备份**。
+
+    `.bak` 的命名形状跟人格文件那侧对齐（`<名>.bak`），但多一条：备份目录被占了就
+    往后顺号（`timeline.bak2`、`timeline.bak3`……），**不像人格文件那侧那样直接盖掉
+    旧的 .bak**。语料这侧不能盖，因为每份备份存的是那一刻的全量，而两次出货之间
+    用户可能用 memory_append 写进过新窗口：拿新备份盖旧备份，会把只存在于旧备份里
+    的那部分记忆抹掉——那正是这条护栏要挡的事，护栏自己不能犯。
+    人格文件能重新生成，记忆不能。"""
+    timeline = Path(timeline)
+    backup = timeline.with_name(timeline.name + ".bak")
+    n = 2
+    while backup.exists():
+        backup = timeline.with_name(f"{timeline.name}.bak{n}")
+        n += 1
+    shutil.copytree(timeline, backup)
+    return backup
+
+
+def guard_corpus_overwrite(timeline, planned, mode="block"):
+    """写之前的护栏：按 mode 决定拦下来、先备份、还是照写。返回备份目录或 None。
+
+    **默认 blocking**（2026.08.04）。原先是同名文件直接 `write_text` 覆盖——不备份、
+    不提示、不报错，而 `memory_append` 写回用的是同一套命名形状，所以出货第二遍到
+    同一个 memory/，会盖掉用户后来写进去的窗口。人格文件那侧 08.01 就为「覆盖自己
+    那份」加了 .bak 护栏，那段注释自己写着**「沉默地覆盖才是最坏的形态」**——同一个
+    最坏形态，语料侧一直一点护栏都没有。而**语料是用户唯一不可再生的东西**：人格
+    文件能重新生成，记忆不能。
+
+    **拦截必须有出口**（姊妹卡《初始化输入侧静默塌节与无出口拦截》立的规矩）——
+    没出口的拦截会把用户推去手工搬文件，那是比覆盖更糟的一条路。出口两条：
+      - `backup`：整目录备份完再写（`--backup-corpus`）；
+      - `accept`：我知道会覆盖，就这么办（`--accept-corpus-overwrite`）。
+    **刻意不做「换目录」那一支**：用户本来就能换 `--out`，为它新开一个开关等于凭空
+    多一套目录语义。"""
+    conflicts = corpus_overwrite_conflicts(timeline, planned)
+    if not conflicts:
+        return None
+    if mode == "accept":
+        return None
+    if mode == "backup":
+        return backup_corpus_dir(timeline)
+    windows = "、".join(f"window_{n:02d}" for n in conflicts[:5]) + \
+              ("…" if len(conflicts) > 5 else "")
+    raise PermissionError(
+        f"{CORPUS_OVERWRITE_CODE}：目标记忆库 {Path(timeline)} 里已有 "
+        f"{len(conflicts)} 个窗口会被这次出货改写（{windows}）。"
+        "语料是不可再生的——你后来用 memory_append 写进去的窗口就长在这些文件里，"
+        "盖掉就没了。两条出口，挑一条重跑本步："
+        "加 --backup-corpus（先把整个 timeline 备份成 timeline.bak 再写，只加不减），"
+        "或加 --accept-corpus-overwrite（我知道会覆盖，就这么办）。"
+        "想留着这份记忆库不动，就换一个 --out 目录。")
+
+
+def write_corpus(memory_dir, entries, gap_seconds=1800, start_window=1,
+                 corpus_overwrite="block"):
+    """导入的中间格式条目（memory_import.MemoryEntry）→ timeline/ 下的 md。
+    返回 (写下的文件列表, 备份目录或 None)。
+
+    一个会话一个文件，按时间间隔断开（同 entries_to_index 的自然边界判据）。
+
+    **文件名带日期**，因为文件名日期是 parse_chunk_timestamp 的最高优先级来源——
+    真实语料那次 95.6% 的块落到 mtime 兜底，根子就是文件名不带日期。我们自己生成
+    的语料没有理由重蹈；日期来自条目时间戳，是有据可依的，不是猜的。整段没有时间
+    戳的会话就不写日期，也不编一个。
+
+    **重跑不许静默覆盖已有窗口**：目标 timeline 里已有的窗口会被这次改样时就停下来，
+    出口见 guard_corpus_overwrite。护栏在**任何写盘之前**判完。
+
+    index/ 建出来但留空，见 INDEX_README。"""
+    mem = Path(memory_dir)
+    timeline = mem / "timeline"
+    planned = plan_corpus_files(entries, gap_seconds, start_window)
+    # 护栏要在 mkdir / 写 README 之前过：拦下来的那次不该在用户目录里留任何痕迹
+    backup = guard_corpus_overwrite(timeline, planned, corpus_overwrite)
+    timeline.mkdir(parents=True, exist_ok=True)
+    (mem / "index").mkdir(parents=True, exist_ok=True)
+    (mem / "index" / "README.txt").write_text(INDEX_README, encoding="utf-8")
+
+    written = []
+    for _, (name, text) in sorted(planned.items()):
+        (timeline / name).write_text(text, encoding="utf-8")
         written.append(timeline / name)
-    return written
+    return written, backup
 
 
 def contract_source(base=None):
@@ -1619,7 +1728,7 @@ def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
                  server_path=None, confirmed=False, entries=None,
                  contract_base=None, previous_persona=None, route=None,
                  validation_mode="legacy_v1", rendered_override=None,
-                 add_coverage=True):
+                 add_coverage=True, corpus_overwrite="block"):
     """产出四件套（generic 档多一份注入契约副本）。**confirmed=False 时拒绝写盘**——写用户磁盘要过确认关卡
     （规格 §7：人格文件任何改动必须用户确认）。
 
@@ -1629,7 +1738,10 @@ def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
     init_state.json）传进来；只有它、且它跟这次的档不同名时才退役。不传就一个都不碰。
 
     entries 给了就把语料落成记忆库（write_corpus）；没给就只把目录建出来——
-    用户可能是把已有语料目录用 corpus_dir 直接指过来的，那份不该被我们重写。"""
+    用户可能是把已有语料目录用 corpus_dir 直接指过来的，那份不该被我们重写。
+
+    `corpus_overwrite`（block／backup／accept）透传给写入侧护栏：目标 timeline 里
+    已有的窗口会被这次改样时默认停下来，不静默覆盖。见 guard_corpus_overwrite。"""
     if not confirmed:
         raise PermissionError("未确认，不写盘——人格文件写入必须过用户确认关卡")
     # 第二道闸：还有没走过确认的草稿就不许出货。
@@ -1652,8 +1764,15 @@ def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
     # 引导句的超长闸要在**任何写盘之前**过：出到一半才拒绝，目录里留下半套货，
     # 而错误信息说的是「不出货」
     guidance_body = guidance_text(persona_path)
+    # 语料侧的覆盖护栏要跟引导句超长闸挨在一起过：**都在任何写盘之前**。语料一旦
+    # 被盖就取不回来了，不能等到目录里已经躺了半套货再拦
+    corpus_backup = None
+    if entries:
+        written, corpus_backup = write_corpus(out / "memory", entries,
+                                              corpus_overwrite=corpus_overwrite)
+    else:
+        written = []
     (out / "memory").mkdir(parents=True, exist_ok=True)
-    written = write_corpus(out / "memory", entries) if entries else []
     corpus = Path(corpus_dir) if corpus_dir else out / "memory"
     # **覆盖区间要在渲染之前写进人格文件**：它是每轮都在的那一层，而护栏挂在工具
     # 返回值上的话，模型一绕过工具（grep、直接读文件）就一条都不生效
@@ -1731,7 +1850,7 @@ def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
     return {"persona": persona_path, "memory_dir": out / "memory",
             "mcp_config": out / "mcp-config.json", "corpus_files": written,
             "guidance": guidance, "contract": contract, "retired": retired,
-            "overwritten_backup": overwritten}
+            "overwritten_backup": overwritten, "corpus_backup": corpus_backup}
 
 
 def save_state(out_dir, state):
@@ -2019,7 +2138,7 @@ def _selftest():
             MemoryEntry(timestamp=1750000300.0, speaker="我", text="我答了她"),
             MemoryEntry(timestamp=1750100000.0, speaker="她", text="隔天的新话题")]
     with tempfile.TemporaryDirectory() as td:
-        files = write_corpus(Path(td) / "memory", ents)
+        files, _ = write_corpus(Path(td) / "memory", ents)
         assert len(files) == 2, "时间间隔超 gap 要断成两个会话文件"
         day1 = datetime.fromtimestamp(1750000000.0).strftime("%Y-%m-%d")
         assert files[0].name == f"window_01_{day1}.md", f"文件名要带日期：{files[0].name}"
@@ -3366,7 +3485,11 @@ def _selftest():
             "--persona", str(persona_file), "--step", "inspect", "--json").stdout)
         drift_table = {row["section"]: (row["before"], row["after"])
                        for row in drift_payload["persona_drift"]["table"]}
-        assert drift_table.get("user") == (2, 0) and drift_table.get("closing") == (2, 0), \
+        # ⚠ 这两个数 2026.08.04 从 (2,0) 改成 (1,0)：台账第二条把标题块打成 delete
+        #   之后，差异表的口径是**只数正文块**（`original_block_counts` 的 docstring
+        #   写了为什么两边都不数标题）。这一节各只有一段虚构正文，所以是 1。
+        #   **塌空这件事本身照旧抓得住**——1→0 跟 2→0 一样是整节被吞掉。
+        assert drift_table.get("user") == (1, 0) and drift_table.get("closing") == (1, 0), \
             f"删标题后必须报出「上次 N 块 → 这次 0 块」的差异表：{drift_table}"
         assert "PERSONA_SECTION_COLLAPSED" in {
             issue["code"] for issue in drift_payload["blocking_issues"]}, \
@@ -3425,7 +3548,182 @@ def _selftest():
         shipped_text = (root / "AGENTS.md").read_text(encoding="utf-8")
         assert "去语料里找" not in shipped_text and "虚构自述" in shipped_text
 
-    print("selftest ok（61项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
+    # 62.【两个靶心，真命令】重跑出货不许静默覆盖已有语料。
+    #     夹具：现造一份虚构聊天 txt（两段会话跨两天、间隔超 gap → 落成两个窗口文件），
+    #     走 v1 全流程真命令出货，再用 append_record（memory_append 那支笔本身）
+    #     往 window_02 里写一条，然后**重跑出货**。
+    #     ⚠ 靶心二那条才是原始现场：靶心一只证明「已有文件时会停」，
+    #       靶心二证明「用户后来写进去的那句话没被吃掉」。
+    #     ⚠ 全程看产出目录里的文件正文，**不拿「出货成功、无报错」当通过证据**
+    #       ——那正是这个洞的形态本身。
+    #     变异：把 write_corpus 里那行 guard_corpus_overwrite 删掉（或让
+    #     corpus_overwrite_conflicts 恒返回 []）→ 重跑直接静默出货、追加句消失，
+    #     这一段转红。
+    with tempfile.TemporaryDirectory() as td:
+        from memory_retrieval import append_record
+        root = Path(td)
+        script = str(Path(__file__).resolve())
+        chat = root / "虚构聊天.txt"
+        chat.write_text("2026-07-15 21:03 她\n虚构：今晚的月亮很大。\n"
+                        "2026-07-15 21:05 我\n虚构：我看到了。\n"
+                        "2026-07-16 09:00 她\n虚构：早，今天出门吗。\n",
+                        encoding="utf-8")
+        timeline = root / "memory" / "timeline"
+        APPEND_ONE = "虚构：她说想学游泳。"
+
+        def run_ow(*extra, check=True):
+            r = subprocess.run([sys.executable, script, "--out", str(root), *extra],
+                               cwd=str(root), capture_output=True, text=True,
+                               encoding="utf-8")
+            assert not check or r.returncode == 0, f"跑挂了：{extra}\n{r.stdout}\n{r.stderr}"
+            return r
+
+        def ship(*extra, check=True):
+            return run_ow("--step", "ship", "--client", "codex",
+                          "--import", str(chat), *extra, check=check)
+
+        def backups():
+            return sorted(p.name for p in root.glob("memory/timeline.bak*"))
+
+        def window_02():
+            return next(timeline.glob("window_02_*.md")).read_text(encoding="utf-8")
+
+        qs_ow = json.loads(run_ow("--step", "questionnaire", "--json").stdout)
+        run_ow("--step", "answers", "--answers-json", json.dumps(
+            {q["qid"]: ({"keys": "".join(sorted(q["options"])[:2])} if q["options"]
+                        else {"pick": "她说“到家了发一句”，我说好。"})
+             for q in qs_ow["questions"]}, ensure_ascii=False))
+        listed_ow = json.loads(run_ow("--step", "confirm", "--list", "--json").stdout)
+        run_ow("--step", "confirm", "--decisions-json", json.dumps(
+            {p["key"]: "keep" for p in listed_ow["pending"]}, ensure_ascii=False))
+        run_ow("--step", "route", "--route", "zero-dep")
+        assert ship().returncode == 0, "第一次出货本来就该出得了——目录是空的，没什么可覆盖"
+        assert {p.name for p in timeline.glob("*.md")} == \
+            {"window_01_2026-07-15.md", "window_02_2026-07-16.md"}
+        assert not backups(), "第一次出货没覆盖任何东西，不该凭空造备份"
+
+        #    靶心二的现场：用户用 memory_append 往已有窗口里写了一句
+        append_record(root / "memory", APPEND_ONE, "还没报名", window=2)
+        assert APPEND_ONE in window_02()
+
+        #    靶心一：目标 timeline 非空且会被改样 → 必须停下来，不许静默覆盖
+        blocked = ship(check=False)
+        blocked_msg = blocked.stdout + blocked.stderr
+        assert blocked.returncode != 0 and CORPUS_OVERWRITE_CODE in blocked_msg, \
+            f"重跑出货静默覆盖了语料：{blocked_msg}"
+        assert "--backup-corpus" in blocked_msg and "--accept-corpus-overwrite" in blocked_msg, \
+            "拦截必须把出口写在拦截信息里，否则用户只能去手工搬文件"
+        #    靶心二：那句话必须还在。**这条才是原始现场**
+        assert APPEND_ONE in window_02(), "被拦下来的那次不许动用户已有的窗口"
+        assert not backups(), "拦下来的那次不该在用户目录里留下任何痕迹"
+
+        #    出口①：备份完再写。追加句在备份里取得回来
+        assert ship("--backup-corpus").returncode == 0
+        assert backups() == ["timeline.bak"]
+        assert APPEND_ONE in next(
+            (root / "memory" / "timeline.bak").glob("window_02_*.md")
+        ).read_text(encoding="utf-8"), "备份里必须有用户写进去的那句话，否则备份等于没做"
+        assert APPEND_ONE not in window_02(), "备份之后是照写——这一步没写等于出口是假的"
+
+        #    判据取「内容不同」而不是「目录非空」：原样再跑一遍不该被拦，也不该造备份
+        assert ship().returncode == 0, "同一份语料原样重跑，写出来跟磁盘上一样，不该拦"
+        assert backups() == ["timeline.bak"]
+
+        #    出口②：显式确认覆盖。不备份、直接写
+        append_record(root / "memory", "虚构：她报名了周三那节课。", "已报名", window=2)
+        assert ship("--accept-corpus-overwrite").returncode == 0
+        assert "虚构：她报名了" not in window_02(), "确认覆盖那条出口没真的写下去"
+        assert backups() == ["timeline.bak"], "--accept-corpus-overwrite 是「不备份直接写」"
+
+        #    只加不减：再备份一次，旧备份原样留着，新备份顺号——每份备份存的是那一刻
+        #    的全量，拿新的盖旧的会把只活在旧备份里的那段记忆抹掉
+        append_record(root / "memory", "虚构：第一节课她迟到了。", "在上课", window=2)
+        assert ship("--backup-corpus").returncode == 0
+        assert backups() == ["timeline.bak", "timeline.bak2"]
+        assert APPEND_ONE in next(
+            (root / "memory" / "timeline.bak").glob("window_02_*.md")
+        ).read_text(encoding="utf-8"), "旧备份被新备份盖掉了——护栏自己犯了它要挡的事"
+
+    # 63.【两个靶心，真命令】节标题不许出现两遍；用户自己的人称写法要保住。
+    #     （走查台账第二条 ＋ 台账里"顺带一件别漏"的人称温差，一并做。）
+    #     夹具：现造一份虚构人格文件，四个一级标题（其中用户那节写的是「她是谁」
+    #     ——**人称就藏在这一行里**）＋四段虚构正文，走 v2 全流程真命令出货。
+    #     ⚠ 两个靶心**分开断言**，不合成一条：
+    #       靶心一（标题只出现一次）看的是 parse_original_text 给标题块打的 delete；
+    #       靶心二（人称是用户自己的写法）看的是 persona_pronouns 那条链。
+    #     ⚠ **不许拿「original_span_coverage 还是 1.0」当通过证据**：覆盖率不看
+    #       operation，对这条改动天然恒真，跑了也不说明任何事。判据一律取
+    #       **产出文件的正文**。
+    #     变异一：parse_original_text 里标题块改回 operation="keep"（proposed_text
+    #       跟着还原）→ 靶心一转红（每个标题数出来是 2）。
+    #     变异二：preview_payload 与 prepare_section_versions 里的 persona_pronouns(state)
+    #       改回写死 None → 靶心二转红（标题变成中性的「对方是谁」）。
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        script = str(Path(__file__).resolve())
+        persona_file = root / "输入人格.md"
+        #  ⚠ 正文里**不许出现标题里的那几个字**：下面靶心一数的是字面出现次数，
+        #    正文自己带一个就把这把尺子废了（第一版夹具写的是「虚构开篇。」，
+        #    数出来 2 次，看着像洞其实是夹具的伪影）。
+        persona_file.write_text(
+            "# 开篇\n\n虚构：认得彼此。\n\n# 她是谁\n\n虚构：她怕吵。\n\n"
+            "# 我是谁\n\n虚构自述。\n\n# 最终约定\n\n虚构：说到做到。\n", encoding="utf-8")
+
+        def run_dup(*extra, check=True):
+            return subprocess.run(
+                [sys.executable, script, "--out", str(root), *extra],
+                capture_output=True, text=True, encoding="utf-8", check=check)
+
+        run_dup("--persona", str(persona_file), "--step", "inspect", "--json")
+        dup_qs = json.loads(run_dup("--step", "choose-sections", "--json").stdout)
+        run_dup("--step", "choose-sections", "--section-decisions-json",
+                json.dumps({q["section"]: q["section_versions"][0]["id"]
+                            for q in dup_qs["sections"]}, ensure_ascii=False), "--json")
+        run_dup("--step", "preview", "--json")
+        run_dup("--step", "route", "--route", "zero-dep")
+        dup_ship = run_dup("--step", "ship", "--client", "codex", check=False)
+        assert dup_ship.returncode == 0, \
+            f"干净的输入本来就该出得了货：{dup_ship.stdout + dup_ship.stderr}"
+        shipped = (root / "AGENTS.md").read_text(encoding="utf-8")
+
+        #  靶心一：产出文件里每个节标题只出现一次。数的是**标题里那几个字**，
+        #  因为骨架渲染的是 `## 开篇 · …`、用户原文写的是 `# 开篇`，两者不同字面
+        #  ——只比整行会漏掉这个洞。
+        #  ⚠ **这一条要跟人称那条相互独立**：用户那节的标题里带人称，直接数
+        #    「她是谁」的话，人称一退回中性标签这条也跟着红，两个靶心就并成了
+        #    一条断言（任务卡要求分开守）。所以这里数与人称无关的「是谁」——
+        #    不管渲染成「她是谁」还是「对方是谁」，全文都该正好两处节标题带它
+        #    （用户那节一处、`我是谁` 一处）。
+        for title in ("开篇", "最终约定"):
+            assert shipped.count(title) == 1, \
+                f"标题「{title}」在产出文件里出现了 {shipped.count(title)} 次：" \
+                "骨架渲染一遍、原文块又进正文一遍"
+        assert shipped.count("是谁") == 2, \
+            f"「是谁」那两个节标题出现了 {shipped.count('是谁')} 次（该是 2）：" \
+            "原文标题块又进了一次正文"
+        assert "虚构：她怕吵。" in shipped and "虚构：说到做到。" in shipped, \
+            "标题打 delete 不许连正文一起吞掉——那就成了另一个洞"
+
+        #  靶心二：人称是用户自己写的那个字，不是中性标签。
+        #  两处都要：节标题，以及协议层开篇那句每轮都在的话。
+        assert "## 她是谁" in shipped and "对方是谁" not in shipped, \
+            f"节标题被渲染成了中性标签，不是用户自己的写法：{shipped[:400]}"
+        assert "这是你和她共同维护的记忆文件" in shipped, \
+            "协议层默认值里的 {ta} 没跟着用户的写法走——同一份文件里两种称呼"
+
+        #  补充（函数层，不是靶心）：读不出来就走中性写法，不猜、不塞默认的他／她。
+        def _ta(heading):
+            return persona_pronouns({"compiler_items": [{
+                "source_type": "original_persona", "section": "user",
+                "original_text": heading, "text": heading}]})
+        assert _ta("# 他是谁") == {"user": "他", "ai": None}
+        assert _ta("# 小鱼是谁") == {"user": "小鱼", "ai": None}
+        assert _ta("# 对方是谁") is None and _ta("# 用户是谁") is None, \
+            "「对方」「用户」是我们替他挑的词，不是他自己的写法"
+        assert _ta("# 它是谁") is None, "「它」在任何一档都不许出现"
+        assert _ta("# 我是谁") is None, "不是用户那节的标题句式，读不出来就该是 None"
+
+    print("selftest ok（63项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
           "归属句式 / 默认值不预支历史 / 协议层不问用户 / 导出纪律 / 渲染顺序 / "
           "人称锚死一套 / 用户只有一种称呼形态 / 昵称档不被静默吃掉 / 中性档不丢主语 / 人称从语料读出来 / 中性写法不许漏 / 语料侧判定不许猜 / 全文零它 / 称呼不重复拼接 / 关系状态归开篇 / "
           "答案读回不静默丢 / 任务书不泄漏进人格文件 / 长字面量不崩 / 未决草稿不蒸发 / "
@@ -3438,7 +3736,13 @@ def _selftest():
           "默认 UTF-8 的机器上这条恒真） / "
           "改一次输入人格文件不许静默塌节（跨运行比对差异表，整节塌空是 blocking，"
           "⚠ 不拿覆盖率 1.0 当通过证据） / "
-          "TASK_DIRECTIVE_REMAINS 在该节有一个带 diff 的「删除该块」版本，选它能出货）")
+          "TASK_DIRECTIVE_REMAINS 在该节有一个带 diff 的「删除该块」版本，选它能出货 / "
+          "重跑出货不许静默覆盖语料（判据落在目录层、取「内容不同」；两条出口"
+          "--backup-corpus／--accept-corpus-overwrite 都实跑过；⚠ 靶心二看的是"
+          "memory_append 写进去的那句话还在不在，不拿「出货成功、无报错」当证据） / "
+          "节标题在产出文件里只出现一次（标题块打 delete，原文仍被逐字认领）＋"
+          "人称取用户自己在标题里的写法，不是中性的「对方」"
+          "（⚠ 两条分开断言；⚠ 不拿覆盖率 1.0 当通过证据，它不看 operation））")
 
 
 def _rebuild(state):
@@ -3672,6 +3976,59 @@ def task_directive_delete_items(items):
     return twins
 
 
+# 用户那一节的标题模板是 `{ta}是谁`（persona_template.SECTION_ORDER）。人称就写在
+# 用户自己那行标题里——**正则从模板现拼，不另写一份**：模板哪天改了，这里跟着走。
+_TA_HEADING_PREFIX, _, _TA_HEADING_SUFFIX = SECTIONS["user"].partition("{ta}")
+_TA_HEADING_RE = re.compile(
+    r"^\s{0,3}#{1,6}\s*" + re.escape(_TA_HEADING_PREFIX)
+    + r"(.+?)" + re.escape(_TA_HEADING_SUFFIX) + r"\s*$")
+# 读到这些等于没读到：它们本来就是**我们**替用户挑的词（中性写法用的就是「对方」），
+# 不是他自己的写法。拿它们去填 {ta} 会把一句中性话伪装成"用户原来就这么写的"。
+_TA_NOT_A_PRONOUN = frozenset({"用户", "对方", "ta", "TA", "你", "我", "TA 是谁", "这个人"})
+
+
+def persona_pronouns(state):
+    """v2 出货路径的人称：**从用户自己那份人格文件里读出来**，读不到就走中性写法。
+
+    2026.08.04（走查台账第二条的第二件）：v2 这条路上 `pronouns` 一路写死 `None`，
+    于是十二节骨架把用户那节的标题渲染成中性标签「对方是谁」、协议层开篇渲染成
+    「这是你和对方共同维护的记忆文件」——**而用户自己写的是「她」**。恋人向人格
+    文件上这个温差用户看得出来，而且它在不变量层、每轮都在。
+    台账第二条把标题块打成 `delete` 之后这件事更硬了：用户那行 `## 她是谁` 不再
+    进正文，**中性标签就是他唯一能看到的那个标题**，写错就没有别处兜着。
+
+    判据只认一处：用户自己那节的标题行（`{ta}是谁`）。**这是他亲手写的字**，
+    比任何统计都准，也不需要额外读语料。读不出来就返回 None 走中性写法——
+    不猜、不塞默认的他／她（同 `pronouns_from_answers`：两边都没有就是 None）。
+
+    ⚠ 语料侧的人称判定（`detect_pronouns`）**没有接进 v2**，v1 问卷那条路才走它。
+    这里不假装有：它需要在 inspect 步把整份语料读一遍，是另一件事。
+
+    返回 `{"user": …, "ai": None}`——AI 那一侧在出货文本里没有槽位（`我是谁` 是
+    定死的标题，协议层模板里只有 `{ta}`），没有可读之处就不编一个出来。"""
+    from persona_compiler import is_heading_block
+
+    for item in state.get("compiler_items", ()):
+        if item.get("source_type") != "original_persona" or item.get("section") != "user":
+            continue
+        if not is_heading_block(item):
+            continue
+        text = item.get("original_text") or item.get("text") or ""
+        first_line = text.splitlines()[0] if text.splitlines() else text
+        match = _TA_HEADING_RE.match(first_line)
+        if not match:
+            continue
+        ta = match.group(1).strip()
+        if ta in PRONOUN_CHOICES:
+            return {"user": ta, "ai": None}
+        # 昵称档：跟 pronouns_from_answers 用同一套护栏（不许「它」、限长）——
+        # 这东西会填进句子中间，四十个字的"称呼"会把每一句都撑坏。
+        if (ta and ta not in _TA_NOT_A_PRONOUN and len(ta) <= NICKNAME_MAX_CHARS
+                and not any(bad in ta for bad in _NICKNAME_REJECT)):
+            return {"user": ta, "ai": None}
+    return None
+
+
 def prepare_section_versions(state):
     """从来源项确定性重建十二节版本；旧决定只在版本 ID 仍存在时保留。"""
     from persona_compiler import (
@@ -3684,7 +4041,9 @@ def prepare_section_versions(state):
              if not str(item.get("item_id", "")).endswith(DIRECTIVE_DELETE_SUFFIX)]
     items.extend(task_directive_delete_items(items))
     refs = {item.source_ref for item in items}
-    for item in protocol_items():
+    # 协议层默认值里的 {ta} 按用户自己的写法填（见 persona_pronouns）；
+    # 读不出来才退到中性写法——**这一句是那个"温差"的另一半**，跟节标题同源一份人称。
+    for item in protocol_items(persona_pronouns(state)):
         if item.source_ref not in refs:
             items.append(item)
     if any(item.section == "style" and item.source_type != "protocol" for item in items):
@@ -3763,7 +4122,8 @@ def section_choice_payload(state):
 def apply_original_section_decisions(state, decisions):
     """给解析失败／跨节原文块选择主节；只移动整块，不拆句、不改字。"""
     from dataclasses import replace
-    from persona_compiler import item_from_dict, item_to_dict
+    from persona_compiler import (
+        HEADING_DELETE_REASON, is_heading_block, item_from_dict, item_to_dict)
 
     items = [item_from_dict(item) for item in state.get("compiler_items", ())]
     by_id = {item.item_id: item for item in items
@@ -3780,6 +4140,18 @@ def apply_original_section_decisions(state, decisions):
             continue
         if choice not in valid_sections:
             raise ValueError(f"未知人格节：{choice}")
+        # ⚠ 标题块保持 delete：手工归节是"这块归哪一节"，不是"要不要进正文"。
+        #   这里若跟着改成 keep/move，用户手动归一次节，那一节的标题就又出现两遍
+        #   ——而且只在"归节判不出来"的那些文件上发作，最难被发现。
+        if is_heading_block(item):
+            #   理由与 proposed_text 一并给全：旧版 state 里的标题块还是 keep、
+            #   `operation_reason` 是空的，只改 operation 会撞 PersonaItem 那条
+            #   "rewrite/delete 必须说明理由"的校验。
+            updated.append(replace(
+                item, section=choice, operation="delete", proposed_text="",
+                operation_reason=HEADING_DELETE_REASON,
+                confidence="user_mapped", confirmed=False))
+            continue
         updated.append(replace(
             item, section=choice,
             operation="keep" if item.section == choice else "move",
@@ -3821,6 +4193,9 @@ def preview_payload(state):
     lines = ["# 核心人格", ""]
     unresolved = []
     source_summary = {}
+    # 节标题的人称跟正文同源一份（见 persona_pronouns）：原来这里写死 None，
+    # 于是写「她」的用户拿到的标题是中性的「对方是谁」——同一份文件里两种称呼。
+    pronouns = persona_pronouns(state)
     decisions = state.get("section_decisions", {})
     for section, label in SECTION_ORDER:
         decision = decisions.get(section)
@@ -3835,7 +4210,7 @@ def preview_payload(state):
             continue
         source_summary[section] = selected.get("source_summary", [])
         if selected.get("markdown", "").strip():
-            lines.extend([f"## {fill_pronouns(label, None)}", "",
+            lines.extend([f"## {fill_pronouns(label, pronouns)}", "",
                           selected["markdown"].rstrip(), ""])
     markdown = "\n".join(lines).rstrip() + "\n"
     warnings = [issue for issue in state.get("diagnostics", [])
@@ -4031,7 +4406,12 @@ def _drift_payload(persona_file, before_hash, after_hash, rows, collapsed, ackno
     issues = [CompileIssue(
         "PERSONA_SOURCE_DRIFT", "warning",
         "输入人格文件跟上次 inspect 时不是同一份（sha256 变了）。本次归入各节的"
-        "原文块数 vs 上次：" + ("；".join(table) if table else "各节块数没有变化"))]
+        "原文块数 vs 上次：" + ("；".join(table) if table else "各节块数没有变化")
+        # ⚠ 口径写在数字旁边：光给「上次 3 块 → 这次 2 块」，用户没法自己分辨
+        #   少的那块是内容没了、还是我们数的东西变了（标题块 2026.08.04 起打
+        #   delete、不进正文）。两边都不数标题，所以这个数不会因为那次改动而跳。
+        + "。（只数正文块，不含 markdown 标题行——标题由十二节骨架统一渲染，"
+        "两次都不计入。）")]
     before_by_section = {row["section"]: row["before"] for row in rows}
     if collapsed:
         detail = "、".join(
@@ -4298,7 +4678,8 @@ def _step_ship_v2(args, state):
         raise SystemExit("不出货：" + "；".join(
             f"{issue.code}：{issue.message}" for issue in blocking))
     persona = build_persona_from_items(
-        [item_from_dict(item) for item in state.get("compiler_items", [])], pronouns=None)
+        [item_from_dict(item) for item in state.get("compiler_items", [])],
+        pronouns=persona_pronouns(state))
     client, switched = resolve_client(args.client, state.get("client"))
     if switched:
         print(switched + "\n")
@@ -4525,6 +4906,16 @@ def _step_route(args, state):
     print(format_routes())
 
 
+def _corpus_overwrite_mode(args):
+    """两个开关 → 写入侧护栏的档位。两个都给就走备份：备份本来就包含「照写」，
+    而反过来（照写却没备份）会丢东西——含糊的时候倒向留得下的那一边。"""
+    if getattr(args, "backup_corpus", False):
+        return "backup"
+    if getattr(args, "accept_corpus_overwrite", False):
+        return "accept"
+    return "block"
+
+
 def _step_ship(args, state):
     # 检索路线必须先选过一次（2026.08.02）。**这里刻意是硬闸不是默认值**：
     # 三条路里有一条会把私人记忆发到第三方，而"用户从没被问过"和"用户选了默认"
@@ -4555,7 +4946,7 @@ def _step_ship(args, state):
         paths = write_bundle(args.out, persona, client=client,
                              corpus_dir=args.corpus, confirmed=True, entries=entries,
                              previous_persona=state.get("last_shipped_persona"),
-                             route=route)
+                             route=route, corpus_overwrite=_corpus_overwrite_mode(args))
     except (PermissionError, ValueError, FileNotFoundError) as e:
         raise SystemExit(f"不出货：{e}")
     print("【四件套】")
@@ -4573,6 +4964,13 @@ def _step_ship(args, state):
         # 拼错了会变成"确认过的更新不生效"，而那是最难自查的一种坏法
         print(f"  已退役：{bak.with_suffix('').name} → {bak.name}"
               f"（换档后旧档的人格文件不再更新，别再拼它）")
+    if paths.get("corpus_backup"):
+        # 备份了就必须说出来，而且要说清「为什么会有这一步」：静默地把语料换掉，
+        # 跟静默覆盖是同一种坏法，只是多了一份没人知道的备份
+        print(f"\n⚠ 目标记忆库里原来那些窗口会被这次出货改写，整个 timeline 已备份成："
+              f"{paths['corpus_backup']}")
+        print("   你后来用 memory_append 写进去的内容在那份备份里，"
+              "对着它把该留的贴回 memory/timeline/。（备份只加不减，我们不会删它。）")
     if paths.get("overwritten_backup"):
         # **沉默地覆盖才是最坏的形态**：老用户升级重跑 ship 是对的做法，但他手改过
         # 的段落不在 state 里、重放不出来。所以这里必须说出来，并指向那份备份。
@@ -4721,6 +5119,15 @@ if __name__ == "__main__":
                     help="confirm 步：只列出待确认草稿，不进交互循环")
     ap.add_argument("--decisions-json", dest="decisions_json",
                     help="confirm 步：结构化决定（同上三种取值），非交互落盘")
+    # 重跑出货会盖掉目标 timeline 里已有的窗口（包括用户后来用 memory_append 写进去
+    # 的），所以默认拦住。**拦截必须留出口**，这两个就是；「换目录」那一支刻意不做
+    # ——`--out` 本来就能换，为它新开开关等于凭空多一套目录语义
+    ap.add_argument("--backup-corpus", dest="backup_corpus", action="store_true",
+                    help="ship 步：先把整个 memory/timeline 备份成 timeline.bak（只加不减，"
+                         "已有备份就顺号）再写")
+    ap.add_argument("--accept-corpus-overwrite", dest="accept_corpus_overwrite",
+                    action="store_true",
+                    help="ship 步：确认「我知道会覆盖已有窗口，就这么办」，不备份直接写")
     ap.add_argument("--import", dest="import_path",
                     help="ship 步：语料导出文件（ChatGPT/Claude json、聊天 txt、timeline md），"
                          "由 memory_import 认格式并落成记忆库")

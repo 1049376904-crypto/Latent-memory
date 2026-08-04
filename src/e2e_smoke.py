@@ -198,10 +198,18 @@ def run_persona_compiler_cases():
         preview, _ = _compile_v2_case(
             original_case, original, corpus_dir, rich,
             preferred_text="绝不讨论她没有主动带起的家庭细节")
-        from persona_compiler import parse_original_persona
+        from persona_compiler import is_heading_block, parse_original_persona
+        original_items = parse_original_persona(original)
         assert all(item.text.rstrip() in preview["persona_markdown"]
-                   for item in parse_original_persona(original)), \
-            "原人格重排后每个逐字块都必须完整出现"
+                   for item in original_items if not is_heading_block(item)), \
+            "原人格重排后每个逐字正文块都必须完整出现"
+        # ⚠ **标题块除外**（2026.08.04，走查台账第二条）：标题打的是 `operation="delete"`
+        #   ——不是丢掉，是不再进正文，由十二节骨架统一渲染一遍，否则每个标题在产出
+        #   文件里出现两遍。所以这里改成数「标题里那几个字只出现一次」。
+        for heading in ("我是谁", "最终约定"):
+            assert preview["persona_markdown"].count(heading) == 1, \
+                f"节标题「{heading}」在产出文本里出现了 " \
+                f"{preview['persona_markdown'].count(heading)} 次"
         assert "第一次完成海图修复" in preview["persona_markdown"], "语料应补入具体里程碑"
         assert "风格参考，非台词" in preview["persona_markdown"], "真实风格片段必须带学习免责声明"
         # 免责声明的检索层那半也必须真的落到出货文本里（任务卡 风格片段挤掉检索）：

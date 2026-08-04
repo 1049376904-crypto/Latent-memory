@@ -205,6 +205,27 @@ def _section_from_heading(line):
     return None
 
 
+HEADING_RE = re.compile(r"^\s{0,3}#{1,6}(?:\s|$)")
+# 标题块打 delete 的理由（`PersonaItem` 强制 rewrite/delete 必须说明理由）。
+# 这句会出现在用户看得到的 diff 里，所以写成"为什么"，不是"做了什么"。
+HEADING_DELETE_REASON = (
+    "这一行是节标题。出货时十二节骨架会按 SECTION_ORDER 统一渲染一遍标题，"
+    "原文标题再进正文的话，同一个标题在产出文件里会出现两遍。"
+    "标题仍被逐字认领（span／hash 不动，覆盖率照旧），只是不再进正文。")
+
+
+def is_heading_block(item):
+    """这一块原文是不是「一行标题」。收 `PersonaItem` 或它的 dict 形态。
+
+    判据跟 `parse_original_text` 里那条 `re.match` 同源：块的**第一行**是 markdown
+    标题。原文块的切法保证标题自成一块（`_text_blocks` 遇标题行即断），所以
+    第一行是标题＝整块就是那一行标题。"""
+    data = item if isinstance(item, dict) else item_to_dict(item)
+    text = data.get("original_text") or data.get("text") or ""
+    first_line = text.splitlines()[0] if text.splitlines() else text
+    return bool(HEADING_RE.match(first_line))
+
+
 def _text_blocks(text):
     """返回原文块的精确字符区间；围栏内部永远不解释成标题。"""
     lines = text.splitlines(keepends=True)
@@ -250,14 +271,23 @@ def _text_blocks(text):
 
 
 def parse_original_text(text, source_ref):
-    """把原人格切成精确 span；不改写、不丢弃任何非空原文。"""
+    """把原人格切成精确 span；不改写、不丢弃任何非空原文。
+
+    ⚠ **标题块打 `operation="delete"`**（2026.08.04，走查台账第二条）：标题行身兼二职
+    ——它既是归节锚点，又是一块原文。锚点照常用（`current_section` 在这儿设），
+    但它作为原文再进一次正文的话，出货文件里每个节标题必然出现两遍：一遍是
+    十二节骨架渲染的 `## {label}`，一遍是用户自己那行。
+    **不能靠"丢掉标题"来解决**——本函数的承诺是"不丢弃任何非空原文"，那是被
+    `original_span_coverage` 硬顶着的不变量。`delete` 是第三条路：块还在、span 与
+    hash 一字不动、覆盖率照旧算它，只是拼正文时被 `operation != "delete"` 过滤掉。"""
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     current_section = None
     items = []
     for index, (start, end) in enumerate(_text_blocks(text), 1):
         block = text[start:end]
         first_line = block.splitlines()[0] if block.splitlines() else block
-        if re.match(r"^\s{0,3}#{1,6}(?:\s|$)", first_line):
+        heading = bool(HEADING_RE.match(first_line))
+        if heading:
             current_section = _section_from_heading(first_line)
         section = current_section
         items.append(PersonaItem(
@@ -265,7 +295,9 @@ def parse_original_text(text, source_ref):
             source_type="original_persona",
             source_ref=f"{source_ref}:{start}-{end}",
             source_span=(start, end), source_hash=digest,
-            operation="keep", original_text=block, proposed_text=block,
+            operation="delete" if heading else "keep",
+            original_text=block, proposed_text="" if heading else block,
+            operation_reason=HEADING_DELETE_REASON if heading else "",
             confidence="exact" if section else "ambiguous", confirmed=False,
             group_id=f"orig:block:{index}"))
     return items
@@ -306,13 +338,22 @@ def original_block_counts(items):
     ⚠ `operation == "delete"` 的不计：它是同一块的另一个版本（比如任务书残句的
     「删除该块」版本），不是第二块原文；计进去两边的数会一起虚高、差异表失真。
 
+    ⚠ **标题块一律不计，不看 `operation`**（2026.08.04，台账第二条落地时补）：
+    标题块现在打的就是 `delete`（见 `parse_original_text`），上面那条本来就够。
+    这里之所以再单独判一次标题，是为了**让这个数在这次口径变化前后一致**：
+    用户上一次是用旧版跑的，state 里存着的标题块 `operation` 还是 `keep`，只按
+    operation 判的话，重跑时每节会整体少一块——那是口径变了，不是内容丢了，而
+    用户拿到的是一张「上次 3 块 → 这次 2 块」的表，**没法自己分辨是哪一种**；
+    只有标题、没有正文的节还会被误判成「塌空」而 blocking。
+    差异表量的是**正文原文块有没有被吞掉**，标题块从来不是正文，两边都不计最干净。
+
     收 `PersonaItem` 或它的 dict 形态都行——状态文件里存的是 dict。"""
     counts = {}
     for item in items:
         data = item if isinstance(item, dict) else item_to_dict(item)
         if data.get("source_type") != "original_persona":
             continue
-        if data.get("operation") == "delete":
+        if data.get("operation") == "delete" or is_heading_block(data):
             continue
         key = data.get("section") or UNMAPPED_SECTION_KEY
         counts[key] = counts.get(key, 0) + 1
@@ -521,8 +562,12 @@ def build_section_versions(section, items, conflicts):
         selected_items.sort(key=lambda item: order[item.item_id])
         markdown = "\n\n".join(
             item.proposed_text for item in selected_items if item.operation != "delete")
+        # 标题块的 delete 不进 diff：它每节都在、内容永远是那一行标题，摊开来
+        # **会把真正的删除淹掉**（同 compare_original_block_counts 只列有变化的节）。
+        # 纪律三要摊开的是「用户的内容被删了」，而标题并没有被删——骨架会把它渲染
+        # 回来，只是不再出现两遍。
         diffs = [render_item_diff(item) for item in selected_items
-                 if item.operation in {"rewrite", "delete"}]
+                 if item.operation in {"rewrite", "delete"} and not is_heading_block(item)]
         item_ids = tuple(item.item_id for item in selected_items)
         digest = hashlib.sha256(
             (section + "\0" + "\0".join(item_ids)).encode("utf-8")
@@ -785,7 +830,14 @@ def _selftest():
     assert original_span_coverage(source, parsed) == 1.0
     assert "## 这不是标题" in covered
     assert any("## 这不是标题" in entry.text for entry in parsed)
-    assert all(entry.operation in ("keep", "move") for entry in parsed)
+    # 正文块照旧 keep／move；**标题块打 delete**（台账第二条：不这么做标题必然出现
+    # 两遍），但仍被逐字认领——上面那条覆盖率 1.0 的断言就压着这一点：
+    # delete 不等于丢，span 与 original_text 一字不动。
+    assert all(entry.operation in ("keep", "move")
+               for entry in parsed if not is_heading_block(entry))
+    assert [entry.operation for entry in parsed if is_heading_block(entry)] == ["delete"]
+    assert all(entry.proposed_text == "" and entry.operation_reason
+               for entry in parsed if is_heading_block(entry))
 
     # 变异：删掉 compare_original_block_counts 里 before>0 and after==0 那一支，
     #   或者把 delete 版本也计进 original_block_counts，这一段会红。
@@ -799,9 +851,18 @@ def _selftest():
     assert original_span_coverage(drift_after, after_items) == 1.0
     rows, collapsed = compare_original_block_counts(before_counts, after_counts)
     assert collapsed == ["closing"], collapsed
+    #   数里**不含标题块**（台账第二条落地后的口径，见 original_block_counts 的
+    #   docstring）：这两节各只有一段正文，所以是 1，不是 1 段正文＋1 行标题的 2。
     assert {row["section"]: (row["before"], row["after"]) for row in rows} == {
-        "closing": (2, 0), "ai": (2, 3)}
+        "closing": (1, 0), "ai": (1, 2)}
     assert compare_original_block_counts(before_counts, before_counts) == ([], [])
+    #   口径变化不许被读成"内容丢了"：拿**旧版 state 的形态**（标题块还是 keep）
+    #   跟这次的比，两边必须一个字不差——否则老用户重跑会看到每节整体 -1，
+    #   只有标题没有正文的节还会被误判成塌空。变异：把 original_block_counts 里
+    #   `or is_heading_block(data)` 删掉 → 这条转红。
+    legacy_shape = [dict(item_to_dict(entry), operation="keep", proposed_text=entry.text)
+                    for entry in parse_original_text(drift_before, "CLAUDE.md")]
+    assert original_block_counts(legacy_shape) == before_counts
 
     # 变异：人格路径重新混回 corpus_files，会把最高权重来源降成普通记忆块。
     import tempfile

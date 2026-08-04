@@ -204,6 +204,11 @@ def run_persona_compiler_cases():
             "原人格重排后每个逐字块都必须完整出现"
         assert "第一次完成海图修复" in preview["persona_markdown"], "语料应补入具体里程碑"
         assert "风格参考，非台词" in preview["persona_markdown"], "真实风格片段必须带学习免责声明"
+        # 免责声明的检索层那半也必须真的落到出货文本里（任务卡 风格片段挤掉检索）：
+        # 只有前半时，模型有片段可答就不去调 memory_search。删掉这半这条必须红。
+        assert "不是记忆" in preview["persona_markdown"] \
+            and "先查记忆库" in preview["persona_markdown"], \
+            "免责声明必须同时带检索层那半（片段不是记忆、提到过去先查库）"
         from persona_compiler import aggregate_persona_metrics
         metric_state = json.loads((original_case / "init_state.json").read_text(encoding="utf-8"))
         metric_state["privacy_metrics"] = {

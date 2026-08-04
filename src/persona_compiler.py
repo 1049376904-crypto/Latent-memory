@@ -292,6 +292,52 @@ def original_span_coverage(text, items):
     return len(required & covered) / len(required)
 
 
+UNMAPPED_SECTION_KEY = "__unmapped__"
+
+
+def original_block_counts(items):
+    """统计原文块按节的分布，用于跨运行比对。
+
+    ⚠ **这是 `original_span_coverage` 抓不到的那一面**：覆盖率的分母是「本次传进来
+    的那份 text」现算的（见上面那个函数），用户删掉的字符不在分母里，所以删标题
+    导致整节塌进邻节时覆盖率仍是 1.0——**那把尺子在结构上就量不到这件事**。
+    要发现它只能拿「上一次的归节结果」跟这次比，本函数给的就是可比的那个数。
+
+    ⚠ `operation == "delete"` 的不计：它是同一块的另一个版本（比如任务书残句的
+    「删除该块」版本），不是第二块原文；计进去两边的数会一起虚高、差异表失真。
+
+    收 `PersonaItem` 或它的 dict 形态都行——状态文件里存的是 dict。"""
+    counts = {}
+    for item in items:
+        data = item if isinstance(item, dict) else item_to_dict(item)
+        if data.get("source_type") != "original_persona":
+            continue
+        if data.get("operation") == "delete":
+            continue
+        key = data.get("section") or UNMAPPED_SECTION_KEY
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def compare_original_block_counts(previous, current):
+    """比对两次归节的块数，返回 (差异表, 这次塌空的节)。
+
+    只列有变化的节——没变的节列出来会把真正的差异淹在一屏输出里。
+    「塌空」＝上次有块、这次一块都没有，是整节被吞掉的形态（走查里真发生的那种）。"""
+    rows = []
+    collapsed = []
+    for key in sorted(set(previous) | set(current)):
+        before = int(previous.get(key, 0))
+        after = int(current.get(key, 0))
+        if before == after:
+            continue
+        rows.append({"section": key, "before": before, "after": after,
+                     "delta": after - before})
+        if before > 0 and after == 0:
+            collapsed.append(key)
+    return rows, collapsed
+
+
 def _sha256_path(path):
     digest = hashlib.sha256()
     with Path(path).open("rb") as fh:
@@ -741,6 +787,22 @@ def _selftest():
     assert any("## 这不是标题" in entry.text for entry in parsed)
     assert all(entry.operation in ("keep", "move") for entry in parsed)
 
+    # 变异：删掉 compare_original_block_counts 里 before>0 and after==0 那一支，
+    #   或者把 delete 版本也计进 original_block_counts，这一段会红。
+    #   靶心是「删标题 → 整节塌进邻节，而覆盖率仍是 1.0」——**覆盖率断言故意留在
+    #   这里**：它证明的不是通过，是那把尺子确实看不见这件事。
+    drift_before = "# 我是谁\n\n甲段。\n\n# 最终约定\n\n乙段。\n"
+    drift_after = "# 我是谁\n\n甲段。\n\n乙段。\n"
+    before_counts = original_block_counts(parse_original_text(drift_before, "CLAUDE.md"))
+    after_items = parse_original_text(drift_after, "CLAUDE.md")
+    after_counts = original_block_counts(after_items)
+    assert original_span_coverage(drift_after, after_items) == 1.0
+    rows, collapsed = compare_original_block_counts(before_counts, after_counts)
+    assert collapsed == ["closing"], collapsed
+    assert {row["section"]: (row["before"], row["after"]) for row in rows} == {
+        "closing": (2, 0), "ai": (2, 3)}
+    assert compare_original_block_counts(before_counts, before_counts) == ([], [])
+
     # 变异：人格路径重新混回 corpus_files，会把最高权重来源降成普通记忆块。
     import tempfile
     from pathlib import Path
@@ -810,7 +872,8 @@ def _selftest():
                for value in metrics.values())
     assert not ({"text", "source_ref", "persona_file"} & set(metrics))
 
-    print("selftest ok（来源 IR、序列化、逐字解析、输入隔离、来源合并、冲突与节版本）")
+    print("selftest ok（来源 IR、序列化、逐字解析、输入隔离、来源合并、冲突与节版本、"
+          "跨运行归节块数比对）")
 
 
 if __name__ == "__main__":

@@ -1662,19 +1662,25 @@ def _selftest():
         sk.settimeout(10)
         sk.sendall((f"POST /mcp HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer s3cret\r\n"
                     f"Content-Length: {_HTTP_BODY_LIMIT + 1}\r\n\r\n").encode())
-        assert "413" in sk.recv(65536).decode("utf-8", "replace").split("\r\n")[0]
+        #     ⚠ 收响应一律走 `_recv_http`，不许 `sk.recv()` 一发了事——理由见 18c
+        assert "413" in _recv_http(sk).split("\r\n")[0]
         sk.close()
 
         # 18c.【chunked 明确不支持，且报错指对方向·变异靶心】（2026.08.03 外部实测）
         #     原先走到"请求体不是合法的 UTF-8 JSON"，把人往「我 JSON 写错了」引，
         #     真因是传输编码不匹配——跟 supergateway 时代「默认 SSE 与客户端不匹配」
         #     同形物。变异：把 Transfer-Encoding 那一支删掉 → 这条红
+        #     ⚠ **必须走 `_recv_http` 按 Content-Length 收满**（2026.08.04「自检偶发红」
+        #     那单的根因）：`_send` 先冲响应头、再写 body 是两段，单发 `recv` 常常只
+        #     拿到头——于是查状态行的断言恒绿、查 body 的那条随机红，看起来就是
+        #     「偶发红、复跑即绿、与本轮改动无关」。同日撞了四次都记成噪音。
+        #     ⚠ 这条规矩 18b 的 `_recv_http` docstring 里早写着，这里当时没照着用。
         sk = _socket.create_connection(("127.0.0.1", httpd.server_address[1]))
         sk.settimeout(10)
         sk.sendall((f"POST /mcp HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer s3cret\r\n"
                     f"Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
                     ).encode() + f"{len(raw):x}\r\n".encode() + raw + b"\r\n0\r\n\r\n")
-        ck = sk.recv(65536).decode("utf-8", "replace")
+        ck = _recv_http(sk)
         assert "501" in ck.split("\r\n")[0], f"chunked 要回 501 不是 400：{ck.splitlines()[0]}"
         assert "Transfer-Encoding" in ck and "JSON 写错" in ck, \
             "报错必须指向传输编码，并明说不是 JSON 的问题——指错方向就是这条的病灶"
@@ -1745,17 +1751,36 @@ def _selftest():
             "同窗口里的手动上传不许被自己的写回吞掉——吞掉就再也不重读了（静默）"
         httpd18e.shutdown()
 
-    print("selftest ok（18项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层 / "
+    # 19. CLI 入口必须把 stdout 锁成 UTF-8（`--doctor` 打的是中文报告）。第 8 项
+    #     锁的是 stdio 传输那条流（serve_stdio 自己包 UTF-8），管不到 `print`。
+    #     ⚠ **在 Linux／默认 UTF-8 的机器上这条恒真，在那儿跑不算验过**：变异要在
+    #     `PYTHONIOENCODING=gbk` 下跑——删掉 `__main__` 里的
+    #     `sys.stdout.reconfigure(...)` 必须转红，加回去复绿。
+    assert (getattr(sys.stdout, "encoding", "") or "").lower().replace("-", "") == "utf8", \
+        f"CLI 入口没把 stdout 锁成 UTF-8（当前 {sys.stdout.encoding}）：" \
+        "中文 Windows（cp936）下 --doctor 遇到 emoji 会 UnicodeEncodeError"
+
+    print("selftest ok（19项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层 / "
           "完整链路 / stdio / UTF-8 / 写回当场可查 / 用进撑过重启 / "
           "无可靠命中明确说 / 撤回更正闭环 / 缺失率标注接线 / 实体标注接线 / "
           "部署体检只读 / 部署体检走真进程（相对路径解析开、空语料非零退出、"
           "每句一个 `##` 的导出要报切块警告）/ HTTP 传输真端口往返（鉴权 401、"
           "非回环裸跑拒绝、非 ASCII token 拒绝起动、Origin 403、路径 404、通知 202、"
           "GET 405、批量 400、超限 413、chunked 501、keep-alive 下被拒后同连接重试、"
-          "UTF-8 写回即查、语料变化自动重读、同窗口手动上传不被写回吞掉））")
+          "UTF-8 写回即查、语料变化自动重读、同窗口手动上传不被写回吞掉）/ "
+          "CLI 入口把 stdout 锁成 UTF-8（⚠ 变异要在 PYTHONIOENCODING=gbk 下跑，"
+          "默认 UTF-8 的机器上这条恒真））")
 
 
 if __name__ == "__main__":
+    # 中文 Windows（cp936/GBK）下 stdout 按系统区域编码写，`--doctor` 的中文报告
+    # 一遇到 emoji 就 UnicodeEncodeError（缘由与判据见 memory_init.py 同一处注释）。
+    # stdio 传输那条路本来就已经自己包了 UTF-8（见 serve_stdio），这里补的是
+    # **面向控制台的那部分输出**；改的是编码，不是 ensure_ascii。
+    # ⚠ 只放在 `__main__` 里：被 import 时不许改掉调用方进程的 stdout。
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--doctor", action="store_true",

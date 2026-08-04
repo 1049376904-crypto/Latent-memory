@@ -3317,7 +3317,115 @@ def _selftest():
         "### 第 7 步：接入客户端", 1)[0]
     assert "请写一句" not in compiler_section and "自由文本入口" in compiler_section
 
-    print("selftest ok（58项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
+    # 59. CLI 入口必须把 stdout 锁成 UTF-8（`__main__` 里那两行 reconfigure）。
+    #     ⚠ **这条断言在 Linux／默认 UTF-8 的机器上恒真，在那儿跑不算验过**：
+    #     变异要在 `PYTHONIOENCODING=gbk` 下跑——删掉 `__main__` 里的
+    #     `sys.stdout.reconfigure(...)`，`PYTHONIOENCODING=gbk python memory_init.py
+    #     --selftest` 必须转红；加回去复绿。三个入口（本文件 / memory_import /
+    #     mcp_server）各有一条同形断言。
+    assert (getattr(sys.stdout, "encoding", "") or "").lower().replace("-", "") == "utf8", \
+        f"CLI 入口没把 stdout 锁成 UTF-8（当前 {sys.stdout.encoding}）：" \
+        "中文 Windows（cp936）下 --json 遇到 emoji 会 UnicodeEncodeError"
+
+    # 60.【A 靶心，真命令】改一次输入人格文件不许静默塌节。
+    #     夹具：现造一份带四个 markdown 标题的虚构人格文件，跑完一遍出货；
+    #     然后**只删掉其中两行标题、正文一字不动**，从 --step inspect 重跑。
+    #     ⚠ **不许拿「覆盖率还是 1.0」当通过证据**——那正是走查里没抓住的那把尺子。
+    #     这里反过来断言 ORIGINAL_COVERAGE_INCOMPLETE **不出现**：证明的是旧闸门
+    #     在结构上看不见这件事，所以必须有跨运行比对，不是证明这次通过了。
+    #     变异：把 persona_drift_report 开头改成 `return None`（或删掉 shipping_issues
+    #     里读 persona_drift 那一支）→ 这一整段转红。
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        script = str(Path(__file__).resolve())
+        persona_text = ("# 开篇\n\n虚构开篇。\n\n# 我是谁\n\n虚构自述。\n\n"
+                        "# 对方是谁\n\n虚构对方。\n\n# 最终约定\n\n虚构约定。\n")
+        persona_file = root / "输入人格.md"
+        persona_file.write_text(persona_text, encoding="utf-8")
+
+        def run_drift(*extra, check=True):
+            return subprocess.run(
+                [sys.executable, script, "--out", str(root), *extra],
+                capture_output=True, text=True, encoding="utf-8", check=check)
+
+        def walk_and_ship():
+            qs = json.loads(run_drift("--step", "choose-sections", "--json").stdout)
+            run_drift("--step", "choose-sections", "--section-decisions-json",
+                      json.dumps({q["section"]: q["section_versions"][0]["id"]
+                                  for q in qs["sections"]}, ensure_ascii=False), "--json")
+            run_drift("--step", "preview", "--json")
+            run_drift("--step", "route", "--route", "zero-dep")
+            return run_drift("--step", "ship", "--client", "codex", check=False)
+
+        run_drift("--persona", str(persona_file), "--step", "inspect", "--json")
+        assert walk_and_ship().returncode == 0, "干净的输入本来就该出得了货"
+        persona_file.write_text(
+            persona_text.replace("# 对方是谁\n\n", "").replace("# 最终约定\n\n", ""),
+            encoding="utf-8")
+        drift_payload = json.loads(run_drift(
+            "--persona", str(persona_file), "--step", "inspect", "--json").stdout)
+        drift_table = {row["section"]: (row["before"], row["after"])
+                       for row in drift_payload["persona_drift"]["table"]}
+        assert drift_table.get("user") == (2, 0) and drift_table.get("closing") == (2, 0), \
+            f"删标题后必须报出「上次 N 块 → 这次 0 块」的差异表：{drift_table}"
+        assert "PERSONA_SECTION_COLLAPSED" in {
+            issue["code"] for issue in drift_payload["blocking_issues"]}, \
+            "整节塌空只打 warning 等于没报——warning 在一屏输出里看不见"
+        collapsed_ship = walk_and_ship()
+        collapsed_msg = collapsed_ship.stdout + collapsed_ship.stderr
+        assert collapsed_ship.returncode != 0 and "PERSONA_SECTION_COLLAPSED" in collapsed_msg, \
+            f"塌节后必须拦在出货口：{collapsed_msg}"
+        assert "ORIGINAL_COVERAGE_INCOMPLETE" not in collapsed_msg, \
+            "逐字覆盖率闸门本来就看不见塌节；它要是红了说明这段夹具没在测该测的东西"
+        # 拦截必须有出口，否则又把用户逼回「手改输入文件」——那正是塌节的成因。
+        accepted = json.loads(run_drift(
+            "--persona", str(persona_file), "--step", "inspect", "--json",
+            "--accept-persona-drift").stdout)
+        assert not accepted["blocking_issues"] and "PERSONA_SECTION_COLLAPSED" in {
+            issue["code"] for issue in accepted["warnings"]}
+        assert walk_and_ship().returncode == 0, "确认过就该能出货，不能变成死路"
+
+    # 61.【B 靶心，真命令】TASK_DIRECTIVE_REMAINS 要有出口，不靠用户手改输入文件。
+    #     夹具：现造一份含任务书残句（命中 TASK_DIRECTIVE_TOKENS）的虚构人格文件。
+    #     变异：把 task_directive_delete_items 的返回改成 []
+    #     → 该节只剩 1 个版本、ship 被 TASK_DIRECTIVE_REMAINS 拦死，这一段转红。
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        script = str(Path(__file__).resolve())
+        persona_file = root / "输入人格.md"
+        persona_file.write_text(
+            "# 开篇\n\n虚构开篇。\n\n# 我是谁\n\n虚构自述。\n\n"
+            "# 对方是谁\n\n对方喜欢什么去语料里找：待补。\n\n# 最终约定\n\n虚构约定。\n",
+            encoding="utf-8")
+
+        def run_exit(*extra, check=True):
+            return subprocess.run(
+                [sys.executable, script, "--out", str(root), *extra],
+                capture_output=True, text=True, encoding="utf-8", check=check)
+
+        run_exit("--persona", str(persona_file), "--step", "inspect", "--json")
+        exit_qs = json.loads(run_exit("--step", "choose-sections", "--json").stdout)
+        hit_section = next(q for q in exit_qs["sections"] if q["section"] == "user")
+        dropped = [version for version in hit_section["section_versions"]
+                   if "去语料里找" not in version["markdown"]]
+        assert len(hit_section["section_versions"]) >= 2 and dropped, \
+            "被拦住的那一节必须多出一个「删除该块」的版本，否则这份人格文件无法出货"
+        assert "操作：delete" in dropped[0]["diff"] and "-对方喜欢什么去语料里找" in dropped[0]["diff"], \
+            f"删除版本必须带 diff（纪律三：原文 delete 要在该节把 diff 摊开）：{dropped[0]['diff']}"
+        exit_decisions = {q["section"]: q["section_versions"][0]["id"]
+                          for q in exit_qs["sections"]}
+        exit_decisions["user"] = dropped[0]["id"]
+        run_exit("--step", "choose-sections", "--section-decisions-json",
+                 json.dumps(exit_decisions, ensure_ascii=False), "--json")
+        run_exit("--step", "preview", "--json")
+        run_exit("--step", "route", "--route", "zero-dep")
+        exit_ship = run_exit("--step", "ship", "--client", "codex", check=False)
+        assert exit_ship.returncode == 0, \
+            f"选了删除版本之后必须能出货：{exit_ship.stdout + exit_ship.stderr}"
+        shipped_text = (root / "AGENTS.md").read_text(encoding="utf-8")
+        assert "去语料里找" not in shipped_text and "虚构自述" in shipped_text
+
+    print("selftest ok（61项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
           "归属句式 / 默认值不预支历史 / 协议层不问用户 / 导出纪律 / 渲染顺序 / "
           "人称锚死一套 / 用户只有一种称呼形态 / 昵称档不被静默吃掉 / 中性档不丢主语 / 人称从语料读出来 / 中性写法不许漏 / 语料侧判定不许猜 / 全文零它 / 称呼不重复拼接 / 关系状态归开篇 / "
           "答案读回不静默丢 / 任务书不泄漏进人格文件 / 长字面量不崩 / 未决草稿不蒸发 / "
@@ -3325,7 +3433,12 @@ def _selftest():
           "pick 题只许挑不许写 / 冷启动出得了货 / "
           "AI 驱动不绕过确认 / 确认关卡 / 续跑 / 完整性 / generic 档随货带契约 / "
           "CLI 真进程走文档教的那条命令 / 换档退役旧档 / 同档重跑不自退 / "
-          "不动不是我们出的文件 / 覆盖手改的人格文件前必先备份并说出来 / MCP 配置路径可直接用 / ship 话术不串档 / 检索路线是真选择点 / 云端档落到启动参数 / 凭证不进产出目录 / 引导句是指针（绝对路径、超长不出货、换档跟着换） / MCP 配置分可搬运与绝对路径两档（占位符只给 Claude Code、必带默认值、半套可搬运不许出） / 覆盖区间的 {end} 是提示不是断言 / 指针护栏盖住 timeline 写回层）")
+          "不动不是我们出的文件 / 覆盖手改的人格文件前必先备份并说出来 / MCP 配置路径可直接用 / ship 话术不串档 / 检索路线是真选择点 / 云端档落到启动参数 / 凭证不进产出目录 / 引导句是指针（绝对路径、超长不出货、换档跟着换） / MCP 配置分可搬运与绝对路径两档（占位符只给 Claude Code、必带默认值、半套可搬运不许出） / 覆盖区间的 {end} 是提示不是断言 / 指针护栏盖住 timeline 写回层 / "
+          "CLI 入口把 stdout 锁成 UTF-8（⚠ 变异要在 PYTHONIOENCODING=gbk 下跑，"
+          "默认 UTF-8 的机器上这条恒真） / "
+          "改一次输入人格文件不许静默塌节（跨运行比对差异表，整节塌空是 blocking，"
+          "⚠ 不拿覆盖率 1.0 当通过证据） / "
+          "TASK_DIRECTIVE_REMAINS 在该节有一个带 diff 的「删除该块」版本，选它能出货）")
 
 
 def _rebuild(state):
@@ -3508,6 +3621,57 @@ def _style_disclaimer_item():
         confidence="protocol", confirmed=True, group_id="mechanism:style_disclaimer")
 
 
+# 任务书／空指令的词面。**只有这一份**：出货闸（shipping_issues）拿它判拦不拦，
+# 选择题（task_directive_delete_items）拿同一份生成「删除该块」的版本。
+# ⚠ 两处必须同源——各写一份的话，闸门拦得住的句子选择题里生不出出口，
+#   用户就又被推回「手改输入文件」那条路（那正是现象 A 的雷区）。
+TASK_DIRECTIVE_TOKENS = ("去语料里找", "记住用户喜好", "请用户补写", "请写一句")
+
+# 「删除该块」版本的 item_id 后缀。每次重建节版本时先按这个后缀清掉旧的再重生成，
+# 免得用户改了归节之后留下一个挂在旧节上的孤儿版本。
+DIRECTIVE_DELETE_SUFFIX = ":directive-delete"
+
+
+def task_directive_delete_items(items):
+    """给命中任务书残句的原文块，额外造一个「删除该块」的版本。
+
+    **这是 `TASK_DIRECTIVE_REMAINS` 的出口**（2026.08.03 走查第五条）：拦截本身是对的
+    ——待办占位不该进成品——但在此之前流程里没有退出路径，那一节只生成 1 个版本、
+    不含「删掉它」，于是这份人格文件**通过官方命令无法出货**，唯一出路是手工编辑
+    输入文件后整条重跑；而手改输入文件正是静默塌节（现象 A）的雷区。
+
+    做法是给同一块原文再造一个 `operation="delete"` 的孪生条目，**共用 group_id**
+    ——于是 `build_conflicts` 把两者判成同一语义组的不同版本，
+    `build_section_versions` 的 `itertools.product` 自然给这一节生出两个版本：
+    保留的和删掉的。`render_item_diff` 只对 rewrite/delete 出 diff，所以删除那版
+    **自带 diff 和拦截理由**，兑现指南纪律三「原文 delete 必须在该节把 diff 摊开」。
+
+    ⚠ 孪生条目的 `source_span` / `source_hash` / `original_text` 一个字不动：
+    `original_span_coverage` 认的是这三样，动了会把逐字覆盖闸门弄红。"""
+    from dataclasses import replace
+
+    twins = []
+    for item in items:
+        if item.source_type != "original_persona" or item.section is None:
+            continue
+        if item.operation not in {"keep", "move"}:
+            continue
+        hit = [token for token in TASK_DIRECTIVE_TOKENS if token in item.original_text]
+        if not hit:
+            continue
+        twins.append(replace(
+            item,
+            item_id=item.item_id + DIRECTIVE_DELETE_SUFFIX,
+            operation="delete",
+            proposed_text="",
+            confirmed=False,
+            operation_reason=(
+                "TASK_DIRECTIVE_REMAINS：这一块含任务书或空指令（命中「"
+                + "」「".join(hit)
+                + "」），带着它出货会被拦下。选这个版本＝把这块原文删掉。")))
+    return twins
+
+
 def prepare_section_versions(state):
     """从来源项确定性重建十二节版本；旧决定只在版本 ID 仍存在时保留。"""
     from persona_compiler import (
@@ -3516,7 +3680,9 @@ def prepare_section_versions(state):
     )
 
     state = dict(state)
-    items = [item_from_dict(item) for item in state.get("compiler_items", ())]
+    items = [item_from_dict(item) for item in state.get("compiler_items", ())
+             if not str(item.get("item_id", "")).endswith(DIRECTIVE_DELETE_SUFFIX)]
+    items.extend(task_directive_delete_items(items))
     refs = {item.source_ref for item in items}
     for item in protocol_items():
         if item.source_ref not in refs:
@@ -3692,7 +3858,9 @@ def shipping_issues(state, persona_markdown, manifest):
 
     issues = [CompileIssue(
         issue["code"], issue["severity"], issue["message"],
-        tuple(issue.get("item_ids", ()))) for issue in state.get("diagnostics", [])]
+        tuple(issue.get("item_ids", ())))
+        for issue in list(state.get("diagnostics", []))
+        + list((state.get("persona_drift") or {}).get("issues", []))]
     decisions = state.get("section_decisions", {})
     missing_sections = [section for section, _label in SECTION_ORDER
                         if decisions.get(section, {}).get("status") != "confirmed"]
@@ -3700,10 +3868,11 @@ def shipping_issues(state, persona_markdown, manifest):
         issues.append(CompileIssue(
             "SECTION_UNCONFIRMED", "blocking",
             "以下人格节尚未确认：" + "、".join(missing_sections)))
-    if any(token in persona_markdown for token in (
-            "去语料里找", "记住用户喜好", "请用户补写", "请写一句")):
+    if any(token in persona_markdown for token in TASK_DIRECTIVE_TOKENS):
         issues.append(CompileIssue(
-            "TASK_DIRECTIVE_REMAINS", "blocking", "人格文件仍含任务书或空指令"))
+            "TASK_DIRECTIVE_REMAINS", "blocking",
+            "人格文件仍含任务书或空指令（出口：--step choose-sections 里那一节有一个"
+            "「删除该块」的版本，带 diff，选它即可出货；不必去手改输入文件）"))
     if "timeline" not in persona_markdown:
         issues.append(CompileIssue(
             "TIMELINE_POINTER_MISSING", "blocking",
@@ -3800,6 +3969,118 @@ def shipping_issues(state, persona_markdown, manifest):
     return issues
 
 
+def _drift_section_label(key):
+    from persona_compiler import UNMAPPED_SECTION_KEY
+
+    if key == UNMAPPED_SECTION_KEY:
+        return "未归节"
+    return dict(SECTION_ORDER).get(key, key)
+
+
+def persona_drift_report(previous_state, manifest, current_items, acknowledged=False):
+    """跨运行比对输入人格文件：哈希变了就把「各节原文块数」的差异摊开。
+
+    **这是唯一能发现静默塌节的地方**（2026.08.03 走查第一条）。归节全靠 markdown
+    标题行做锚点（`persona_compiler.parse_original_text`），删掉一行标题，后面的块
+    一路顺延继承上一节、整节塌进邻节；而所有既有闸门都看不见：
+    `original_span_coverage` 的分母是**本次传进来那份 text 现算的**，删掉的字符不在
+    分母里，覆盖率照样 1.0；`init_state.json` 里虽然存了上次的 `source_hashes`，
+    但 `--step inspect` 重跑时直接用新 manifest 覆盖，没有做过跨运行比对。
+    于是走查里真实发生的形态是：**出货成功、零 blocking、零 warning、`--doctor` 也过**，
+    而用户原文整段没了。
+
+    ⚠ **光打 warning 不够**：warning 在一屏输出里等于没有，而整节塌空正是走查里
+    真发生的那一种。所以「某节上次有 N 块、这次 0 块」直接升级成 blocking。
+
+    ⚠ blocking 必须有出口，否则就重蹈现象 B 的覆辙（拦得对但把用户逼去手改输入
+    文件，而手改输入文件正是本现象的雷区）：出口是 `--accept-persona-drift`，
+    用户确认「就是我有意删的」之后降级成 warning，不改用户任何文件。
+
+    返回 None＝没有可比的上一次，或这份文件跟上次逐字相同。"""
+    from persona_compiler import (
+        CompileIssue, compare_original_block_counts, original_block_counts)
+
+    persona_file = manifest.persona_file
+    if persona_file is None or not isinstance(previous_state, dict):
+        return None
+    if previous_state.get("schema_version") != 2:
+        return None
+    previous_hashes = (previous_state.get("source_manifest") or {}).get("source_hashes") or {}
+    # 键在不在，本身就是「上次跑的是不是同一份文件」的判据：manifest 那侧存的是
+    # resolve 之后的绝对路径，两边同源，不用再猜相对路径。
+    before_hash = previous_hashes.get(str(persona_file), "")
+    after_hash = manifest.source_hashes.get(str(persona_file), "")
+    if not before_hash or before_hash == after_hash:
+        return None
+    previous_counts = original_block_counts(previous_state.get("compiler_items", ()))
+    if not previous_counts:
+        return None
+    current_counts = original_block_counts(current_items)
+    rows, collapsed = compare_original_block_counts(previous_counts, current_counts)
+
+    return _drift_payload(str(persona_file), before_hash, after_hash,
+                          rows, collapsed, acknowledged)
+
+
+def _drift_payload(persona_file, before_hash, after_hash, rows, collapsed, acknowledged):
+    """把差异表渲染成用户看得懂的两条 issue。级别只由 acknowledged 决定。"""
+    from persona_compiler import CompileIssue
+
+    table = [f"{_drift_section_label(row['section'])}：上次 {row['before']} 块"
+             f" → 这次 {row['after']} 块" for row in rows]
+    issues = [CompileIssue(
+        "PERSONA_SOURCE_DRIFT", "warning",
+        "输入人格文件跟上次 inspect 时不是同一份（sha256 变了）。本次归入各节的"
+        "原文块数 vs 上次：" + ("；".join(table) if table else "各节块数没有变化"))]
+    before_by_section = {row["section"]: row["before"] for row in rows}
+    if collapsed:
+        detail = "、".join(
+            f"{_drift_section_label(key)}（上次 {before_by_section.get(key, 0)} 块）"
+            for key in collapsed)
+        issues.append(CompileIssue(
+            "PERSONA_SECTION_COLLAPSED",
+            "warning" if acknowledged else "blocking",
+            f"这几节这次一个原文块都没有、上次有：{detail}。"
+            "最常见的原因是那一节的 markdown 标题行被删了——归节靠标题锚点，"
+            "标题没了整节会顺延塌进上一节，而逐字覆盖率闸门看不见这件事。"
+            + ("（已用 --accept-persona-drift 确认是有意删的）" if acknowledged else
+               "确认就是你有意删掉这些内容，就加 --accept-persona-drift 重跑本步；"
+               "想找回来就把那几行标题加回输入文件再重跑。")))
+    return {
+        "persona_file": persona_file,
+        "before_hash": before_hash,
+        "after_hash": after_hash,
+        "acknowledged": bool(acknowledged),
+        "table": rows,
+        "collapsed_sections": collapsed,
+        "issues": [_compile_issue_payload(issue) for issue in issues],
+    }
+
+
+def carry_forward_persona_drift(previous_state, manifest, acknowledged=False):
+    """把上一次 inspect 记下的塌节结论**带过这一次**。
+
+    ⚠ **少了这一支，`--accept-persona-drift` 是个假出口**：inspect 会把 state 里的
+    `source_hashes` 换成这次的，于是紧接着再跑一次 inspect 时「上次」已经是塌过节
+    的那一份，哈希一样、比不出差异，blocking 自己消失了——**用户加不加这个开关都
+    一样能出货，而那条 warning 也跟着蒸发**，等于既没有出口也没有留痕。
+
+    所以：只要这次读到的还是同一份、同一内容的人格文件，就把上次那份结论原样带过来，
+    级别按这次给不给开关重算；确认过一次就一直算确认过（写在 state 里）。"""
+    if not isinstance(previous_state, dict) or manifest.persona_file is None:
+        return None
+    previous = previous_state.get("persona_drift") or {}
+    persona_file = str(manifest.persona_file)
+    if previous.get("persona_file") != persona_file:
+        return None
+    if previous.get("after_hash") != manifest.source_hashes.get(persona_file, ""):
+        return None
+    return _drift_payload(
+        persona_file, previous.get("before_hash", ""), previous.get("after_hash", ""),
+        list(previous.get("table", ())), list(previous.get("collapsed_sections", ())),
+        bool(acknowledged) or bool(previous.get("acknowledged")))
+
+
 def _v2_inputs(args, state=None):
     state = state or {}
     saved = state.get("inputs", {})
@@ -3854,8 +4135,19 @@ def _step_inspect_v2(args, existing_state=None):
         state["compiler_items"] = [item_to_dict(item)
                                    for item in parse_original_persona(manifest.persona_file)]
     state["diagnostics"] = state["source_manifest"]["issues"]
+    # ⚠ 跨运行比对的结论**不能**放进 diagnostics：`--step extract --candidates`
+    #   会整个覆盖 diagnostics（见 _step_extract_v2），放那儿等于跑一步就没了。
+    #   单开一格，出货闸从这一格读。
+    acknowledged = getattr(args, "accept_persona_drift", False)
+    drift = persona_drift_report(
+        existing_state, manifest, state["compiler_items"], acknowledged=acknowledged)
+    if drift is None:
+        drift = carry_forward_persona_drift(existing_state, manifest, acknowledged)
+    if drift:
+        state["persona_drift"] = drift
     state["step"] = "inspected"
     save_state(args.out, state)
+    drift_issues = (drift or {}).get("issues", [])
     payload = {
         "schema_version": 2,
         "mode": "compiler_v2",
@@ -3866,13 +4158,18 @@ def _step_inspect_v2(args, existing_state=None):
             "section": item["section"], "confidence": item["confidence"],
             "source_ref": item["source_ref"],
         } for item in state["compiler_items"]],
-        "blocking_issues": [issue for issue in state["diagnostics"]
+        "persona_drift": drift,
+        "blocking_issues": [issue for issue in state["diagnostics"] + drift_issues
                             if issue["severity"] == "blocking"],
+        "warnings": [issue for issue in state["diagnostics"] + drift_issues
+                     if issue["severity"] == "warning"],
         "next": "--step extract",
     }
     if args.json:
         print(json.dumps(payload, ensure_ascii=False))
     else:
+        for issue in drift_issues:
+            print(f"[{issue['severity']}] {issue['code']}：{issue['message']}")
         print("输入检查完成。下一步：--step extract --json")
 
 
@@ -4363,6 +4660,20 @@ def _cli(args):
 
 
 if __name__ == "__main__":
+    # 中文 Windows（控制台编码 cp936/GBK）下，stdout 默认按系统区域编码写；语料和
+    # 人格文件里出现 emoji（U+1F338 这类非 BMP 字符）几乎必然，于是第一个
+    # `--step inspect --json` 就抛 UnicodeEncodeError，**报错里完全看不出该怎么办**
+    # ——整条初始化流程崩在第一个命令上（2026.08.03 真机走查第三条）。
+    # ⚠ 要改的是**输出端自己保证编码**，不是退回 `ensure_ascii=True`：那会把中文
+    #   全变成 \uXXXX，用户和下游 AI 都读不了。JSON 的字段与内容一个字不动。
+    # ⚠ stderr 一起锁：argparse 的报错、`ap.error(...)` 的中文提示走的是那条流，
+    #   同一台机器上撞的是同一堵墙。
+    # ⚠ 只放在 `__main__` 里，不塞进任何被 import 的函数：别人 import 本模块时
+    #   不该被我们改掉整个进程的 stdout。`memory_import.py` / `mcp_server.py`
+    #   两个入口同样各有一份（三个入口一起改，别留一个）。
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--out", help="产出目录")
@@ -4396,6 +4707,13 @@ if __name__ == "__main__":
     ap.add_argument("--original-section-decisions-json",
                     dest="original_section_decisions_json",
                     help="choose-sections 步：{原人格块 item_id: 主节或 leave_unresolved}")
+    # inspect 检测到「上次有块、这次 0 块」时会 blocking。**拦截必须留出口**，
+    # 否则用户又被推回手改输入文件那条路（那正是塌节本身的成因）。这个开关只表示
+    # 「我知道，是我有意删的」，降级成 warning；它不改用户的任何文件。
+    ap.add_argument("--accept-persona-drift", dest="accept_persona_drift",
+                    action="store_true",
+                    help="inspect 步：确认输入人格文件这次少掉的整节就是你有意删的，"
+                         "把 PERSONA_SECTION_COLLAPSED 从 blocking 降为 warning")
     ap.add_argument("--existing-persona-choice",
                     choices=["treat_current_as_original", "continue_legacy"],
                     help="inspect 检测到旧人格文件时的迁移选择；不给就只展示选项")

@@ -31,7 +31,18 @@
 import argparse
 from dataclasses import dataclass, field as dc_field
 
-DISCLAIMER = "风格参考，非台词——学说话方式，不是背台词。"
+# disclaimer 是两半，不是一句（2026.08.04 补第二半，任务卡「风格片段挤掉检索」）：
+#   前半挡**输出层**——别把片段里的句子当素材复述，那是抄台词。
+#   后半挡**检索层**——2026.08.03 真机抓到：模型有片段可答就**不调 memory_search**，
+#   答出来具体、有细节、语气也对，听着像在场其实在读稿，且全程不报错；片段涉及的
+#   事件在库里没有记录时这个洞才看得见。缺的是这一条，不是前半写坏了，所以是补不是改。
+# 这个常量同时供注入（render）与存储（memory_init 的 protocol:style_disclaimer）使用，
+# 改这一处即两处都改——规格 §3.3「存储和注入两处都要带」。
+DISCLAIMER = (
+    "风格参考，非台词——学说话方式，不是背台词。"
+    "另：这几段是风格样本，不是记忆；对方提到过去的事，先查记忆库，"
+    "别拿这里的片段当答案。"
+)
 
 # 规格 §2 的十二节骨架，顺序即权重：首尾是注意力高地，别拿去放运维细节
 SECTION_ORDER = [
@@ -139,7 +150,7 @@ class Milestone:
 @dataclass
 class StyleExcerpt:
     """一条风格候选片段。disclaimer 是硬性字段，不是可选的——缺了模型会把片段
-    当台词直接引用（真实使用中反复出现的行为）。"""
+    当台词直接引用（输出层），也会拿片段顶替查库（检索层）。两半都在 DISCLAIMER 里。"""
     text: str
     pool: str  # "daily" 或 "intimacy"
     disclaimer: str = DISCLAIMER
@@ -204,7 +215,8 @@ class Persona:
             raise PersonaValidationError(
                 f"relationship_type={self.relationship_type} 未启用亲密语境候选池")
         if not ex.disclaimer:
-            raise PersonaValidationError("风格候选片段缺 disclaimer——风格参考≠台词这条不能省")
+            raise PersonaValidationError(
+                "风格候选片段缺 disclaimer——「风格参考≠台词」和「片段≠记忆」这两条都不能省")
         self.style_excerpts.append(ex)
 
     def active_fields(self):
@@ -410,6 +422,13 @@ def _selftest():
     assert "不该出现" not in [x.get("value") for x in out["user"]], "未确认草稿不该出现在 render 里"
     style_block = [x for x in out["style"] if "style_pool" in x]
     assert style_block and style_block[0]["disclaimer"] == DISCLAIMER, "风格块必须带 disclaimer"
+    # disclaimer 的两半分开守：删掉任意一半这里必须红（任务卡第六节的变异判据）。
+    # ⚠ 这条只能证明「这句话出到了注入结构里」，证明不了「模型真的会去查」——
+    # 后者要在能注入人格的客户端上真机验，两半分开记，别拿这个绿冒充那个绿。
+    injected = style_block[0]["disclaimer"]
+    assert "不是背台词" in injected, "disclaimer 缺输出层那半（别抄台词）"
+    assert "不是记忆" in injected and "先查记忆库" in injected, \
+        "disclaimer 缺检索层那半（片段不是记忆、提到过去先查库）"
 
     # 13. compiler_v2 的零材料路径只放松关系 specific，不放松协议底座。
     zero = Persona("partner")

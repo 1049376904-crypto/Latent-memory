@@ -63,6 +63,7 @@
 import argparse
 import json
 import re
+import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -498,10 +499,27 @@ def _selftest():
         Path(td, "p.json").write_text(json.dumps(_CLAUDE_PROJECT_FIXTURE), encoding="utf-8")
         assert load_any(Path(td, "p.json"))[0].tags[0] == "claude_project", "load_any 认得 projects/*.json"
 
-    print("selftest ok（11项断言：六个翻译器 / 两个消费方真接上 / 分发与兜底）")
+    # 12. CLI 入口必须把 stdout 锁成 UTF-8（`--stats` 打的是中文，语料带 emoji 时
+    #     在 cp936 下会 UnicodeEncodeError）。⚠ **在 Linux／默认 UTF-8 的机器上这条
+    #     恒真，在那儿跑不算验过**：变异要在 `PYTHONIOENCODING=gbk` 下跑——删掉
+    #     `__main__` 里的 `sys.stdout.reconfigure(...)` 必须转红，加回去复绿。
+    assert (getattr(sys.stdout, "encoding", "") or "").lower().replace("-", "") == "utf8", \
+        f"CLI 入口没把 stdout 锁成 UTF-8（当前 {sys.stdout.encoding}）：" \
+        "中文 Windows（cp936）下 --stats 遇到 emoji 会 UnicodeEncodeError"
+
+    print("selftest ok（12项断言：六个翻译器 / 两个消费方真接上 / 分发与兜底 / "
+          "CLI 入口把 stdout 锁成 UTF-8（⚠ 变异要在 PYTHONIOENCODING=gbk 下跑，"
+          "默认 UTF-8 的机器上这条恒真））")
 
 
 if __name__ == "__main__":
+    # 中文 Windows（cp936/GBK）下 stdout 按系统区域编码写，`--stats` 打的说话人、
+    # 时间范围是中文，语料里带 emoji 时直接 UnicodeEncodeError
+    # （缘由与判据见 memory_init.py 同一处注释）。改的是编码，不是 ensure_ascii。
+    # ⚠ 只放在 `__main__` 里：被 import 时不许改掉调用方进程的 stdout。
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--stats", metavar="FILE", help="导入前核对：条数/说话人/时间范围（不打内容）")

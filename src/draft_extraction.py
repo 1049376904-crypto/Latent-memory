@@ -44,6 +44,11 @@ EXTRACTION_PROMPT = """# 人格候选提取任务
 逐个读取《人格候选输入清单.json》里的语料。每个候选必须填写真实 `source_ref`、
 字符区间 `source_span` 和逐字 `evidence`。每个输入来源都要在 `source_accounting` 中
 登记候选 ID，或明确写 `no_supported_candidate: true`。只返回符合 schema 的 JSON。
+
+⚠ `evidence` 必须是**原始字符**，不许做任何加工：不要 HTML 转义（`>` 就写 `>`，
+不要写成 `&gt;`；`<`、`&` 同理），不要把直引号改成弯引号，不要改空白与换行。
+校验器是**逐字**比对原文的，改一个字符就整条不过——而报出来的错是
+「evidence 不是原文逐字」，看不出是转义干的。
 """
 
 

@@ -1304,9 +1304,14 @@ def mcp_config_snippet(server_path, corpus_dir, threads_path, route=None,
         vals = [PORTABLE_PREFIX + str(r).replace("\\", "/") for r in rels]
         note = CONFIG_NOTE + CONFIG_NOTE_PORTABLE
     else:
-        vals = [str(paths[0].resolve()).replace("\\", "/"),
-                str(corpus_dir).replace("\\", "/"),
-                str(threads_path).replace("\\", "/")]
+        # ⚠ 三个都要 `resolve()`，不是只有 server 那个（走查台账 08-03 第六条）：
+        # 原来只有 `paths[0]` 解了，`corpus_dir` 与 `threads_path` 是裸 `str()`
+        # ——而同一行拼进去的 `CONFIG_NOTE_MACHINE_BOUND` 写着"写死了这台机器的
+        # 绝对路径"，**三分之一是真的**。用户拿相对路径起 `--out` 时，配置里落下的
+        # 就是相对值，而客户端起 server 的工作目录跟他当时 cd 的地方无关
+        # ——又是一句不报到脸上的 file not found。
+        # `--doctor` 那边本来就有"配置里写的是相对值时会解析开"的处理，出货端对齐。
+        vals = [str(path.resolve()).replace("\\", "/") for path in paths]
         note = CONFIG_NOTE + CONFIG_NOTE_MACHINE_BOUND
     cfg = {CONFIG_NOTE_KEY: note,
            "mcpServers": {"memory": {
@@ -3048,6 +3053,21 @@ def _selftest():
         assert not any("MEMORY_EMBED" in x or "http" in x for x in a), \
             f"{r} 档把 endpoint/环境变量名写进了 MCP 配置：{a}"
 
+    # 9e2.【变异靶心：三个路径都要解成绝对路径，不是只有 server】走查台账 08-03 第六条。
+    #      原先只有 `paths[0]` 走了 `resolve()`，`--corpus` 与 `--threads` 是裸 `str()`
+    #      ——而同一份配置里那句 `CONFIG_NOTE_MACHINE_BOUND` 写着"写死了这台机器的
+    #      绝对路径"，**三分之一是真的**。用户拿相对路径起 `--out`（`--out .` 这种）
+    #      时配置里就落相对值，而客户端起 server 的工作目录跟他当时 cd 的地方无关。
+    #      ⚠ **靶子必须喂相对路径**：走 `write_bundle(td, …)` 那条路时 `td` 本来就是
+    #      绝对的，**三个值不 resolve 也全是绝对路径，断言恒真**——第一版就是这么写的，
+    #      变异不红才发现。**"断言在缺陷面前全绿"跟"没有这条断言"是一回事。**
+    rel_args = json.loads(mcp_config_snippet(
+        "mcp_server.py", "memory", "threads.jsonl"))["mcpServers"]["memory"]["args"]
+    for label, value in (("server", rel_args[0]), ("--corpus", rel_args[2]),
+                         ("--threads", rel_args[4])):
+        assert Path(value).is_absolute(), \
+            f"mcp-config.json 里 {label} 落的是相对路径，换个工作目录就指不对：{value}"
+
     # 9f.【变异靶心：MCP 配置按客户端分「可搬运/绝对路径」两档】（任务卡「MCP 配置
     #     跨机器搬不动」2026.08.02，真实用户在云端容器里当场接不上）。四条一起钉：
     #     ① Claude Code 档 + 整套在产出目录下 → args 里零绝对路径，全走占位符；
@@ -3197,6 +3217,61 @@ def _selftest():
                       if question["section"] == "user")
     assert any(version["id"].endswith(":leave_empty")
                for version in empty_user["section_versions"])
+    # 56b.【靶心：选择题那一屏的节标题也不许漏占位符】走查台账 08-04 第四条。
+    #     ⚠ **靶子必须是"有 --persona 的那条路"**：零材料 state 读不出人称，
+    #     标题走中性写法，`{ta}` 本来就不会出现——拿它当靶子这条断言恒真。
+    #     所以先造一个用户自己写了 `## 她是谁` 的 state，再看那一屏。
+    from persona_compiler import item_to_dict as _item_to_dict
+    pron_items = [PersonaItem(
+        item_id="orig:user_head", text="## 她是谁", section="user",
+        source_type="original_persona", source_ref="fixture:persona",
+        source_span=(0, 6), source_hash="fixture", operation="delete",
+        original_text="## 她是谁", proposed_text="",
+        operation_reason="标题由十二节骨架统一渲染",
+        confidence="exact", confirmed=False)]
+    pron_state = dict(new_v2_state())
+    pron_state["compiler_items"] = [_item_to_dict(item) for item in pron_items]
+    pron_payload = section_choice_payload(prepare_section_versions(pron_state))
+    labels = [question["label"] for question in pron_payload["sections"]]
+    assert not any(_SLOT_RE.search(label) for label in labels), \
+        f"选择题那一屏的节标题漏出了人称占位符：{labels!r}"
+    assert "她是谁" in labels, \
+        f"用户自己写的是「她」，选择题里却没按他的写法渲染：{labels!r}"
+    # 56c.【靶心：归节题的说明要按块的类型给】走查台账 08-04 第三条。
+    #     ⚠ **两条都要**：只钉标题块那句，把常量整个换成标题文案也能全绿
+    #     ——那样正文块就被告知"选哪节都不影响正文"，是**反着错**。
+    unmapped = [
+        PersonaItem(item_id="orig:h1", text="# 核心人格", section=None,
+                    source_type="original_persona", source_ref="fixture:persona",
+                    source_span=(0, 6), source_hash="fx", operation="keep",
+                    original_text="# 核心人格", proposed_text="# 核心人格",
+                    confidence="low", confirmed=False),
+        PersonaItem(item_id="orig:body", text="她怕吵。", section=None,
+                    source_type="original_persona", source_ref="fixture:persona",
+                    source_span=(7, 11), source_hash="fx", operation="keep",
+                    original_text="她怕吵。", proposed_text="她怕吵。",
+                    confidence="low", confirmed=False)]
+    map_state = dict(new_v2_state())
+    map_state["compiler_items"] = [_item_to_dict(item) for item in unmapped]
+    notes = {question["item_id"]: question["note"] for question
+             in section_choice_payload(prepare_section_versions(map_state)
+                                       )["original_mapping_questions"]}
+    assert set(notes) == {"orig:h1", "orig:body"}, f"两块都该被问到：{sorted(notes)}"
+    assert "不会改变出货正文" in notes["orig:h1"], \
+        f"标题块的题面没说清「选哪一节都一样」，用户会在那儿白挑一个：{notes['orig:h1']!r}"
+    assert "不会改变出货正文" not in notes["orig:body"], \
+        f"正文块被告知「选哪节都不影响正文」——那是反着错：{notes['orig:body']!r}"
+    #     两句都要说清 leave_unresolved 不是出口（它会被 SECTION_UNCONFIRMED 拦）
+    #     ⚠ 原来这里写成 `A in note or A in note`——**同一个条件写了两遍**，
+    #     那个 or 是死的；判据其实只有一条，写两遍不等于多查了一种说法。
+    for item_id, note in notes.items():
+        assert "出不了货" in note, f"{item_id} 没说 leave_unresolved 的代价"
+
+    #     反向：读不出人称时走中性写法，**不许塞默认的他／她**（同 8a3 ④）
+    neutral_labels = [question["label"] for question in section_payload["sections"]]
+    assert not any(_SLOT_RE.search(label) for label in neutral_labels)
+    assert not any("她" in label or "他" in label for label in neutral_labels), \
+        f"人称读不出来时不该塞一个进去：{neutral_labels!r}"
 
     decisions = {question["section"]: question["section_versions"][0]["id"]
                  for question in section_payload["sections"]}
@@ -3723,7 +3798,7 @@ def _selftest():
         assert _ta("# 它是谁") is None, "「它」在任何一档都不许出现"
         assert _ta("# 我是谁") is None, "不是用户那节的标题句式，读不出来就该是 None"
 
-    print("selftest ok（63项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
+    print("selftest ok（66项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
           "归属句式 / 默认值不预支历史 / 协议层不问用户 / 导出纪律 / 渲染顺序 / "
           "人称锚死一套 / 用户只有一种称呼形态 / 昵称档不被静默吃掉 / 中性档不丢主语 / 人称从语料读出来 / 中性写法不许漏 / 语料侧判定不许猜 / 全文零它 / 称呼不重复拼接 / 关系状态归开篇 / "
           "答案读回不静默丢 / 任务书不泄漏进人格文件 / 长字面量不崩 / 未决草稿不蒸发 / "
@@ -3742,7 +3817,12 @@ def _selftest():
           "memory_append 写进去的那句话还在不在，不拿「出货成功、无报错」当证据） / "
           "节标题在产出文件里只出现一次（标题块打 delete，原文仍被逐字认领）＋"
           "人称取用户自己在标题里的写法，不是中性的「对方」"
-          "（⚠ 两条分开断言；⚠ 不拿覆盖率 1.0 当通过证据，它不看 operation））")
+          "（⚠ 两条分开断言；⚠ 不拿覆盖率 1.0 当通过证据，它不看 operation） / "
+          "选择题那一屏的节标题也不许漏人称占位符（⚠ 靶子必须是有 --persona 的那条路，"
+          "零材料 state 走中性写法、这条恒真） / "
+          "mcp-config.json 里三个路径都是绝对的（⚠ 只查 server 那一条在缺陷面前全绿） / "
+          "归节题的说明按块的类型给（标题块要说清「选哪一节都不改变出货正文」，"
+          "⚠ 正文块不许被这么说，那是反着错））")
 
 
 def _rebuild(state):
@@ -4083,6 +4163,31 @@ def prepare_section_versions(state):
     return state
 
 
+MAPPING_NOTE_BODY = ("整块逐字移动到一个主节，或暂不出货；没有自由文本入口。"
+                     "⚠ 选 leave_unresolved 就出不了货（`SECTION_UNCONFIRMED` 会拦），"
+                     "它是「先放着」不是「不要了」。")
+
+MAPPING_NOTE_HEADING = ("⚠ **这一块是一行标题，选哪一节都不会改变出货正文**："
+                        "标题由十二节骨架统一渲染一遍，这一块只被逐字认领、不进正文"
+                        "（`operation=delete`）。你的选择只决定它算在哪一节的来源清单里。"
+                        "⚠ 但**必须选一个**——留着不归出不了货。")
+
+
+def _mapping_note(item):
+    """归节题的说明按块的类型给。
+
+    ⚠ **原来这里是一句写死的常量**，于是**文件自己的那行大标题（`# 核心人格`）
+    也被拿同一句话去问**：「整块逐字移动到一个主节」——十二个选项没有一个对得上，
+    而**选哪个产出都一字不差**（标题块一律被打成 delete，见
+    `apply_original_section_decisions`），题面一个字都没说。
+    2026.08.04 走查现场维护者就在那儿认真挑了一个没有区别的答案（台账 08-04 第三条）。
+
+    ⚠ **不是把标题块自动归掉就完了**：归到哪一节仍然影响那一节的来源清单，
+    那是用户的判断，我们不替他选——**要补的是「告诉他这个选择影响什么」**。"""
+    from persona_compiler import is_heading_block
+    return MAPPING_NOTE_HEADING if is_heading_block(item) else MAPPING_NOTE_BODY
+
+
 def section_choice_payload(state):
     """每节至多一道题；来源、冲突与 diff 只作为版本证据。"""
     from persona_compiler import item_from_dict
@@ -4092,11 +4197,19 @@ def section_choice_payload(state):
                 and item.get("section") is None]
     sections = []
     decisions = state.get("section_decisions", {})
+    # 节标题的人称跟 preview／出货同源一份（`persona_pronouns`）。原来这里直接把
+    # `SECTION_ORDER` 的 label 原样发出去，于是**用户在选择题里看到的是字面
+    # `{ta}是谁`**——一个没填的模板占位符。`preview_payload` 那处一直是对的
+    # （`fill_pronouns(label, pronouns)`），两处不同源，坏的只是先被看到的那处。
+    # ⚠ 这是 2026.08.04 走查在真实人格文件上撞出来的（走查台账 08-04 第四条）：
+    # 出货文件里一个占位符都没漏，**只有做选择的那一屏漏**，所以自检里那条
+    # 「占位符不许漏进出货文件」永远不会红——**它看的不是这一屏**。
+    pronouns = persona_pronouns(state)
     for section, label in SECTION_ORDER:
         versions = state.get("section_versions", {}).get(section, [])
         sections.append({
             "section": section,
-            "label": label,
+            "label": fill_pronouns(label, pronouns),
             "status": decisions.get(section, {}).get("status", "pending"),
             "section_versions": [{
                 "id": version["id"],
@@ -4113,7 +4226,7 @@ def section_choice_payload(state):
                 "source_ref": item.source_ref,
                 "choices": [section for section, _label in SECTION_ORDER]
                            + ["leave_unresolved"],
-                "note": "整块逐字移动到一个主节，或暂不出货；没有自由文本入口",
+                "note": _mapping_note(item),
             } for item in unmapped],
             "sections": sections,
             "next": "选择每节一个 section_version id，再运行 --step choose-sections"}

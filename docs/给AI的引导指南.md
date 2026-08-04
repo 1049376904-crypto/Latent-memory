@@ -450,6 +450,15 @@ claude mcp add memory --scope user "--" python <src绝对路径>/mcp_server.py -
 
 没接通时按顺序查：会话是不是起在产出目录里（这是最常见的原因）→ `claude mcp list` 里 memory 服务连着没有 → **跑一次部署体检**（下面这条），别靠反复换问题去猜。
 
+⚠ **`claude mcp list` 显示 ✔ Connected 不等于连的是这一份语料**（走查台账 08-03 第七条）：
+`memory` 这个服务名会撞车——`claude mcp add memory --scope user` 遇到同名已存在时报
+`MCP server memory already exists in user config`，**它没有覆盖（这是对的），但也没接上**，
+而这里的 ✔ Connected 连的是**旧的那个**。服务在、名字对、连接正常，只是记忆库是别人的。
+**所以这一格要问的不是「memory 连着没有」，是「memory 指的是不是这一份语料」——
+判据是 `--doctor` 打出来的那个绝对路径，跟你的产出目录对一对。**
+⚠ 绕开撞车的办法：不动 user 作用域，改在产出目录放 `.mcp.json`（项目作用域），
+这跟 `CLAUDE.md` 本来就按目录生效的语义一致。
+
 ```
 python <src路径>/mcp_server.py --doctor --corpus <产出目录>/memory --threads <产出目录>/threads.jsonl
 ```

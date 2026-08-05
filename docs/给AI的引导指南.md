@@ -534,6 +534,11 @@ python memory_init.py --out <产出目录> --step ship --client generic
 三条命令只选与客户端相符的一条：Claude Code 产出 `CLAUDE.md`，Codex 产出
 `AGENTS.md`，通用／自建及不依赖宿主约定的客户端产出 `persona.md`。三档都会同时产出
 `memory/`、`mcp-config.json` 与 `引导句.txt`；generic 档还会复制一份《注入契约》。
+
+⚠ **别把 `<产出目录>/memory` 当成 TA 的记忆库去接**：走七步走这条路它是个**空目录**
+（我们一个字都不往里写），检索真正读的是 TA `--corpus` 指的那个目录——出货报告里
+「记忆库」那一行报的就是它，`mcp-config.json` 里 `--corpus` 指的也是它。
+只有出货时加 `--import <导出文件>`、由我们替 TA 建库，窗口文件才落进 `memory/`。
 `引导句.txt` 是闭源前端可用的一行指针，不是第四种人格文件；Claude Code／Codex
 用不上它。
 

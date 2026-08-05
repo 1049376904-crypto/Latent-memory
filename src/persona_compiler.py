@@ -589,11 +589,13 @@ def apply_section_choice(state, section, version_id):
     if version is None:
         # 出口写进报错里：版本 id 是内容哈希（`section:` ＋ sha256 前 12 位），
         # **人不可能猜对，只能从上一条命令的输出里抄**——报错却不说抄哪儿，
-        # 2026.08.04 外部实测就卡在这里（`memory_init.py` 那两条同形的报错一起改的）。
+        # 2026.08.04 外部实测就卡在这里。
+        # ⚠ **让人抄的字段名必须写成 `version_id`**：出给 CLI 的版本条目只有这一个键，
+        # 写成别的会把人指向一个不存在的字段。
         known = "、".join(candidate.version_id for candidate in versions) or "（这一节还没有任何版本）"
         raise ValueError(
             f"未知节版本：{section}/{version_id}。这一节当前的合法版本是：{known}"
-            "（出口：--step choose-sections --json，从 sections[].section_versions[].id "
+            "（出口：--step choose-sections --json，从 sections[].section_versions[].version_id "
             "里原样抄；⚠ 版本 id 是内容哈希，改一次来源项就会变，别沿用旧的、"
             "更别去手改 init_state.json）")
     selected = set(version.item_ids)
@@ -732,9 +734,15 @@ def aggregate_persona_metrics(state):
         decision = decisions.get(section, {})
         version_id = decision.get("version_id") if isinstance(decision, dict) else None
         versions = versions_by_section.get(section, ())
-        selected = next((version for version in versions
-                         if (version.get("version_id", version.get("id"))
-                             if isinstance(version, dict) else version.version_id) == version_id), None)
+        # ⚠ 原先这里是 `version.get("version_id", version.get("id"))`——**那处防御性
+        # 回退就是「两个键该信哪个」这份含糊留下的痕迹**（任务卡《节版本双键收敛》
+        # 靶心三）。收敛之后判据只有 `version_id` 一个，回退跟着清掉。
+        # ⚠ 同时守住靶心二：`version_id` 为 None 时**不许拿两个 None 相等当匹配上**
+        # ——外部那个补丁就是这么把 `BOUNDARY_CONFLICT_UNRESOLVED` 静默放过的。
+        selected = None if not version_id else next(
+            (version for version in versions
+             if (version.get("version_id") if isinstance(version, dict)
+                 else version.version_id) == version_id), None)
         if selected is not None:
             selected_markdown[section] = (
                 selected.get("markdown", "") if isinstance(selected, dict) else selected.markdown)

@@ -348,7 +348,10 @@ python memory_init.py --out <产出目录> --step choose-sections --original-sec
 
 该操作只移动整块，不拆句、不改字；`leave_unresolved` 允许继续看预览，但会阻止出货。
 
-每节最多一道题，答案只能是该题给出的 `section_version` ID。版本正文旁会列出来源；
+每节最多一道题，答案只能是该题给出的 `section_version` ID（字段名就是 `version_id`）。
+⚠ **版本号会随重跑变**：重跑过 `choose-sections` 之后再交回一份旧的选择，
+出货会被 `SECTION_VERSION_STALE` 拦下并点名是哪一节、你交的是哪个号——
+**不拦的话那一节会整节从出货文件里消失，而且不报错**。重跑一次看当前版本号再选。版本正文旁会列出来源；
 原人格若有 rewrite/delete，必须在该节展示原文、新版、理由和 diff；硬边界冲突也会在
 对应节给出互斥版本。原文逐字移动和固定协议项可以随整节确认，原文改写、删除及冲突
 不得藏进“全部通过”。

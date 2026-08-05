@@ -34,8 +34,11 @@ import argparse
 import json
 import time
 from dataclasses import dataclass, asdict, field as dc_field
-from datetime import datetime
+from datetime import datetime, timezone as _tz
 from pathlib import Path
+
+# 记忆所有者的时区（任务卡"写回时区与跨日归窗"）：注入块上的日期跟召回块同一个口径
+from time_context import TimeContext
 
 # 自动兜底时回看的对话轮数：经验值，跟检索层 +0.05/k=60 同一待遇，待真实评估再调
 DEFAULT_TAIL_TURNS = 6
@@ -143,13 +146,19 @@ class ThreadStore:
         return max(threads, key=lambda t: (t.window, t.ended_at)) if threads else None
 
 
-def format_thread_block(thread: Thread, now=None):
+def format_thread_block(thread: Thread, now=None, time_context=None):
     """thread → 可注入 context 的文本块。带真实日期与距今天数（规格 §3.2：动态召回
-    的目的就是传达时间距离），来源成色明确标出。"""
+    的目的就是传达时间距离），来源成色明确标出。
+
+    ⚠ **日期按记忆所有者的时区算，跟召回块同一个口径**（2026.08.04 跨时区事故，
+    任务卡"写回时区与跨日归窗"）：这一块就贴在召回块上面一起注入，这里裸着
+    `fromtimestamp` 的话，UTC 的服务器上东八区深夜那次会话会写成前一天——**同一屏
+    里两个日期口径**比单独错更坏，模型会拿它们互相校准。距今天数仍按真实经过时间
+    算（那是时间距离，不是日历日），不受时区影响。"""
     if thread is None:
         return None
     now = time.time() if now is None else now
-    day = datetime.fromtimestamp(thread.ended_at).strftime("%Y.%m.%d")
+    day = (time_context or TimeContext.default()).label(thread.ended_at)
     gap_days = max(0, int((now - thread.ended_at) // 86400))
     when = "今天" if gap_days == 0 else f"{gap_days} 天前"
     lines = [f"【上次会话】第 {thread.window} 个窗口，{day}（{when}）："]
@@ -214,6 +223,20 @@ def _selftest():
     assert "今天" in format_thread_block(
         close_thread(15, now - 600, now - 60, (), "刚聊完"), now=now)
     assert format_thread_block(None) is None
+    #    【跨时区·变异靶心】（2026.08.04 事故，任务卡「写回时区与跨日归窗」）：
+    #    这一块的日期也得按记忆所有者的时区算——它跟召回块贴在一起注入，口径分家
+    #    比单独错更坏。把上面那行改回裸 fromtimestamp → 下面这两条在非东八区的机器上红。
+    from time_context import tzdb_available
+    east8 = "Asia/Shanghai" if tzdb_available() else "UTC+08:00"   # 采集条件见 time_context
+    #    东八区 2026-08-04 02:05（＝UTC 08-03 18:05）结束的那次会话
+    tz_end = datetime(2026, 8, 3, 18, 5, 0, tzinfo=_tz.utc).timestamp()
+    tz_th = close_thread(16, tz_end - 3600, tz_end, ("凌晨聊的",), "聊完了")
+    assert "2026.08.04" in format_thread_block(tz_th, now=tz_end + 60,
+                                               time_context=TimeContext(east8)), \
+        "上次会话的日期该按记忆所有者的时区算，不是按跑服务那台机器的"
+    assert "2026.08.03" in format_thread_block(tz_th, now=tz_end + 60,
+                                               time_context=TimeContext("UTC")), \
+        "同一个 epoch 在不同时区就是不同的日历日——这个数是配置的函数，不是常量"
 
     # 6. 存取往返：内存态与文件态行为一致
     import tempfile
@@ -234,7 +257,7 @@ def _selftest():
     store2.append(close_thread(5, t0, t0 + 60, (), "补写的旧窗口"))
     assert store2.latest().window == 20, "补写旧窗口不该顶掉新窗口"
 
-    print("selftest ok（7项断言：状态必填 / 窗口号 / 兜底标注 / 注入日期 / 存取 / latest 语义）")
+    print("selftest ok（8项断言：状态必填 / 窗口号 / 兜底标注 / 注入日期 / 注入日期按所有者时区 / 存取 / latest 语义）")
 
 
 if __name__ == "__main__":

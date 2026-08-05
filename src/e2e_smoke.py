@@ -160,7 +160,7 @@ def _compile_v2_case(root, persona=None, corpus=None, candidates=None,
         versions = question["section_versions"]
         chosen = next((version for version in versions
                        if preferred_text and preferred_text in version["markdown"]), versions[0])
-        decisions[question["section"]] = chosen["id"]
+        decisions[question["section"]] = chosen["version_id"]
     _run_compiler_cli(root, "--step", "choose-sections", "--section-decisions-json",
                       json.dumps(decisions, ensure_ascii=False), "--json")
     preview = json.loads(_run_compiler_cli(root, "--step", "preview", "--json").stdout)
@@ -285,7 +285,7 @@ def run_persona_compiler_cases():
                           json.dumps({"items": [], "source_accounting": []}), "--json")
         questions = json.loads(_run_compiler_cli(
             migration_root, "--step", "choose-sections", "--json").stdout)
-        decisions = {question["section"]: question["section_versions"][0]["id"]
+        decisions = {question["section"]: question["section_versions"][0]["version_id"]
                      for question in questions["sections"]}
         _run_compiler_cli(migration_root, "--step", "choose-sections",
                           "--section-decisions-json", json.dumps(decisions), "--json")

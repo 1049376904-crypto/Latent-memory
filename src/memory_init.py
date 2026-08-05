@@ -46,6 +46,8 @@ from collections import namedtuple
 from datetime import datetime
 from pathlib import Path
 
+from time_context import DEFAULT_TIMEZONE, detect_local_timezone
+
 from persona_template import (
     Persona, Field, SECTION_ORDER, SECTIONS, OPENING_REQUIRED,
     CURRENT_STATE_FIELD, RETRIEVAL_CONVENTION_FIELD, DISCLAIMER,
@@ -430,9 +432,15 @@ def specificity_score(text):
     return score
 
 
-def coverage_report(persona, min_score=1, questions=None):
+def coverage_report(persona, min_score=1, questions=None, pronouns=None):
     """逐节体检 → [(section_key, status, 说明)]。
     status ∈ ok / missing / vague / protocol（系统已填，不用问用户）。
+
+    **`pronouns` 必须收在这一层，不在调用方渲染时补**（2026.08.05 拍板）：节标题模板
+    自带人称槽（`{ta}是谁`），说明句是拿 label 拼的——**谁拼谁就得填**，否则用户读到的
+    是字面 `{ta}是谁`。这处是同一根因的第三处（另两处：`section_choice_payload`、
+    `preview_payload`，都已在函数内部填），放在调用方等于再造一个"第四处谁负责填"。
+    ⚠ 不传就走 `fill_pronouns` 的中性写法（`对方是谁`），**绝不留占位符**。
 
     **只看用户与语料来源的内容，system 来源不算覆盖**（2026.07.31 跑通第一版时
     抓到的真 bug）：开篇里既有协议层默认值、又有关系 specific 内容，按"整节有没有
@@ -448,7 +456,8 @@ def coverage_report(persona, min_score=1, questions=None):
         by_section.setdefault(f.section, []).append(f)
     has_system = {f.section for f in persona.active_fields() if f.source == "system"}
     out = []
-    for key, label in SECTION_ORDER:
+    for key, raw_label in SECTION_ORDER:
+        label = fill_pronouns(raw_label, pronouns)
         if key not in asked_sections:      # 没有对应问题的节：要么协议层、要么本阶段不管
             note = "系统已填，不用你管" if key in has_system else "本阶段不问"
             out.append((key, "protocol", f"{label}：{note}"))
@@ -1260,9 +1269,31 @@ CONFIG_NOTE_PORTABLE = (
 # selftest 9f 的断言④管的是「server 在产出目录外」，管不到这一种，所以写在这里。
 PORTABLE_PREFIX = "${CLAUDE_PROJECT_DIR:-.}/"
 
+# 时区那一单（任务卡「写回时区与跨日归窗」2026.08.04 真机事故）加的两句尾巴。
+#
+# ⚠ **两条规矩，别混成一条**（2026.08.05 维护者拍板后的形态）：
+#   ① **没人给时区时，落进 args 的是默认值 `Asia/Shanghai`**，不是留空；
+#   ② **探测到的宿主时区永远不进 args**，只当参考写进说明。
+# ②那条守的是：探测探的是**跑初始化那台机器**，而这个值要的是**记忆所有者本人**——
+# 事故现场那台 VPS 探出来正好是 `Etc/UTC`，填进去就等于给那个缺陷发一张
+# `✓ 时区：Etc/UTC` 的合格证。**它长得跟判据一模一样，而且不会报错。**
+# ⚠ 默认值同样可能是错的（使用者不在东八区时），所以说明里必须写明"这是默认值、
+# 不对就改这一行"，`--doctor` 那一格也仍然报 ⚠——**默认值不等于验过了**。
+CONFIG_NOTE_TZ = (
+    "时区那一行（--timezone）决定“今天是几号”按哪个时区算——写回落进哪个窗口文件、"
+    "记录标题、检索标签都跟着它。换时区/换机器记得改。")
+CONFIG_NOTE_TZ_DEFAULT = (
+    "⚠ 时区那一行（--timezone）填的是**默认值 " + DEFAULT_TIMEZONE + "（东八区）**，"
+    "因为没人告诉过我们你在哪个时区——**我们不猜，也不拿这台机器的时区顶替**"
+    "（探到的是跑初始化这台机器的时区，不是你的）。**你不在东八区的话，这一行现在"
+    "就是错的**：凌晨那几个小时写下的记忆会被记成前一天，文件名、记录标题、检索标签"
+    "一起错，而且不报任何错。改法：把上面那行的 " + DEFAULT_TIMEZONE + " 换成你的 "
+    "IANA 时区（例如 Europe/Berlin）。跑 --doctor 时这一格会报 ⚠ 提醒你确认，"
+    "显式配上之后就变 ✓。")
+
 
 def mcp_config_snippet(server_path, corpus_dir, threads_path, route=None,
-                       client=None, portable_root=None):
+                       client=None, portable_root=None, timezone=None):
     """给用户直接粘贴的 MCP 配置。路径统一用正斜杠——JSON 里反斜杠要转义，
     而正斜杠在 Windows 上一样认，少一个踩坑点。
 
@@ -1313,10 +1344,22 @@ def mcp_config_snippet(server_path, corpus_dir, threads_path, route=None,
         # `--doctor` 那边本来就有"配置里写的是相对值时会解析开"的处理，出货端对齐。
         vals = [str(path.resolve()).replace("\\", "/") for path in paths]
         note = CONFIG_NOTE + CONFIG_NOTE_MACHINE_BOUND
+    # 时区：人给了就用人给的，没给就落默认值——**但探测结果任何时候都不进 args**
+    # （两条规矩的分别见 CONFIG_NOTE_TZ_DEFAULT 上面那段注释）
+    tz = (timezone or "").strip()
+    note += CONFIG_NOTE_TZ if tz else CONFIG_NOTE_TZ_DEFAULT
+    if not tz:
+        here_tz = detect_local_timezone()
+        if here_tz and here_tz != DEFAULT_TIMEZONE:
+            note += (f"（⚠ 顺带一提：跑初始化这台机器的本地时区是 {here_tz}，"
+                     f"跟上面填的默认值不一样。这**不代表**该填 {here_tz}——"
+                     "要填的是你自己所在的时区，不是这台机器的。仅供你核对时参考。）")
+        tz = DEFAULT_TIMEZONE
     cfg = {CONFIG_NOTE_KEY: note,
            "mcpServers": {"memory": {
                "command": "python",
-               "args": [vals[0], "--corpus", vals[1], "--threads", vals[2]]
+               "args": [vals[0], "--corpus", vals[1], "--threads", vals[2],
+                        "--timezone", tz]
                        + route_args(route or ROUTE_DEFAULT),
            }}}
     return json.dumps(cfg, ensure_ascii=False, indent=2)
@@ -1733,7 +1776,7 @@ def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
                  server_path=None, confirmed=False, entries=None,
                  contract_base=None, previous_persona=None, route=None,
                  validation_mode="legacy_v1", rendered_override=None,
-                 add_coverage=True, corpus_overwrite="block"):
+                 add_coverage=True, corpus_overwrite="block", timezone=None):
     """产出四件套（generic 档多一份注入契约副本）。**confirmed=False 时拒绝写盘**——写用户磁盘要过确认关卡
     （规格 §7：人格文件任何改动必须用户确认）。
 
@@ -1836,7 +1879,7 @@ def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
     # 出货时 cwd 是什么谁也保证不了，而这两个文件在包里永远是同级
     server = server_path or Path(__file__).resolve().parent / "mcp_server.py"
     cfg = mcp_config_snippet(server, corpus, out / "threads.jsonl", route=route,
-                             client=client, portable_root=out)
+                             client=client, portable_root=out, timezone=timezone)
     (out / "mcp-config.json").write_text(cfg, encoding="utf-8")
     # 第四件：闭源前端的引导句（小字段放指针、全文留文件）。所有档都出——
     # 宿主客户端用不上它，但「日后要不要接一个闭源前端」出货时不知道，
@@ -1866,43 +1909,49 @@ def save_state(out_dir, state):
     return p
 
 
-def assert_version_keys_consistent(state):
-    """`section_versions` 里同一个版本的 `id` 与 `version_id` 必须相等。
-
-    ⚠ **这个形态我们自己产生不了**：`_section_version_dict` 是从同一个值写出这两个键的。
-    所以两者不等只有一个来源——**这个文件被手工编辑过**。
-    2026.08.05 拿到的那份真机 state 就是实例：
-    `('opening:confirmed_v1', 'opening:6a6e7b2054d3')`，四节都是这个样子。
-    它的坏法**不报错**：决定层指向哈希、渲染侧查 `id`，于是那四节被当成没确认、
-    **悄悄从预览里消失**，一路走到 ship 才以别的错误码浮出来（那次是 timeline 指针）。
-    ⚠ 这里刻意**只拦不修**——手改的意图我们猜不到，替他选一个键就是替他改人格。
-    """
-    bad = []
-    for section, versions in (state.get("section_versions") or {}).items():
-        for version in versions:
-            if not isinstance(version, dict) or "id" not in version:
-                continue
-            canonical = version.get("version_id", version["id"])
-            if version["id"] != canonical:
-                bad.append(f"{section}：id={version['id']} / version_id={canonical}")
-    if bad:
-        raise SystemExit(
-            "不继续：init_state.json 的节版本表里，同一个版本的 id 与 version_id 不一致——"
-            + "；".join(bad)
-            + "。这个形态本工具产生不了，只可能来自手工编辑。"
-              "⚠ 别在这份状态上继续跑：渲染侧按 id 匹配，对不上的节会被整节丢掉，"
-              "而且**不报错**。出口：换一个干净的 --out 目录从 --step inspect 重跑；"
-              "已经出货的人格文件是好的，直接改那份 md 也行。")
-
-
 def load_state(out_dir):
     p = Path(out_dir) / "init_state.json"
-    state = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
-    assert_version_keys_consistent(state)
-    return state
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
 
 
 # ---------- selftest（合成数据，全部虚构） ----------
+
+_GROUP_HEAD_A = re.compile(r"^ {4}# ?\d+[a-z]?\.")
+_GROUP_HEAD_B = re.compile(r"^\s+# +[a-z]\d?\)")
+_GROUP_ASSERT = re.compile(r"^\s*(assert |raise AssertionError)")
+
+
+def _count_assertion_groups(path):
+    """按判据机械数 `_selftest` 里的断言组个数（判据写在 `72` 那一组的注释里）。
+
+    ⚠ **纯正则、无人工判断**：这条的意义就是「换个人重跑得同一个数」——
+    所以不许在这里做任何"看起来像一组"的裁量，形态不合就是不算。
+    """
+    lines = path.read_text(encoding="utf-8").split("\n")
+    start = next(i for i, line in enumerate(lines) if line.startswith("def _selftest():")) + 1
+    end = next(i for i in range(start, len(lines))
+               if line_starts_top_level(lines[i]))
+    body = list(enumerate(lines[start:end], start=start + 1))
+    heads = [(number, "A" if _GROUP_HEAD_A.match(text) else "B")
+             for number, text in body
+             if _GROUP_HEAD_A.match(text) or _GROUP_HEAD_B.match(text)]
+    bounds = [number for number, _kind in heads] + [end + 1]
+    lives = {number: any(_GROUP_ASSERT.match(text) for line_no, text in body
+                         if number < line_no < bounds[index + 1])
+             for index, (number, _kind) in enumerate(heads)}
+    mains = [number for number, kind in heads if kind == "A"]
+    total = 0
+    for index, main in enumerate(mains):
+        stop = mains[index + 1] if index + 1 < len(mains) else end + 1
+        subs = [number for number, kind in heads
+                if kind == "B" and main < number < stop and lives[number]]
+        total += len(subs) if subs else (1 if lives[main] else 0)
+    return total
+
+
+def line_starts_top_level(line):
+    return line.startswith("def ") or line.startswith("class ")
+
 
 def _selftest():
     import tempfile
@@ -2374,6 +2423,25 @@ def _selftest():
                                                pronouns={"user": "他"})}
     assert "pronoun_ai" in asked_half and "pronoun_user" not in asked_half, \
         f"只该问判不出来的那一侧：{sorted(asked_half)}"
+
+    #      ⑦ **问卷那一屏的覆盖度说明不许漏出占位符**（2026.08.05 补，任务卡
+    #      `问卷覆盖度那一屏漏人称占位符`）。这是同一根因的第三处，前两处
+    #      （`section_choice_payload` 的 label、出货文件正文）各有断言，
+    #      **唯独没有一条看这一屏**——于是它在全绿的自检面前活了整整一天。
+    #      ⚠ **靶子必须是「人称判得出来」的那条路**：判不出来时本来就走中性写法，
+    #      `{ta}` 压根不会出现，拿它当靶子这条断言恒真（56b 那条踩过的坑）。
+    _cov_known = coverage_report(Persona("partner"), pronouns={"user": "她", "ai": "他"})
+    _notes_known = [n for _, _, n in _cov_known]
+    assert not any("{ta}" in n or "{ai}" in n for n in _notes_known), \
+        f"覆盖度说明漏出了人称占位符（用户会在问卷第一屏读到）：{_notes_known}"
+    assert any(n.startswith("她是谁") for n in _notes_known), \
+        f"人称判出来了却没渲染进覆盖度说明：{_notes_known}"
+    #      反向：读不出人称走中性写法，**不许塞占位符、也不许塞默认的他／她**
+    _notes_unknown = [n for _, _, n in coverage_report(Persona("partner"))]
+    assert any(n.startswith("对方是谁") for n in _notes_unknown), \
+        f"人称判不出来时该走中性写法「对方是谁」：{_notes_unknown}"
+    assert not any("{ta}" in n or "{ai}" in n for n in _notes_unknown), \
+        f"中性路径也漏出了占位符：{_notes_unknown}"
 
     # 8a3b.【靶心：语料侧判定在**真 CLI 上**真的会触发】验收打回一：
     #      `_detect_pronouns_from_corpus` 当初没把用户侧说话人传进去，于是
@@ -3099,6 +3167,34 @@ def _selftest():
         assert Path(value).is_absolute(), \
             f"mcp-config.json 里 {label} 落的是相对路径，换个工作目录就指不对：{value}"
 
+    # 9e3.【变异靶心：没给就落默认东八区，探到的宿主时区永远不进 args】（任务卡「写回时区与
+    #      跨日归窗」2026.08.04 真机事故）。**这一条守的不是"有没有这个参数"，是
+    #      "这个值从哪来"**：探测探的是跑初始化那台机器的本地时区，而要的是记忆
+    #      所有者本人的时区。事故现场那台 VPS 探出来正好是 `Etc/UTC`——自动填进去，
+    #      `--doctor` 就会给那个缺陷发一张 `✓ 时区：Etc/UTC` 的合格证。
+    #      ⚠ 靶子必须**把探测结果按住成一个真实的值**，否则在探不出时区的机器上
+    #      这条恒真（"断言在缺陷面前全绿"跟没有这条断言是一回事）。
+    _real_detect = detect_local_timezone
+    globals()["detect_local_timezone"] = lambda: "Etc/UTC"
+    try:
+        no_tz = json.loads(mcp_config_snippet("/x/mcp_server.py", "/x/memory",
+                                              "/x/threads.jsonl"))
+        n_args = no_tz["mcpServers"]["memory"]["args"]
+        assert n_args[-2:] == ["--timezone", DEFAULT_TIMEZONE], \
+            f"没人给时区时，落进 args 的该是默认值 {DEFAULT_TIMEZONE}：{n_args}"
+        assert "Etc/UTC" not in " ".join(n_args), \
+            "探测到的宿主时区任何时候都不许进 args——那是给缺陷发合格证"
+        assert "默认值" in no_tz[CONFIG_NOTE_KEY] and "Etc/UTC" in no_tz[CONFIG_NOTE_KEY], \
+            "说明里必须写明这是默认值、且如实说这台机器探到的是别的（让人有机会发现不一致）"
+        given = json.loads(mcp_config_snippet("/x/mcp_server.py", "/x/memory",
+                                              "/x/threads.jsonl", timezone="Europe/Berlin"))
+        g_args = given["mcpServers"]["memory"]["args"]
+        assert g_args[-2:] == ["--timezone", "Europe/Berlin"], f"人给了就得落进 args：{g_args}"
+        assert "Etc/UTC" not in given[CONFIG_NOTE_KEY] and "默认值" not in given[CONFIG_NOTE_KEY], \
+            "人给了之后不该再提探测值或默认值，免得几个值打架"
+    finally:
+        globals()["detect_local_timezone"] = _real_detect
+
     # 9f.【变异靶心：MCP 配置按客户端分「可搬运/绝对路径」两档】（任务卡「MCP 配置
     #     跨机器搬不动」2026.08.02，真实用户在云端容器里当场接不上）。四条一起钉：
     #     ① Claude Code 档 + 整套在产出目录下 → args 里零绝对路径，全走占位符；
@@ -3246,7 +3342,7 @@ def _selftest():
                for version in question["section_versions"])
     empty_user = next(question for question in section_payload["sections"]
                       if question["section"] == "user")
-    assert any(version["id"].endswith(":leave_empty")
+    assert any(version["version_id"].endswith(":leave_empty")
                for version in empty_user["section_versions"])
     # 56b.【靶心：选择题那一屏的节标题也不许漏占位符】走查台账 08-04 第四条。
     #     ⚠ **靶子必须是"有 --persona 的那条路"**：零材料 state 读不出人称，
@@ -3304,7 +3400,7 @@ def _selftest():
     assert not any("她" in label or "他" in label for label in neutral_labels), \
         f"人称读不出来时不该塞一个进去：{neutral_labels!r}"
 
-    decisions = {question["section"]: question["section_versions"][0]["id"]
+    decisions = {question["section"]: question["section_versions"][0]["version_id"]
                  for question in section_payload["sections"]}
     v2_state = apply_section_decisions(v2_state, decisions)
     preview = preview_payload(v2_state)
@@ -3320,24 +3416,39 @@ def _selftest():
     unconfirmed["section_decisions"].pop("closing")
     assert "SECTION_UNCONFIRMED" in {
         issue.code for issue in shipping_issues(unconfirmed, preview["persona_markdown"], None)}
-    # 变异靶心（2026.08.05）：拦截**必须自带出口**，否则被拦的人会去手动绕过。
-    #   变异一：把 SECTION_UNCONFIRMED 的出口句删掉 → 这条红。
-    #   变异二：把 apply_section_choice 的报错改回只说"未知节版本" → 下面那条红。
+    # 71.【三个靶心，函数级】**拦截必须自带出口**：闸门判得对、也确实拦住了，
+    #     但报错只说现象不说处境，人就会自己找路绕过去——2026.08.04 外部实测的代价。
+    #     变异：①删掉 SECTION_UNCONFIRMED 那段出口句 → a 段红；
+    #     ②把 persona_compiler 的「未知节版本」改回只说一句 → b 段红；
+    #     ③把 preview_payload 里 `stale.append` 删掉 → c 段红。
+    #     ⚠ b 段让人抄的字段名必须是 `version_id`：出给 CLI 的条目只有这一个键，
+    #     写成别的会把人指向一个不存在的字段。
+    #     a) 出口句要说清怎么提交，并提醒别手改状态文件
     unconfirmed_msg = next(
         issue.message for issue in shipping_issues(unconfirmed, preview["persona_markdown"], None)
         if issue.code == "SECTION_UNCONFIRMED")
     assert "--section-decisions-json" in unconfirmed_msg and "init_state.json" in unconfirmed_msg, \
         f"SECTION_UNCONFIRMED 必须自带出口与「别手改状态」的提醒：{unconfirmed_msg}"
+    #     b) 未知节版本要列出该节当前的合法版本，并说清从哪条命令的哪个字段抄
     try:
         apply_section_decisions(v2_state, {"closing": "closing:不存在的版本"})
     except ValueError as exc:
-        assert "choose-sections" in str(exc) and "closing:" in str(exc), \
+        assert "choose-sections" in str(exc), \
             f"未知节版本要说清合法 id 从哪儿抄：{exc}"
+        assert "section_versions[].version_id" in str(exc), \
+            f"抄的字段名要按出给 CLI 的那个键名给（`version_id`）：{exc}"
+        #      ⚠ **这一条是「列出合法版本」本身的判据**：写成 `"closing:" in str(exc)`
+        #      是**恒真**的——报错开头那句「未知节版本：closing/
+        #      closing:不存在的版本」自己就含 `closing:`——**它恒真，是拿一个近似的东西
+        #      冒充判据本身**（CLAUDE.md 第 10 条那个形状）。实测：只删掉 `known` 那段、
+        #      别的照留，`memory_init.py --selftest` 退出码仍是 0（全绿）。
+        #      变异 ②b（补这条时先写后跑）：报错里保留出口句与字段名、只去掉合法版本
+        #      清单 → 本条红。
+        assert decisions["closing"] in str(exc), \
+            f"要把该节当前的合法版本原样列出来，只指路等于让人再跑一趟：{exc}"
     else:
         raise AssertionError("未知节版本必须报错")
-
-    # 变异靶心（2026.08.05，真机 state 打回来的）：**已确认但版本 id 找不到**
-    # 不能跟"没确认"共用一句话——那次的代价是用户据此判断确认没生效、去改了源码。
+    #     c) 「已确认但版本号找不到」在预览层单列，不许混进「未确认」
     stale_state = dict(v2_state)
     stale_state["section_decisions"] = dict(v2_state["section_decisions"])
     stale_state["section_decisions"]["closing"] = {
@@ -3350,22 +3461,6 @@ def _selftest():
     stale_preview = preview_payload(stale_state)
     assert stale_preview["stale_versions"] == ["closing"], "预览要单列这类节，别混进未确认里"
     assert "closing" in stale_preview["unresolved"], "它确实渲染不出来，仍要算未解决"
-
-    # 变异靶心（同上）：同一个版本 id != version_id 只可能来自手改，必须当场拦。
-    handmade = dict(v2_state)
-    handmade["section_versions"] = dict(v2_state["section_versions"])
-    handmade["section_versions"]["closing"] = [
-        dict(version, id="closing:confirmed_v1")
-        for version in v2_state["section_versions"]["closing"]]
-    try:
-        assert_version_keys_consistent(handmade)
-    except SystemExit as exc:
-        assert "手工编辑" in str(exc) and "--step inspect" in str(exc), \
-            f"双键不一致要说清来源与出口：{exc}"
-    else:
-        raise AssertionError("id 与 version_id 不一致必须拦住")
-    assert_version_keys_consistent(v2_state)      # 正常状态不许误伤
-
     assert "TIMELINE_POINTER_MISSING" in {
         issue.code for issue in shipping_issues(v2_state, preview["persona_markdown"].replace(
             "timeline", "history"), None)}
@@ -3387,7 +3482,7 @@ def _selftest():
         changed_state = prepare_section_versions(changed_state)
         changed_questions = section_choice_payload(changed_state)["sections"]
         changed_state = apply_section_decisions(changed_state, {
-            question["section"]: question["section_versions"][0]["id"]
+            question["section"]: question["section_versions"][0]["version_id"]
             for question in changed_questions})
         changed_preview = preview_payload(changed_state)
         changed_state["preview"] = {"preview_hash": changed_preview["preview_hash"]}
@@ -3408,7 +3503,7 @@ def _selftest():
             item_to_dict(item) for item in parse_original_persona(persona_file)]
         unassigned = prepare_section_versions(unassigned)
         unassigned = apply_section_decisions(unassigned, {
-            question["section"]: question["section_versions"][0]["id"]
+            question["section"]: question["section_versions"][0]["version_id"]
             for question in section_choice_payload(unassigned)["sections"]})
         unassigned_preview = preview_payload(unassigned)
         assert "SECTION_UNCONFIRMED" in {
@@ -3422,7 +3517,7 @@ def _selftest():
             mapping_questions[0]["item_id"]: "opening"})
         assigned = prepare_section_versions(assigned)
         assigned = apply_section_decisions(assigned, {
-            question["section"]: question["section_versions"][0]["id"]
+            question["section"]: question["section_versions"][0]["version_id"]
             for question in section_choice_payload(assigned)["sections"]})
         assigned_preview = preview_payload(assigned)
         assert "一段没有标题但必须保留的原文。" in assigned_preview["persona_markdown"]
@@ -3448,7 +3543,7 @@ def _selftest():
                           if "protocol:opening_recognition" in version["source_summary"])
         else:
             chosen = versions[0]
-        override_decisions[question["section"]] = chosen["id"]
+        override_decisions[question["section"]] = chosen["version_id"]
     override_state = apply_section_decisions(override_state, override_decisions)
     override_preview = preview_payload(override_state)
     assert "PROTOCOL_OVERRIDES_ORIGINAL" in {
@@ -3535,7 +3630,7 @@ def _selftest():
         partial_state["compiler_items"] = partial_items
         partial_state = prepare_section_versions(partial_state)
         partial_state = apply_section_decisions(partial_state, {
-            question["section"]: question["section_versions"][0]["id"]
+            question["section"]: question["section_versions"][0]["version_id"]
             for question in section_choice_payload(partial_state)["sections"]})
         assert "ORIGINAL_COVERAGE_INCOMPLETE" in {
             issue.code for issue in shipping_issues(
@@ -3567,7 +3662,7 @@ def _selftest():
         continued = run_v2("--json")
         assert "--step extract" in continued
         questions = json.loads(run_v2("--step", "choose-sections", "--json"))
-        cli_decisions = {question["section"]: question["section_versions"][0]["id"]
+        cli_decisions = {question["section"]: question["section_versions"][0]["version_id"]
                          for question in questions["sections"]}
         run_v2("--step", "choose-sections", "--section-decisions-json",
                json.dumps(cli_decisions, ensure_ascii=False), "--json")
@@ -3622,7 +3717,7 @@ def _selftest():
         def walk_and_ship():
             qs = json.loads(run_drift("--step", "choose-sections", "--json").stdout)
             run_drift("--step", "choose-sections", "--section-decisions-json",
-                      json.dumps({q["section"]: q["section_versions"][0]["id"]
+                      json.dumps({q["section"]: q["section_versions"][0]["version_id"]
                                   for q in qs["sections"]}, ensure_ascii=False), "--json")
             run_drift("--step", "preview", "--json")
             run_drift("--step", "route", "--route", "zero-dep")
@@ -3687,9 +3782,9 @@ def _selftest():
             "被拦住的那一节必须多出一个「删除该块」的版本，否则这份人格文件无法出货"
         assert "操作：delete" in dropped[0]["diff"] and "-对方喜欢什么去语料里找" in dropped[0]["diff"], \
             f"删除版本必须带 diff（纪律三：原文 delete 要在该节把 diff 摊开）：{dropped[0]['diff']}"
-        exit_decisions = {q["section"]: q["section_versions"][0]["id"]
+        exit_decisions = {q["section"]: q["section_versions"][0]["version_id"]
                           for q in exit_qs["sections"]}
-        exit_decisions["user"] = dropped[0]["id"]
+        exit_decisions["user"] = dropped[0]["version_id"]
         run_exit("--step", "choose-sections", "--section-decisions-json",
                  json.dumps(exit_decisions, ensure_ascii=False), "--json")
         run_exit("--step", "preview", "--json")
@@ -3699,6 +3794,317 @@ def _selftest():
             f"选了删除版本之后必须能出货：{exit_ship.stdout + exit_ship.stderr}"
         shipped_text = (root / "AGENTS.md").read_text(encoding="utf-8")
         assert "去语料里找" not in shipped_text and "虚构自述" in shipped_text
+
+    # 61b.【靶心，真命令】「出货文件全文零『它』」那条硬约束必须能看住**存量人格文件**。
+    #      （任务卡《零它硬约束对存量人格文件失效》，2026.08.04 走查现场第一条。）
+    #      ⚠ **靶子必须是"用户已有的人格文件"走 v2 七步**，不许拿我们自己造的问卷人格
+    #      代替——**那正是这个缺陷本身**：守着这条约束的老断言（`_ship_and_read` 那条）
+    #      喂的是程序现造的 v1 问卷产物，**从没见过 v2 的产出**，于是旧版工具留下的
+    #      `**它该记住你哪些方面**：…` 原样出货，warning 0、blocking 0，全程零提示。
+    #      变异三条，**都实跑过、各自转红**（红在哪一段是实测的，不是预想的）：
+    #      ①`BANNED_WORD_TOKENS` 清空（＝回到缺陷现状）→ **红在 b 段**（那一节生不出
+    #        删除版本；断言顺序先撞到它，warning 那半同样没了，只是没走到）；
+    #      ②`_DELETE_EXIT_RULES` 去掉禁用词那一行 → 同样红在 b 段（有提示、没出口）；
+    #      ③`_step_ship_v2` 里打 warning 那几行删掉 → **红在 a 段**，报文是
+    #        「实际输出：【四件套】」——**报了但没人看见，跟没报是一回事**。
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        script = str(Path(__file__).resolve())
+        persona_file = root / "旧版人格.md"
+        #      夹具照抄旧版工具的产物形态：**「它」在标题里**，正文是虚构内容
+        persona_file.write_text(
+            "# 开篇\n\n虚构开篇。\n\n# 我是谁\n\n虚构自述。\n\n"
+            "# 她是谁\n\n**它该记住你哪些方面**：她在临海修旧海图。\n\n"
+            "# 最终约定\n\n虚构约定。\n", encoding="utf-8")
+
+        def run_ban(*extra, check=True):
+            return subprocess.run(
+                [sys.executable, script, "--out", str(root), *extra],
+                capture_output=True, text=True, encoding="utf-8", check=check)
+
+        run_ban("--persona", str(persona_file), "--step", "inspect", "--json")
+        ban_qs = json.loads(run_ban("--step", "choose-sections", "--json").stdout)
+        ban_section = next(q for q in ban_qs["sections"] if q["section"] == "user")
+        #      b) 那一节必须多出一个「删除该块」的版本，且带 diff（纪律三）
+        ban_drop = [v for v in ban_section["section_versions"] if "它" not in v["markdown"]]
+        assert len(ban_section["section_versions"]) >= 2 and ban_drop, \
+            "含「它」的那一节必须多出一个「删除该块」的版本——没有出口，用户只能回去" \
+            "手改输入文件，而手改标题正是 08.03 台账第一条那个塌节雷区"
+        assert "操作：delete" in ban_drop[0]["diff"] and "它该记住你哪些方面" in ban_drop[0]["diff"], \
+            f"删除版本必须带 diff，把要删掉的原文摊开：{ban_drop[0]['diff']}"
+        assert "BANNED_WORD_REMAINS" in ban_drop[0]["diff"] or "不写成「它」" in ban_drop[0]["diff"], \
+            f"删除版本要说清为什么给这个选项：{ban_drop[0]['diff']}"
+
+        #      a) 先按"原样保留"走完，出货必须**成功但报出来**（拍板：warning 不 blocking）
+        keep_decisions = {q["section"]: q["section_versions"][0]["version_id"] for q in ban_qs["sections"]}
+        keep_id = next(v["version_id"] for v in ban_section["section_versions"] if "它" in v["markdown"])
+        keep_decisions["user"] = keep_id
+        run_ban("--step", "choose-sections", "--section-decisions-json",
+                json.dumps(keep_decisions, ensure_ascii=False), "--json")
+        run_ban("--step", "preview", "--json")
+        run_ban("--step", "route", "--route", "zero-dep")
+        kept_ship = run_ban("--step", "ship", "--client", "codex", check=False)
+        kept_msg = kept_ship.stdout + kept_ship.stderr
+        assert kept_ship.returncode == 0, f"这条是 warning 不是 blocking，该出得了货：{kept_msg}"
+        assert "BANNED_WORD_REMAINS" in kept_msg, \
+            f"⚠ 存量人格文件带着「它」出货时必须报到用户脸上，实际输出：{kept_msg}"
+        assert "它该记住你哪些方面" in kept_msg, \
+            f"报错要指到行，不能只说「文件里有『它』」让用户自己去 Ctrl+F：{kept_msg}"
+        assert "它" in (root / "AGENTS.md").read_text(encoding="utf-8"), \
+            "用户选了保留就真的保留——⚠ 不许替他改原文（v2「不改写任何非空原文」不变量）"
+
+        #      c) 再选「删除该块」重跑：能出货，且出货文件里那句没了
+        drop_decisions = dict(keep_decisions)
+        drop_decisions["user"] = ban_drop[0]["version_id"]
+        run_ban("--step", "choose-sections", "--section-decisions-json",
+                json.dumps(drop_decisions, ensure_ascii=False), "--json")
+        run_ban("--step", "preview", "--json")
+        dropped_ship = run_ban("--step", "ship", "--client", "codex", check=False)
+        dropped_msg = dropped_ship.stdout + dropped_ship.stderr
+        assert dropped_ship.returncode == 0, f"选了删除版本必须能出货：{dropped_msg}"
+        shipped_ban = (root / "AGENTS.md").read_text(encoding="utf-8")
+        assert "它该记住你哪些方面" not in shipped_ban and "虚构自述" in shipped_ban, \
+            "选了删除版本之后那句该没了，别的原文一个字不许少"
+        assert "BANNED_WORD_REMAINS" not in dropped_msg, \
+            f"删干净了就不该再报——见字就报等于把 warning 变成噪声：{dropped_msg}"
+
+    # 61d.【两个靶心，真命令】「材料很水」要有留空出口，而且**按得下去**。
+    #      （任务卡《材料很水时没有留空出口》，2026.08.04 走查现场第二条。）
+    #      现场证据：十二节 `section_versions` 长度全是 1、`leave_empty` 一处都没有
+    #      ——这一步退化成"十二节 × 1 个选项 × 12 次确认"的橡皮图章。
+    #      ⚠ **靶心二才是这张卡的本体**：只让按钮出现、按下去却被
+    #      `SOURCE_ACCOUNTING_INCOMPLETE` 拦死，等于给了个按不下去的按钮。
+    #      变异：把 `elif all(... == "corpus")` 那一支删掉 → a 段红（没有留空版本）。
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        script = str(Path(__file__).resolve())
+        corpus_dir = root / "语料"
+        (corpus_dir / "timeline").mkdir(parents=True)
+        (corpus_dir / "timeline" / "window_01_2026-05-02.md").write_text(
+            "# 第1个窗口 · 2026-05-02\n\n## 日常\n虚构：她在临海修旧海图。\n",
+            encoding="utf-8")
+        thin = corpus_dir / "timeline" / "window_02_2026-05-03.md"
+        thin.write_text("# 第2个窗口 · 2026-05-03\n\n## 闲聊\n虚构：今天天气不错。\n",
+                        encoding="utf-8")
+
+        def run_thin(*extra, check=True):
+            return subprocess.run(
+                [sys.executable, script, "--out", str(root), *extra],
+                capture_output=True, text=True, encoding="utf-8", check=check)
+
+        #      ⚠ 夹具带上 `--persona`：不然「有原文块的节不给留空」那条边界没有靶子
+        #      （实测过——不带 persona 时把边界放宽成"有材料就给"，这一段照样全绿）
+        persona_file = root / "输入人格.md"
+        persona_file.write_text(
+            "# 开篇\n\n虚构开篇。\n\n# 我是谁\n\n虚构自述。\n\n"
+            "# 她是谁\n\n她在临海修旧海图。\n\n# 最终约定\n\n虚构约定。\n",
+            encoding="utf-8")
+        run_thin("--persona", str(persona_file), "--corpus", str(corpus_dir),
+                 "--step", "inspect", "--json")
+        #      候选：两条都挂在 daily 节，其中一条就是那种"逐字对得上的废话"
+        thin_ref = str(thin.resolve())
+        rich_ref = str((corpus_dir / "timeline" / "window_01_2026-05-02.md").resolve())
+        thin_text = thin.read_text(encoding="utf-8")
+        rich_text = Path(rich_ref).read_text(encoding="utf-8")
+        payload_thin = {"items": [
+            {"item_id": "corpus:1", "text": "她在临海修旧海图。", "section": "daily",
+             "source_ref": rich_ref,
+             "source_span": [rich_text.index("虚构：她在临海修旧海图。"),
+                             rich_text.index("虚构：她在临海修旧海图。") + 12],
+             "candidate_kind": "fact", "evidence": "虚构：她在临海"},
+            {"item_id": "corpus:2", "text": "今天天气不错。", "section": "daily",
+             "source_ref": thin_ref,
+             "source_span": [thin_text.index("虚构：今天天气不错。"),
+                             thin_text.index("虚构：今天天气不错。") + 10],
+             "candidate_kind": "fact", "evidence": "虚构：今天天气"},
+        ], "source_accounting": [
+            {"source_ref": rich_ref, "candidate_item_ids": ["corpus:1"]},
+            {"source_ref": thin_ref, "candidate_item_ids": ["corpus:2"]},
+        ]}
+        run_thin("--step", "extract", "--candidates",
+                 json.dumps(payload_thin, ensure_ascii=False), "--json")
+        thin_qs = json.loads(run_thin("--step", "choose-sections", "--json").stdout)
+        thin_daily = next(q for q in thin_qs["sections"] if q["section"] == "daily")
+        #      a) 靶心一：有材料的那一节必须多出一个「本节留空」的版本，**且带说明**
+        empty_versions = [v for v in thin_daily["section_versions"]
+                          if v["version_id"].endswith(":leave_empty")]
+        assert len(thin_daily["section_versions"]) >= 2 and empty_versions, \
+            "有材料的节必须给「本节留空」这个选项，否则这一步只是橡皮图章：" \
+            f"{[v['version_id'] for v in thin_daily['section_versions']]}"
+        assert "window_02_2026-05-03.md" in empty_versions[0]["diff"], \
+            f"留空版本要说清会丢掉哪些来源：{empty_versions[0]['diff']}"
+        assert "已交代" in empty_versions[0]["diff"], \
+            "语义变更要写在用户看得见的地方：弃用之后那些来源算已交代，不必回去改候选结果"
+        #      ⚠ 说明写在 diff 里，人读的那条路（不带 --json）必须也打得出来
+        human = run_thin("--step", "choose-sections").stdout
+        assert "本节留空" in human and "window_02_2026-05-03.md" in human, \
+            f"不带 --json 时留空版本只剩一个 id ＋ 一行空白，说明没打出来等于没给：{human[-400:]}"
+
+        #      b) 靶心二（本卡本体）：选了留空之后，preview 里没有这一节，且 **ship 过得去**
+        thin_decisions = {q["section"]: q["section_versions"][0]["version_id"]
+                          for q in thin_qs["sections"]}
+        thin_decisions["daily"] = empty_versions[0]["version_id"]
+        run_thin("--step", "choose-sections", "--section-decisions-json",
+                 json.dumps(thin_decisions, ensure_ascii=False), "--json")
+        thin_preview = json.loads(run_thin("--step", "preview", "--json").stdout)
+        assert "今天天气不错" not in thin_preview["persona_markdown"], \
+            "选了留空，这一节不该出现在预览里"
+        run_thin("--step", "route", "--route", "zero-dep")
+        thin_ship = run_thin("--step", "ship", "--client", "codex", check=False)
+        thin_msg = thin_ship.stdout + thin_ship.stderr
+        assert thin_ship.returncode == 0, \
+            f"⚠ 这条是本卡真正的靶心：按钮按下去必须能出货，实际：{thin_msg}"
+        assert "SOURCE_ACCOUNTING_INCOMPLETE" not in thin_msg, \
+            f"弃用一节之后那些来源仍算已交代（08.05 拍板），不许在这里把人拦回 extract：{thin_msg}"
+        assert "今天天气不错" not in (root / "AGENTS.md").read_text(encoding="utf-8")
+
+        #      c) 反向：零材料的节照旧**只有一个** leave_empty，不许变成两个
+        for question in thin_qs["sections"]:
+            empties = [v for v in question["section_versions"]
+                       if v["version_id"].endswith(":leave_empty")]
+            assert len(empties) <= 1, \
+                f"{question['section']} 出现了两个留空版本——同一个选项给两遍是噪声"
+            #      零材料的节照旧**只有** leave_empty 一个版本，不许变成两个
+            if empties and len(question["section_versions"]) > 1:
+                assert any(v["markdown"] for v in question["section_versions"]), \
+                    f"{question['section']} 的多个版本里没有一个有正文，那这个留空选项是凭空多出来的"
+        zero_material = [q for q in thin_qs["sections"]
+                         if len(q["section_versions"]) == 1
+                         and q["section_versions"][0]["version_id"].endswith(":leave_empty")]
+        assert zero_material, "这份夹具里该有零材料的节（它们是反向靶心的靶子）"
+
+        #      d)【边界靶心】「本节留空」**只给全是语料候选的节**——⚠ 这一条 2026.08.05
+        #      是实测补上的：把那一支放宽成"有材料就给"，上面 a～c 段**照样全绿**，
+        #      "断言在缺陷面前全绿"跟没有断言是一回事。
+        #      两条边界各有一条已经存在的机制在管，别用这个按钮盖过去：
+        #        · 有原文块的节 → 丢弃用户原文必须逐块走「删除该块」（带 diff）；
+        #        · 有协议默认值的节 → 那是骨架，留空会把 ship 直接拦死。
+        thin_state = json.loads((root / "init_state.json").read_text(encoding="utf-8"))
+        types_by_section = {}
+        for item in thin_state.get("compiler_items", []):
+            if item.get("section"):
+                types_by_section.setdefault(item["section"], set()).add(item.get("source_type"))
+        checked = 0
+        for question in thin_qs["sections"]:
+            kinds = types_by_section.get(question["section"], set())
+            has_empty = any(v["version_id"].endswith(":leave_empty")
+                            for v in question["section_versions"])
+            if not kinds:
+                continue                      # 零材料那档在上面 c 段管
+            checked += 1
+            assert has_empty == (kinds == {"corpus"}), (
+                f"{question['section']} 的材料是 {sorted(kinds)}，留空版本={has_empty}"
+                "——「本节留空」只给全是语料候选的节：有原文块的走「删除该块」逐块给，"
+                "有协议默认值的留空会把 ship 拦死（给个按不下去的按钮比不给更糟）")
+        assert checked >= 3 and any(
+            types_by_section.get(q["section"]) == {"corpus"} for q in thin_qs["sections"]), \
+            "这份夹具要同时覆盖到「纯语料」「含原文」「含协议默认值」三种节，否则这条恒真"
+
+    # 61c.【反向靶心】不含「它」的存量人格文件走同一条路，**一个字都不许报**。
+    #      ⚠ 没有这一段的话，把 BANNED_WORD_TOKENS 改成恒真（比如空串）也照样绿
+    #      ——"见字就报"跟"报得准"在只有正向断言时长得一模一样。
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        script = str(Path(__file__).resolve())
+        clean_file = root / "干净人格.md"
+        clean_file.write_text(
+            "# 开篇\n\n虚构开篇。\n\n# 我是谁\n\n虚构自述。\n\n"
+            "# 她是谁\n\n她在临海修旧海图。\n\n# 最终约定\n\n虚构约定。\n",
+            encoding="utf-8")
+
+        def run_clean(*extra, check=True):
+            return subprocess.run(
+                [sys.executable, script, "--out", str(root), *extra],
+                capture_output=True, text=True, encoding="utf-8", check=check)
+
+        run_clean("--persona", str(clean_file), "--step", "inspect", "--json")
+        clean_qs = json.loads(run_clean("--step", "choose-sections", "--json").stdout)
+        clean_user = next(q for q in clean_qs["sections"] if q["section"] == "user")
+        assert not any(v["version_id"].endswith(DIRECTIVE_DELETE_SUFFIX)
+                       for v in clean_user["section_versions"]), \
+            "干净的原文块不该被塞一个「删除该块」的版本——那是给用户多一屏噪声"
+        run_clean("--step", "choose-sections", "--section-decisions-json",
+                  json.dumps({q["section"]: q["section_versions"][0]["version_id"]
+                              for q in clean_qs["sections"]}, ensure_ascii=False), "--json")
+        run_clean("--step", "preview", "--json")
+        run_clean("--step", "route", "--route", "zero-dep")
+        clean_ship = run_clean("--step", "ship", "--client", "codex", check=False)
+        clean_msg = clean_ship.stdout + clean_ship.stderr
+        assert clean_ship.returncode == 0 and "BANNED_WORD_REMAINS" not in clean_msg, \
+            f"不含「它」的人格文件不许报：{clean_msg}"
+
+    # 61e.【三个靶心，真命令＋函数级】节版本双键收敛，且**「某节静默消失」必须绝迹**。
+    #      **它挡的失效形态**：某节的决定指向一个版本表里已经没有的号——
+    #      `status` 仍是 `confirmed`（所以 `SECTION_UNCONFIRMED` 不报），
+    #      `preview_payload` 匹配不到版本就整节跳过，**用户确认过的一节被静默从出货
+    #      文件里删掉、退出码 0、全程零提示**。下面 b 段就是那个形态的断言。
+    #      变异：①`_section_version_dict` 把 `id` 加回去并让读侧按 `id` 匹配 → a 段红；
+    #      ②去掉 `SECTION_VERSION_STALE` 那一段 → b 段红（静默丢节复活）；
+    #      ③`version_key` 拿不到键时返回 None 而不是抛 → c 段红（`None == None` 那条）。
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        script = str(Path(__file__).resolve())
+        persona_file = root / "人格.md"
+        persona_file.write_text(
+            "# 开篇\n\n虚构开篇。\n\n# 我是谁\n\n虚构自述。\n\n"
+            "# 她是谁\n\n她在临海修旧海图。\n\n# 最终约定\n\n虚构约定。\n",
+            encoding="utf-8")
+
+        def run_key(*extra, check=True):
+            return subprocess.run(
+                [sys.executable, script, "--out", str(root), *extra],
+                capture_output=True, text=True, encoding="utf-8", check=check)
+
+        run_key("--persona", str(persona_file), "--step", "inspect", "--json")
+        key_qs = json.loads(run_key("--step", "choose-sections", "--json").stdout)
+        #      a) 靶心一：出给 CLI 的版本条目**只有 version_id 一个键**，不再双写
+        sample = key_qs["sections"][0]["section_versions"][0]
+        assert "version_id" in sample and "id" not in sample, \
+            f"节版本只认一个键（version_id），不许再双写：{sorted(sample)}"
+        key_decisions = {q["section"]: q["section_versions"][0]["version_id"]
+                         for q in key_qs["sections"]}
+        run_key("--step", "choose-sections", "--section-decisions-json",
+                json.dumps(key_decisions, ensure_ascii=False), "--json")
+        run_key("--step", "preview", "--json")
+        run_key("--step", "route", "--route", "zero-dep")
+        assert run_key("--step", "ship", "--client", "codex", check=False).returncode == 0, \
+            "收敛后的新格式必须全程正常"
+        assert "虚构约定" in (root / "AGENTS.md").read_text(encoding="utf-8")
+
+        #      b) 靶心（本卡验收判据那句）：**决定指向一个不存在的版本号 → 必须吵，
+        #      不许某节静默消失**。⚠ 这个形态就是真机那份 state 的形态。
+        state_path = root / "init_state.json"
+        broken = json.loads(state_path.read_text(encoding="utf-8"))
+        broken["section_decisions"]["closing"]["version_id"] = "closing:confirmed_v1"
+        state_path.write_text(json.dumps(broken, ensure_ascii=False), encoding="utf-8")
+        stale_ship = run_key("--step", "ship", "--client", "codex", check=False)
+        stale_msg = stale_ship.stdout + stale_ship.stderr
+        assert stale_ship.returncode != 0 and "SECTION_VERSION_STALE" in stale_msg, \
+            f"⚠ 确认过但版本号找不到时必须拦住——不拦的话那一节整节从出货文件里消失" \
+            f"而且不报错（实测过的真实后果）：退出码 {stale_ship.returncode} / {stale_msg}"
+        assert "closing" in stale_msg and "closing:confirmed_v1" in stale_msg, \
+            f"报错要点名是哪一节、决定指向的是什么，别让人自己去翻 state：{stale_msg}"
+        #      b2) 同一形态在**预览层**要分两行印：混进「未确认节」说的是现象不是处境，
+        #      那句话把一位真实用户指向了翻源码改匹配逻辑。
+        #      ⚠ 走真进程看 CLI 实际打出来的文字，不看 payload——坏的就是印的那一层。
+        stale_preview_out = run_key("--step", "preview").stdout
+        assert "已确认" in stale_preview_out and "closing" in stale_preview_out, \
+            f"预览要单说这一节已确认、只是版本号找不到：{stale_preview_out}"
+        assert "未确认节" not in stale_preview_out, \
+            f"⚠ 不许把它混进「未确认节」——那正是把人指向改源码的那句话：{stale_preview_out}"
+        run_key("--step", "route", "--route", "zero-dep")       # 上一行把 step 退回 previewed
+
+        #      c) 靶心二（防过度纠正）：拿不到键必须**抛**，不许返回 None
+        #      ——外部那个补丁就是 `None == None` 相等，把 BOUNDARY_CONFLICT_UNRESOLVED
+        #      静默放过；**从「报错」退化成「假装通过」比不改更坏**。
+        try:
+            version_key({"markdown": "没有任何 id 的坏条目"})
+            assert False, "拿不到 version_id 必须抛，返回 None 会让两个 None 比出相等"
+        except ValueError as exc:
+            assert "version_id" in str(exc)
+        #      旧 state 的兼容：**历史上写出去的条目两键恒等**，只有 id 也读得出来
+        assert version_key({"id": "closing:abc"}) == "closing:abc"
+        assert version_key({"version_id": "closing:abc", "id": "closing:abc"}) == "closing:abc"
 
     # 62.【两个靶心，真命令】重跑出货不许静默覆盖已有语料。
     #     夹具：现造一份虚构聊天 txt（两段会话跨两天、间隔超 gap → 落成两个窗口文件），
@@ -3829,7 +4235,7 @@ def _selftest():
         run_dup("--persona", str(persona_file), "--step", "inspect", "--json")
         dup_qs = json.loads(run_dup("--step", "choose-sections", "--json").stdout)
         run_dup("--step", "choose-sections", "--section-decisions-json",
-                json.dumps({q["section"]: q["section_versions"][0]["id"]
+                json.dumps({q["section"]: q["section_versions"][0]["version_id"]
                             for q in dup_qs["sections"]}, ensure_ascii=False), "--json")
         run_dup("--step", "preview", "--json")
         run_dup("--step", "route", "--route", "zero-dep")
@@ -3875,7 +4281,29 @@ def _selftest():
         assert _ta("# 它是谁") is None, "「它」在任何一档都不许出现"
         assert _ta("# 我是谁") is None, "不是用户那节的标题句式，读不出来就该是 None"
 
-    print("selftest ok（69项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
+    # 72.【一个靶心，元断言】**项数不许再靠增量漂**（2026.08.05 审核轮，CLAUDE.md 第 10 条）。
+    #     **判据（先写后数）——一项 ＝ 一个「下辖断言的注释标头」**，只认两种形态：
+    #     **A 型主组**＝缩进恰好 4 空格、`# 数字[小写字母].`（如 `# 61e.`）；
+    #     **B 型子组**＝任意缩进、`# 小写字母[一位数字])`（如 `# a)` `# b2)`）。
+    #     算法：按 A 切主组；主组内有下辖断言的 B → 计 B 的个数（**主组本身不再另计**，
+    #     否则一个组数两遍），没有 B → 计 1；**标头到下一个标头之间没有 `assert` 的不计**。
+    #     按这条数出来是 **60**（这一组 `72` 自己也算一组；脚本即下面那个函数）。
+    #     ⚠ **那行斜杠描述有 55 条，跟项数不是一回事**，别拿它当项数的判据。
+    #     ⚠ 靶心：**总结行不影响任何断言、改错了不会红**，所以让它自己守自己——
+    #     下面这条断言现读现数本文件，数不上就红，项数不会静默漂。
+    #     变异（先写后跑）：把总结行的数字改成别的 → 本条红；新增／删掉一个断言组
+    #     而不改那个数 → 本条红。
+    assertion_group_count = _count_assertion_groups(Path(__file__).resolve())
+    _declared = int(re.search(r"selftest ok（(\d+)项断言：", _SELFTEST_SUMMARY).group(1))
+    assert assertion_group_count == _declared, (
+        f"自检总结行写的项数（{_declared}）跟按判据现数出来的（{assertion_group_count}）对不上"
+        "——加减了断言组就把那个数一起改，判据见本组注释")
+
+    print(_SELFTEST_SUMMARY)
+
+
+_SELFTEST_SUMMARY = (
+    "selftest ok（60项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
           "归属句式 / 默认值不预支历史 / 协议层不问用户 / 导出纪律 / 渲染顺序 / "
           "人称锚死一套 / 用户只有一种称呼形态 / 昵称档不被静默吃掉 / 中性档不丢主语 / 人称从语料读出来 / 中性写法不许漏 / 语料侧判定不许猜 / 全文零它 / 称呼不重复拼接 / 关系状态归开篇 / "
           "答案读回不静默丢 / 任务书不泄漏进人格文件 / 长字面量不崩 / 未决草稿不蒸发 / "
@@ -3898,13 +4326,29 @@ def _selftest():
           "选择题那一屏的节标题也不许漏人称占位符（⚠ 靶子必须是有 --persona 的那条路，"
           "零材料 state 走中性写法、这条恒真） / "
           "mcp-config.json 里三个路径都是绝对的（⚠ 只查 server 那一条在缺陷面前全绿） / "
+          "MCP 配置里没给时区就落默认东八区、探到的宿主时区一律只进说明不进 args"
+          "（云服务器上探出来正好是 UTC，拿它顶替等于给那个缺陷发合格证）/ "
+          "「出货文件全文零它」那条硬约束看得住存量人格文件（⚠ 靶子必须是用户已有的"
+          "人格文件走 v2 七步，不许拿我们自己造的问卷人格代替——那正是这个缺陷本身；"
+          "warning 打到屏幕上、那一节有带 diff 的「删除该块」出口、选保留就真保留不改原文）"
+          " / 反向：不含「它」的人格文件一个字都不许报（没有这一段，"
+          "「见字就报」跟「报得准」长得一模一样）/ "
+          "有材料的节也给「本节留空」出口，且**按得下去**（⚠ 靶心二是 ship 不被 "
+          "SOURCE_ACCOUNTING_INCOMPLETE 拦死——只让按钮出现等于给个按不下去的按钮；"
+          "边界断言：留空版本存在 ⟺ 该节全是语料候选，⚠ 这条是实测补的，"
+          "放宽边界那次变异第一次跑全绿）/ "
           "归节题的说明按块的类型给（标题块要说清「选哪一节都不改变出货正文」，"
-          "⚠ 正文块不许被这么说，那是反着错） / "
-          "拦截自带出口（SECTION_UNCONFIRMED 说清 --section-decisions-json 且提醒别手改状态、"
-          "未知节版本列出该节合法 id）＋「已确认但版本 id 查不到」有独立错误码 "
-          "SECTION_VERSION_STALE、不再被说成「未确认」＋同一版本 id != version_id "
-          "当场拦（⚠ 这三条是 2026.08.05 真机 state 打回来的：那次报错说的是现象不是处境，"
-          "用户据此判断确认没生效、去改了源码））")
+          "⚠ 正文块不许被这么说，那是反着错）/ "
+          "节版本收敛成一个 version_id、且「某节静默消失」绝迹（61e：出给 CLI 的条目"
+          "不再双写；决定指向不存在的版本号时 ship 非零退出并点名哪一节／哪个号；"
+          "拿不到键必须抛不许返回 None，⚠ 这三组 7eb30a4 就加了、当时漏进这行）/ "
+          "拦截自带出口（71：SECTION_UNCONFIRMED 说清 --section-decisions-json 且提醒"
+          "别手改状态、未知节版本列出该节合法版本并说清抄哪个字段、「已确认但版本号"
+          "找不到」在预览层单列 stale_versions 不混进未确认；⚠ 这三条是 2026.08.05 真机 "
+          "state 打回来的）＋"
+          "同一形态走真进程看 CLI 实际打出来的两行（61e b2：坏的就是印的那一层））/ "
+          "⚠ 项数自己守自己（72：这一行的数字现读现数本文件，对不上就红——"
+          "判据与算法见 72 那组注释）)")
 
 
 def _rebuild(state):
@@ -3921,8 +4365,8 @@ def _rebuild(state):
                                      state.get("answers"), detected)
     persona = Persona("partner")
     fill_protocol_defaults(persona, pronouns)
-    qs = questions_for(coverage_report(persona), has_corpus=state.get("has_corpus", False),
-                       pronouns=pronouns)
+    qs = questions_for(coverage_report(persona, pronouns=pronouns),
+                       has_corpus=state.get("has_corpus", False), pronouns=pronouns)
     if state.get("answers"):
         apply_answers(persona, qs, state["answers"], pronouns)
     if state.get("decisions"):
@@ -4042,9 +4486,32 @@ def load_init_state(data):
     return SimpleNamespace(mode=mode, data=data)
 
 
+def version_key(version):
+    """版本条目 → 它的 id。**唯一的取键口径**，读的地方都走这里。
+
+    ⚠ **拿不到就抛，不许返回 None**（任务卡《节版本双键收敛》靶心二）：
+    外部那个补丁就是 `version.get("version_id")` 取不到给 `None`，而决定那侧也可能
+    是 `None`，两个 `None` 一比就相等——`BOUNDARY_CONFLICT_UNRESOLVED` 于是被静默
+    放过。**从「报错」退化成「假装通过」，比不改更坏。**
+    ⚠ 兼容一句：2026.08.05 之前写出去的 state 同时有 `id` 与 `version_id` 且值恒等
+    （已拿真的旧 state 核过），所以只认 `version_id`、`id` 兜底，两者都没有就是坏数据。"""
+    key = version.get("version_id") or version.get("id")
+    if not key:
+        raise ValueError(
+            "节版本条目没有 version_id（也没有旧版的 id），这份 init_state.json 是坏的："
+            f"{sorted(version)[:6]}。别继续读——继续读会让某一节静默消失。")
+    return key
+
+
 def _section_version_dict(version):
+    """节版本 → 出给 CLI 的字典。
+
+    ⚠ **只写 `version_id` 一个键**（2026.08.05，任务卡《节版本双键收敛》）：
+    原先这里同时写 `id` 和 `version_id`、值恒等，而 `persona_compiler._version_to_dict`
+    只写 `version_id`——**同一个对象两份序列化、键集不同**，读的一侧也就跟着分家
+    （这边按 `id` 匹配、那边写着防御性回退）。真机上已经出现过失步的实例。
+    收敛之后判据只有一个：**`version_id`**。"""
     return {
-        "id": version.version_id,
         "version_id": version.version_id,
         "section": version.section,
         "item_ids": list(version.item_ids),
@@ -4093,13 +4560,43 @@ def _style_disclaimer_item():
 #   用户就又被推回「手改输入文件」那条路（那正是现象 A 的雷区）。
 TASK_DIRECTIVE_TOKENS = ("去语料里找", "记住用户喜好", "请用户补写", "请写一句")
 
+# 维护者的硬约束词面：**出货文件全文零「它」**（人格文件里的 AI 不是"它"）。
+# ⚠ **这一条 2026.08.04 走查前对存量用户完全失效**（任务卡《零它硬约束对存量人格文件
+# 失效》）：守着它的断言（`_ship_and_read` 那条）靶子是**程序自己现造的 v1 问卷人格**，
+# 而七步走用的是 v2 编译器路径——输入是**用户已有的人格文件**，契约是「不改写、
+# 不丢弃任何非空原文」。于是旧版工具留下的 `**它该记住你哪些方面**：…` 原样出货，
+# 10 个「它」、warning 0 条、blocking 0 条，**全程零提示**。
+#
+# ⚠ **为什么是 warning 不是 blocking**（2026.08.05 维护者拍板 ②＋③）：
+# 「它」是个常用字，用户原文里完全可能有正当用法（"那台咖啡机，它坏了"）。
+# 拦死等于替用户判断他的原文，而**我们明确不许改写用户原文**（v2 不变量）。
+# 所以给的是"看得见 ＋ 有出口"：报出来，并在那一节多给一个「删除该块」的版本。
+BANNED_WORD_TOKENS = ("它",)
+
 # 「删除该块」版本的 item_id 后缀。每次重建节版本时先按这个后缀清掉旧的再重生成，
 # 免得用户改了归节之后留下一个挂在旧节上的孤儿版本。
 DIRECTIVE_DELETE_SUFFIX = ":directive-delete"
 
+# 出口规则表：**哪些词面值得给一个「删除该块」的版本**。
+# ⚠ **这张表就是"触发面"本身，加一行之前先问一句**（2026.08.05 拍板时维护者点的名）：
+# 这个词命中之后，用户"把这块删掉"是不是一个**合理的选项**？——是待办占位／写错的
+# 人称这类"本来就不该进成品"的东西才算；不是"我们看着不顺眼"的都往这里塞。
+# ⚠ 两列缺一不可：闸门（shipping_issues）拿同一份词表判报不报，选择题拿它生成出口
+# ——各写一份的话，闸门报得出的句子选择题里生不出出口，用户又被推回「手改输入文件」，
+# 而手改标题正是 08.03 台账第一条那个塌节雷区。
+_DELETE_EXIT_RULES = (
+    (TASK_DIRECTIVE_TOKENS,
+     "TASK_DIRECTIVE_REMAINS：这一块含任务书或空指令（命中「{hit}」），"
+     "带着它出货会被拦下。选这个版本＝把这块原文删掉。"),
+    (BANNED_WORD_TOKENS,
+     "BANNED_WORD_REMAINS：这一块含「{hit}」——人格文件里的 AI 不写成「它」。"
+     "⚠ 这条**不拦你出货**：你原文里若是正当用法（指某个东西），"
+     "留着就行；确实是旧版工具留下的写法，就选这个版本把这块删掉。"),
+)
+
 
 def task_directive_delete_items(items):
-    """给命中任务书残句的原文块，额外造一个「删除该块」的版本。
+    """给命中出口规则表的原文块，额外造一个「删除该块」的版本。
 
     **这是 `TASK_DIRECTIVE_REMAINS` 的出口**（2026.08.03 走查第五条）：拦截本身是对的
     ——待办占位不该进成品——但在此之前流程里没有退出路径，那一节只生成 1 个版本、
@@ -4122,19 +4619,23 @@ def task_directive_delete_items(items):
             continue
         if item.operation not in {"keep", "move"}:
             continue
-        hit = [token for token in TASK_DIRECTIVE_TOKENS if token in item.original_text]
-        if not hit:
+        reasons = []
+        for tokens, template in _DELETE_EXIT_RULES:
+            hit = [token for token in tokens if token in item.original_text]
+            if hit:
+                reasons.append(template.format(hit="」「".join(hit)))
+        if not reasons:
             continue
+        # 同一块同时命中两条规则时只造**一个**孪生条目（两条理由并排写出来）——
+        # 造两个的话这一节会多出两个内容完全一样的「删除该块」版本，用户选哪个都行，
+        # 而那正是"多给一个选项"变成"多给一屏噪声"的开始
         twins.append(replace(
             item,
             item_id=item.item_id + DIRECTIVE_DELETE_SUFFIX,
             operation="delete",
             proposed_text="",
             confirmed=False,
-            operation_reason=(
-                "TASK_DIRECTIVE_REMAINS：这一块含任务书或空指令（命中「"
-                + "」「".join(hit)
-                + "」），带着它出货会被拦下。选这个版本＝把这块原文删掉。")))
+            operation_reason="；".join(reasons)))
     return twins
 
 
@@ -4224,6 +4725,34 @@ def prepare_section_versions(state):
             versions = [SectionVersion(
                 version_id=f"{section}:leave_empty", section=section,
                 item_ids=(), markdown="", source_summary=(), diff="")]
+        elif all(item.source_type == "corpus" for item in section_items):
+            # 「本节留空」（任务卡《材料很水时没有留空出口》，2026.08.04 走查现场）：
+            # 原先 `leave_empty` **只在某节一条材料都没有时**才被造出来，于是
+            # 「有材料」的节永远只有"全收"一个选项——十二节 × 1 个选项 × 12 次确认，
+            # 这一步退化成橡皮图章。
+            # ⚠ **它拆掉的是唯一一道人工判断**：extract 那道
+            # `SOURCE_ACCOUNTING_INCOMPLETE` 硬闸逼着「每个来源都要交代」，而校验器
+            # 只验 evidence 逐字对得上——**逐字对得上的废话也是逐字对得上**。
+            # 「真有东西」和「为了交代硬凑」在自动闸那里长得一模一样，
+            # `choose-sections` 是唯一分得出来的场合（人看一眼就知道哪句是凑数的）。
+            #
+            # ⚠ **只给「全是语料候选」的节**，边界是想清楚的，别顺手放宽：
+            #   · 有**原文块**（`original_persona`）的节不给——丢弃用户原文必须**逐块**
+            #     走「删除该块」那条出口（带 diff、说得出理由），整节一扫而空会把
+            #     「不改写、不丢弃任何非空原文」那条契约的可见性抹掉；
+            #   · 有**协议层默认值**（`protocol`）的节不给——那些是骨架（按需读取指针
+            #     这类），留空会直接把 ship 拦死（`TIMELINE_POINTER_MISSING`），
+            #     给一个按不下去的按钮比不给更糟。
+            # 这两条不是保守，是各自有一条已经存在的机制在管，别用这个按钮盖过去。
+            dropped = sorted({Path(item.source_ref).name for item in section_items})
+            versions = list(versions) + [SectionVersion(
+                version_id=f"{section}:leave_empty", section=section,
+                item_ids=(), markdown="", source_summary=tuple(dropped),
+                diff=("本节留空：这一节不写进人格文件。"
+                      f"会丢掉 {len(section_items)} 条来自语料的候选，"
+                      f"来源：{'、'.join(dropped)}。"
+                      "⚠ 这些来源仍然算「已交代」（你明确弃用过了），"
+                      "不必回去改候选结果；⚠ 语料本身一个字都不会动。"))]
         versions_by_section[section] = [_section_version_dict(version) for version in versions]
     conflict_payload = [{
         "conflict_id": conflict.conflict_id, "kind": conflict.kind,
@@ -4231,7 +4760,7 @@ def prepare_section_versions(state):
         "reason": conflict.reason, "choices": list(conflict.choices),
         "resolved_choice": conflict.resolved_choice,
     } for conflict in conflicts]
-    valid_ids = {section: {version["id"] for version in versions}
+    valid_ids = {section: {version_key(version) for version in versions}
                  for section, versions in versions_by_section.items()}
     old_decisions = state.get("section_decisions", {})
     state["section_decisions"] = {
@@ -4294,7 +4823,10 @@ def section_choice_payload(state):
             "label": fill_pronouns(label, pronouns),
             "status": decisions.get(section, {}).get("status", "pending"),
             "section_versions": [{
-                "id": version["id"],
+                # ⚠ 键名只有 `version_id` 一个（2026.08.05 双键收敛）——
+                # 原先这里出 `id`，而 `persona_compiler` 那侧出 `version_id`，
+                # 同一个东西两个名字，读的地方就跟着分家
+                "version_id": version_key(version),
                 "markdown": version["markdown"],
                 "source_summary": version.get("source_summary", []),
                 "diff": version.get("diff", ""),
@@ -4383,10 +4915,21 @@ def apply_section_decisions(state, decisions):
     return state
 
 
+STALE_VERSION_EXIT = (
+    "（出口：--step choose-sections --json 取该节当前的版本 id，再重新确认一次。"
+    "⚠ 这种情况几乎只有两个来源：init_state.json 被手改过，或者版本表在确认之后"
+    "重建过——**不是「这一节没确认」**，别去重走确认以外的路）")
+
+
 def preview_payload(state):
     """完整预览只能机械拼接已选节版本，不在预览阶段再次改写。"""
     lines = ["# 核心人格", ""]
     unresolved = []
+    # 已确认、但版本号在版本表里找不到的那些：是 unresolved 的子集，单独列出来是为了
+    # 让 CLI 能说对话——同一句「未确认」把一位真实用户指向了改源码。
+    # ⚠ **判定必须走 `version_key`，不许改成按条目里的 `id` 键匹配**：写侧只写
+    # `version_id`，按 `id` 匹配会把**每一个已确认的节**都判成过期（实测 12/12），
+    # 谁都出不了货，而且不报错。
     stale = []
     source_summary = {}
     # 节标题的人称跟正文同源一份（见 persona_pronouns）：原来这里写死 None，
@@ -4400,10 +4943,10 @@ def preview_payload(state):
             continue
         versions = state.get("section_versions", {}).get(section, [])
         selected = next((version for version in versions
-                         if version["id"] == decision.get("version_id")), None)
+                         if version_key(version) == decision.get("version_id")), None)
         if selected is None:
-            # 确认过、但版本 id 找不到：仍然渲染不出来（所以照旧进 unresolved），
-            # 但**成因和出口都跟"没确认"不同**，单独列一份给 CLI 说清楚。
+            # 确认过、但版本号找不到：仍然渲染不出来（所以照旧进 unresolved），
+            # 但**成因和出口都跟「没确认」不同**，单独列一份给 CLI 说清楚。
             unresolved.append(section)
             stale.append(section)
             continue
@@ -4420,50 +4963,11 @@ def preview_payload(state):
         "preview_hash": hashlib.sha256(markdown.encode("utf-8")).hexdigest(),
         "source_summary": source_summary,
         "unresolved": unresolved,
-        # 已确认但版本 id 找不到的那些：是 unresolved 的子集，单独列出来是为了
-        # 让 CLI 能说对话——同一句“未确认”曾经把人指向了改源码（见 stale_section_versions）
+        # 已确认但版本号找不到的那些：unresolved 的子集，单列给 CLI 分行印
         "stale_versions": stale,
         "warnings": warnings,
         "return_targets": [section for section, _label in SECTION_ORDER],
     }
-
-
-STALE_VERSION_EXIT = (
-    "（出口：--step choose-sections --json 取该节当前的版本 id，再重新确认一次。"
-    "⚠ 这种情况几乎只有两个来源：init_state.json 被手改过，或者版本表在确认之后"
-    "重建过——**不是「这一节没确认」**，别去重走确认以外的路）")
-
-
-def stale_section_versions(state):
-    """已确认、但记下的版本 id 在当前版本表里找不到的节。
-
-    ⚠ **这跟"这一节没确认"是两回事，不能共用一句报错**（2026.08.05 外部实测的代价）：
-    那位用户的四节**确认过**，预览却报"未确认节"，于是他判断确认步骤没生效、
-    去翻源码、改了两行匹配逻辑——**报错说的是现象，不是他的处境**，
-    而现象那句恰好把人指向了错的方向。
-    """
-    stale = []
-    for section, _label in SECTION_ORDER:
-        decision = state.get("section_decisions", {}).get(section) or {}
-        if decision.get("status") != "confirmed":
-            continue          # 那是 SECTION_UNCONFIRMED 的事，不是这里
-        versions = state.get("section_versions", {}).get(section, [])
-        if not any(version.get("id") == decision.get("version_id")
-                   for version in versions):
-            stale.append(section)
-    return stale
-
-
-def stale_section_version_issues(state):
-    from persona_compiler import CompileIssue
-
-    stale = stale_section_versions(state)
-    if not stale:
-        return []
-    return [CompileIssue(
-        "SECTION_VERSION_STALE", "blocking",
-        "以下人格节已确认，但它记下的版本 id 在当前版本表里不存在，"
-        "所以渲染时会被整节丢掉：" + "、".join(stale) + STALE_VERSION_EXIT)]
 
 
 def shipping_issues(state, persona_markdown, manifest):
@@ -4492,12 +4996,58 @@ def shipping_issues(state, persona_markdown, manifest):
               "--step choose-sections --section-decisions-json '{\"节名\": \"版本id\"}' "
               "提交；⚠ 不要去手改 init_state.json，出货闸认的是 section_decisions，"
               "手写 section_versions 不产生任何确认）"))
-    issues.extend(stale_section_version_issues(state))
+    # ⚠ **「确认过、但那个版本号在版本表里找不到」必须吵**（2026.08.05，任务卡
+    # 《节版本双键收敛》验收判据那句「不许出现某节静默消失」）。
+    # ⚠ **判定走 `version_key`，不许改成按条目里的 `id` 键匹配**：写侧只写
+    # `version_id`，按 `id` 匹配会把**每一个已确认的节**都判成过期（实测 12/12），
+    # 谁都出不了货，而且不报错。
+    # ⚠ **也不要再加一道「同一版本的两个键必须相等」的闸**：写侧只有一个键，
+    # 那种闸遇到没有 `id` 的条目会直接跳过，一个都检查不到（实测 0/12），
+    # 是**空转的闸且不报错**；它拦的「两键不等」在构造上已经不可能出现。
+    # 不拦这一条的后果是：
+    # `status` 仍是 `confirmed`，所以 `SECTION_UNCONFIRMED` 不报；`preview_payload`
+    # 匹配不到版本就把这一节整节跳过——**用户确认过的一节被静默从出货文件里删掉，
+    # 退出码 0，全程零提示**（复现步骤与实测记录见那张卡）。
+    stale = []
+    for section, _label in SECTION_ORDER:
+        decision = decisions.get(section, {})
+        if decision.get("status") != "confirmed":
+            continue                       # 那一档归上面的 SECTION_UNCONFIRMED
+        chosen = decision.get("version_id")
+        available = [version_key(version)
+                     for version in state.get("section_versions", {}).get(section, [])]
+        if chosen not in available:
+            stale.append(f"{section}（决定指向 {chosen!r}，这一节现有的版本是："
+                         + ("、".join(available) if available else "一个都没有") + "）")
+    if stale:
+        issues.append(CompileIssue(
+            "SECTION_VERSION_STALE", "blocking",
+            "以下人格节确认过，但确认时选的那个版本号现在找不到了——"
+            "多半是重跑 choose-sections 之后版本号变了，或者手改过 init_state.json。"
+            "⚠ 不修的话这一节会**整节从出货文件里消失，而且不报错**。"
+            "出口：重跑 --step choose-sections 看当前版本号，再选一次。"
+            + "；".join(stale)))
     if any(token in persona_markdown for token in TASK_DIRECTIVE_TOKENS):
         issues.append(CompileIssue(
             "TASK_DIRECTIVE_REMAINS", "blocking",
             "人格文件仍含任务书或空指令（出口：--step choose-sections 里那一节有一个"
             "「删除该块」的版本，带 diff，选它即可出货；不必去手改输入文件）"))
+    # 禁用词：**报出来，但不拦**（拍板 ②）。⚠ 报的是**逐行**，不是"文件里有「它」"
+    # ——用户拿到的是一份上千字的人格文件，只说"有"等于让他自己去 Ctrl+F 猜哪一行
+    # 该改；而这条本来就允许保留正当用法，不指到行就没法判。
+    banned_lines = [line.strip() for line in persona_markdown.splitlines()
+                    if any(token in line for token in BANNED_WORD_TOKENS)]
+    if banned_lines:
+        shown = "；".join(line[:40] for line in banned_lines[:5])
+        issues.append(CompileIssue(
+            "BANNED_WORD_REMAINS", "warning",
+            f"人格文件里有 {len(banned_lines)} 行含「"
+            + "」「".join(BANNED_WORD_TOKENS)
+            + f"」——人格文件里的 AI 不写成「它」，多半是旧版工具留下的写法："
+            + shown + ("…" if len(banned_lines) > 5 else "")
+            + "。⚠ 这条不拦出货（你原文里若是正当用法就留着）；"
+              "确实要去掉的话，--step choose-sections 里那一节有一个「删除该块」的"
+              "版本，带 diff，选它即可，不必去手改输入文件。"))
     if "timeline" not in persona_markdown:
         issues.append(CompileIssue(
             "TIMELINE_POINTER_MISSING", "blocking",
@@ -4545,7 +5095,7 @@ def shipping_issues(state, persona_markdown, manifest):
     for section, decision in decisions.items():
         selected_versions[section] = next((version for version in
             state.get("section_versions", {}).get(section, [])
-            if version["id"] == decision.get("version_id")), None)
+            if version_key(version) == decision.get("version_id")), None)
     for conflict in state.get("conflicts", []):
         if conflict.get("severity") != "blocking":
             continue
@@ -4888,7 +5438,10 @@ def _step_choose_sections_v2(args, state):
         for question in payload["sections"]:
             print(f"\n## {question['label']} [{question['status']}]")
             for version in question["section_versions"]:
-                print(f"- {version['id']}\n{version['markdown']}")
+                # markdown 空的那种版本（本节留空）在屏幕上只剩一个 id ＋ 一行空白，
+                # **说明写在 diff 里，不打出来等于没给**——同「v2 的 warning 只塞进
+                # state」那条一个形状（2026.08.05 两处都撞到）
+                print(f"- {version['version_id']}\n{version['markdown'] or version['diff']}")
 
 
 def _step_preview_v2(args, state):
@@ -4908,11 +5461,11 @@ def _step_preview_v2(args, state):
     else:
         print(payload["persona_markdown"])
         # ⚠ 这两行分开印：把 stale 的节混进「未确认节」，说的就是**现象而不是处境**，
-        # 而那句话曾经把一位用户指向了「确认步骤没生效」→ 翻源码 → 改匹配逻辑。
+        # 而那句话把一位真实用户指向了「确认步骤没生效」→ 翻源码 → 改匹配逻辑。
         stale = payload.get("stale_versions") or []
-        if [section for section in payload["unresolved"] if section not in stale]:
-            print("未确认节：" + "、".join(
-                section for section in payload["unresolved"] if section not in stale))
+        not_confirmed = [section for section in payload["unresolved"] if section not in stale]
+        if not_confirmed:
+            print("未确认节：" + "、".join(not_confirmed))
         if stale:
             print("以下节**已确认**，但它记的版本 id 在当前版本表里找不到，"
                   "所以渲染时被整节丢掉了：" + "、".join(stale) + STALE_VERSION_EXIT)
@@ -4934,6 +5487,15 @@ def _step_ship_v2(args, state):
     if blocking:
         raise SystemExit("不出货：" + "；".join(
             f"{issue.code}：{issue.message}" for issue in blocking))
+    # ⚠ **warning 必须打到屏幕上**（2026.08.05，做「零它」那条 warning 时发现的）：
+    # 在此之前 v2 出货路径的 warning **只被塞进 `state["shipping"]["warnings"]`**，
+    # preview 也不打——于是"给一条 warning"这种修法在这条路上等于什么都没做，
+    # **报了但没人看见跟没报是一回事**。这一行治的是那个，不只服务「零它」那一条。
+    warnings = [issue for issue in issues if issue.severity == "warning"]
+    for issue in warnings:
+        print(f"⚠ {issue.code}：{issue.message}")
+    if warnings:
+        print()
     persona = build_persona_from_items(
         [item_from_dict(item) for item in state.get("compiler_items", [])],
         pronouns=persona_pronouns(state))
@@ -4967,10 +5529,17 @@ def _step_ship_v2(args, state):
 
 
 def _step_questionnaire(args):
-    detected = _detect_pronouns_from_corpus(args.corpus)
+    # 人称有两个来源，**用户自己写下的那个优先**：v2 那条路上他的人格文件里
+    # 就有一行 `## 她是谁`（`persona_pronouns` 读的就是它，比任何统计都准）；
+    # 没有那份文件才退回语料统计。⚠ 两个都没有就是 `{}`，渲染层走中性写法——
+    # **不猜、不塞默认的他／她**（同 `pronouns_from_answers`）。
+    detected = persona_pronouns(load_state(args.out) or {}) or {}
+    detected = {k: v for k, v in detected.items() if v}
+    if not detected:
+        detected = _detect_pronouns_from_corpus(args.corpus)
     persona = Persona("partner")
     fill_protocol_defaults(persona, detected)
-    report = coverage_report(persona)
+    report = coverage_report(persona, pronouns=detected)
     if args.json:
         qs = questions_for(report, has_corpus=bool(args.corpus), pronouns=detected)
         save_state(args.out, {"step": "questionnaire", "client": _client_of(args),
@@ -5186,6 +5755,9 @@ def _step_ship(args, state):
             "--route <key>。三条里有一条会把 TA 的私人记忆发到第三方，"
             "这件事不给静默默认。")
     state["route"] = route
+    # 时区记进 state：跟 route 同待遇，给过一次就不用每次重跑 ship 都再给一遍
+    if args.timezone:
+        state["timezone"] = args.timezone
     persona, _ = _rebuild(state)
     entries = None
     if args.import_path:
@@ -5203,7 +5775,8 @@ def _step_ship(args, state):
         paths = write_bundle(args.out, persona, client=client,
                              corpus_dir=args.corpus, confirmed=True, entries=entries,
                              previous_persona=state.get("last_shipped_persona"),
-                             route=route, corpus_overwrite=_corpus_overwrite_mode(args))
+                             route=route, corpus_overwrite=_corpus_overwrite_mode(args),
+                             timezone=args.timezone or state.get("timezone"))
     except (PermissionError, ValueError, FileNotFoundError) as e:
         raise SystemExit(f"不出货：{e}")
     print("【四件套】")
@@ -5385,6 +5958,14 @@ if __name__ == "__main__":
     ap.add_argument("--accept-corpus-overwrite", dest="accept_corpus_overwrite",
                     action="store_true",
                     help="ship 步：确认「我知道会覆盖已有窗口，就这么办」，不备份直接写")
+    ap.add_argument("--timezone", metavar="IANA名",
+                    help="记忆所有者的时区（例如 Europe/Berlin），写进出货的 "
+                         "mcp-config.json。⚠ 不给就落默认值 Asia/Shanghai（东八区）"
+                         "并在配置说明里写明它是默认值——**探测到的宿主时区任何时候都"
+                         "不会顶替它**：探的是跑初始化这台机器，不是 TA 的（云服务器上"
+                         "探出来正好是 UTC，填进去等于给那个缺陷发合格证）。"
+                         "不给的后果：TA 不在东八区的话日期会静默错一天，"
+                         "--doctor 那一格会报 ⚠")
     ap.add_argument("--import", dest="import_path",
                     help="ship 步：语料导出文件（ChatGPT/Claude json、聊天 txt、timeline md），"
                          "由 memory_import 认格式并落成记忆库")

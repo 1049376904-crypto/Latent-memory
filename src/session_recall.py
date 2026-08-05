@@ -42,6 +42,7 @@ from datetime import datetime
 # 同目录模块，import 不触发各自的 CLI
 from memory_retrieval import MemoryIndex  # noqa: F401
 from degradation_protocol import SessionStatus, degradation_signals  # noqa: F401
+from time_context import TimeContext  # noqa: F401
 from session_thread import ThreadStore, format_thread_block  # noqa: F401
 
 # 压缩近似触发的默认阈值（字符）：取得明显低于常见 context 窗口的量级，宁可早触发。
@@ -74,10 +75,16 @@ def _clip(text, limit):
     return text[:limit].rstrip() + TRUNCATION_NOTE
 
 
-def _time_label(meta):
+def _time_label(meta, time_context=None):
     """召回片段的时间标注——防时间感塌陷的第一道措施：注入的记忆必须带着"这是什么
     时候的事"，否则新窗口容易把旧片段读成正在发生。**没有真实日期依据的一律标
     「时间未知」**：缺时间戳的，以及只能退到 mtime 的。
+
+    **`local_date` 优先于 epoch**（2026.08.04 跨时区事故，任务卡"写回时区与跨日
+    归窗"）：`local_date` 是记忆所有者时区里的那个日历日，已经是结论；而把 epoch
+    在这里格式化一次，格出来的是**读它的这个进程所在时区**的日期——UTC 的服务器上
+    东八区凌晨那条就少一天。没有 `local_date` 的旧 meta 才退回按 epoch 格式化，
+    这时用配置的 TimeContext，不用宿主本地时区。
 
     **mtime 档从"≈某日"改成「时间未知」（2026.08.03，跨模型实测逼出来的）**：
     原先 mtime 兜底会打 `≈2026.08.03` 这种标签，看着"只是不太精确"，实际是
@@ -94,10 +101,13 @@ def _time_label(meta):
     ts = meta.get("timestamp")
     if ts is None or meta.get("timestamp_source") == "mtime":
         return "时间未知"
-    return datetime.fromtimestamp(ts).strftime("%Y.%m.%d")
+    day = meta.get("local_date")
+    if day:
+        return day.replace("-", ".")
+    return (time_context or TimeContext.default()).label(ts)
 
 
-def format_recall_block(results, max_item_chars=DEFAULT_MAX_ITEM_CHARS):
+def format_recall_block(results, max_item_chars=DEFAULT_MAX_ITEM_CHARS, time_context=None):
     """recall_recent 结果 → 可直接注入 context 的文本块，每条带发生日期。
     单条超 max_item_chars 就截断并标注（传 None 关闭截断）。
     空结果返回 None——没东西可召回就什么都不注入，不留空壳标题。"""
@@ -115,7 +125,7 @@ def format_recall_block(results, max_item_chars=DEFAULT_MAX_ITEM_CHARS):
              "更早的读作历史；标「时间未知」的片段只当历史背景，不当作当下状态："]
     for r in results:
         head = r["meta"].get("heading") or r["meta"].get("source", "")
-        tag = "·".join(x for x in (_time_label(r["meta"]), head) if x)
+        tag = "·".join(x for x in (_time_label(r["meta"], time_context), head) if x)
         lines.append(f"- [{tag}] {_clip(r['text'], max_item_chars)}")
     return "\n".join(lines)
 
@@ -130,7 +140,7 @@ class SessionRecall:
 
     def __init__(self, index, topN=DEFAULT_TOPN, half_life=None,
                  compact_threshold_chars=DEFAULT_COMPACT_THRESHOLD_CHARS,
-                 thread_store=None):
+                 thread_store=None, time_context=None):
         self.index = index
         self.topN = topN
         self.half_life = half_life  # None → recall_recent 用自己的默认半衰期
@@ -138,11 +148,15 @@ class SessionRecall:
         # 可选的会话线索存储（session_thread.ThreadStore）。给了就在换窗时先注入
         # "上次聊到哪"，没给就只有召回块——不断线（规格 §5 两层）
         self.thread_store = thread_store
+        # 记忆所有者的时区（任务卡"写回时区与跨日归窗"）：只在 meta 没有 local_date
+        # 的旧块上用得到——新块的日期在写入时就定死了，读的时候不再换算一次
+        self.time_context = time_context
         self._chars_since_recall = 0
 
     def _recall(self, now=None):
         block = format_recall_block(
-            self.index.recall_recent(topN=self.topN, half_life=self.half_life, now=now))
+            self.index.recall_recent(topN=self.topN, half_life=self.half_life, now=now),
+            time_context=self.time_context)
         if block is None:
             return None
         return block + "\n" + SELF_CHECK_FOOTER  # 每次注入都带自查指令，换窗和压缩触发同待遇
@@ -171,7 +185,9 @@ class SessionRecall:
                         "，本窗口可能在退化：先不接入召回记忆，请对方核实后再继续。")
         blocks = []
         if self.thread_store is not None:
-            thread_block = format_thread_block(self.thread_store.latest(), now=now)
+            # 时区跟召回块传同一个：两块贴在一起注入，日期口径不许分家
+            thread_block = format_thread_block(self.thread_store.latest(), now=now,
+                                               time_context=self.time_context)
             if thread_block:
                 blocks.append(thread_block)
         recall_block = self._recall(now=now)
@@ -316,7 +332,31 @@ def _selftest():
     assert TRUNCATION_NOTE not in format_recall_block(
         long_idx.recall_recent(topN=2, now=now), max_item_chars=None)
 
-    print("selftest ok（16项断言：触发时机 / 时间标注防塌陷 / 自查关卡 / threads 两层注入 / 单条截断）")
+    # 17.【跨时区标注·变异靶心】（2026.08.04 手机 Connector 真机事故，任务卡
+    #    「写回时区与跨日归窗」）：标签上的日期是**记忆所有者时区里的那一天**，
+    #    不是读它的这个进程所在时区的那一天。事故现场 UTC 的 VPS 上，东八区凌晨
+    #    02:05 写下的记忆被标成 `[2026.08.03]`，而仲裁句要求"以日期最近的一条为
+    #    当下状态"——日期错一天，模型对"现在是什么状态"的判断就跟着错。
+    #    变异：把 `_time_label` 里的 local_date 那一支删掉 → 下面这批红。
+    from datetime import timezone as _tz
+    from time_context import tzdb_available
+    east8 = "Asia/Shanghai" if tzdb_available() else "UTC+08:00"   # 采集条件见 time_context
+    epoch18 = datetime(2026, 8, 3, 18, 5, 0, tzinfo=_tz.utc).timestamp()
+    #    a) 有 local_date 就用它，一个字都不换算——它已经是结论
+    assert _time_label({"timestamp": epoch18, "local_date": "2026-08-04",
+                        "timestamp_source": "append"}) == "2026.08.04", \
+        "写回时定死的自然日必须原样标出来，不许在读的时候按宿主时区重算一遍"
+    #    b) 旧 meta（没有 local_date）才退回按 epoch 格式化，且要用配置的时区
+    old_meta = {"timestamp": epoch18, "timestamp_source": "append"}
+    assert _time_label(old_meta, TimeContext(east8)) == "2026.08.04"
+    assert _time_label(old_meta, TimeContext("UTC")) == "2026.08.03", \
+        "同一个 epoch 在不同时区就是不同的日历日——这个数是配置的函数，不是常量"
+    #    c) mtime 那档不许被 local_date 救活：没有日期依据就是没有（第 9 项那条结论）
+    assert _time_label({"timestamp": epoch18, "local_date": "2026-08-04",
+                        "timestamp_source": "mtime"}) == "时间未知"
+
+    print("selftest ok（17项断言：触发时机 / 时间标注防塌陷 / 跨时区标注 / 自查关卡 / "
+          "threads 两层注入 / 单条截断）")
 
 
 if __name__ == "__main__":

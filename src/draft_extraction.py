@@ -34,22 +34,172 @@ from persona_compiler import CompileIssue, PersonaItem, SECTION_KEYS
 # 标准来自设计笔记任务5："能看出个性——吐槽/拒绝/不顺从/接得住玩笑，不是平铺直叙的问答"
 _PERSONALITY_MARKERS = ("不", "别", "才", "凭什么", "谁说", "才不", "哼", "！", "？")
 
-EXTRACTION_PROMPT = """# 人格候选提取任务
+# ---------- 候选类型契约：**唯一真相，别在任何地方抄第二份** ----------
+#
+# 2026.08.04 走查现场撞出来的病根（任务卡《候选任务包与校验器契约不一致》）：
+# `candidate_kind` 的三个字面值、以及它们各自的必填子字段，**只活在校验器代码里**
+# ——提示词、输入清单、schema 三份文件里一个字都没写。于是模型给 `kind` 填了别的值，
+# 三道结构检查**一条都没被触发，文件照样过闸**；而"闸门没触发"这件事在输出上
+# 与"闸门通过了"**完全一样**，不可见。
+#
+# ⚠ **这一步的设计前提是"任务包自足"**：零密钥、不联网，把提取外包给用户手上的模型，
+# 三份文件交出去就得够。契约写在源码里，等于要求用户的聊天模型去读 `draft_extraction.py`
+# ——那个前提就塌了。所以：**契约在这张表里定义一次，issue_codes、schema、提示词
+# 全部从它渲染**。新增一个 kind 却忘了写进任务包这件事，从此在结构上不可能发生。
+#
+# `required` 里的字段名就是校验器真正会去读的那几个（`issue_codes` 从这里取），
+# `code` 是缺了它们时报的错误码。fact／quote 没有额外结构要求，但**必须列在这里**
+# ——枚举是"哪些 kind 会被结构检查"的全集，漏一个就等于让它悄悄绕过。
+CANDIDATE_KINDS = {
+    "fact": {
+        "label": "事实",
+        "required": (),
+        "code": None,
+        "rule": "一条可核对的事实（住在哪、在做什么、什么时候开始的）。没有额外必填字段。",
+    },
+    "quote": {
+        "label": "原话",
+        "required": (),
+        "code": None,
+        "rule": "`text` 必须逐字落在 `source_span` 圈出的那段里，否则报 QUOTE_NOT_VERBATIM。",
+    },
+    "milestone": {
+        "label": "里程碑",
+        "required": ("event", "reading", "current_state"),
+        "code": "MILESTONE_INCOMPLETE",
+        "rule": "三段都要给，缺一段就整条不过：`event`（发生了什么）／`reading`"
+                "（这件事怎么读）／`current_state`（现在是什么状态）。",
+    },
+    "naming": {
+        "label": "称呼",
+        "required": ("user_to_ai", "ai_to_user"),
+        "code": "NAMING_NOT_BIDIRECTIONAL",
+        "rule": "双向都要给：`user_to_ai`（用户怎么叫 AI）／`ai_to_user`（AI 怎么叫用户），"
+                "两个都是字符串数组，缺一边就整条不过。",
+    },
+    "style_dialogue": {
+        "label": "风格片段",
+        "required": ("turns",),
+        "code": "STYLE_NOT_DIALOGUE",
+        "rule": "`turns` 是对话轮次数组，每轮 `{\"speaker\": \"谁\", \"text\": \"说了什么\"}`；"
+                "**至少 2 轮、至少 2 个不同且非空的 speaker**（学的是来回接话的风格，"
+                "不是抄一句台词）。每轮 `text` 也必须逐字落在 `source_span` 里。",
+    },
+}
+
+# 来源交代表的键名。⚠ **写错键名不会被猜对**：校验器认的就是这几个字面值，
+# 填 `item_ids` 之类会被指名报错（`SOURCE_ACCOUNTING_FIELD_MISSING`），不做同义兼容
+# ——猜是另一种静默，而且下一个模型换个写法又猜不中。
+ACCOUNTING_IDS_KEY = "candidate_item_ids"
+ACCOUNTING_NONE_KEY = "no_supported_candidate"
+
+
+def _kind_table_md():
+    """契约表 → 提示词里那张 Markdown 表。渲染的是同一份 CANDIDATE_KINDS。"""
+    lines = ["| `candidate_kind` | 是什么 | 除通用字段外还必须给 | 缺了报什么 |",
+             "|---|---|---|---|"]
+    for kind, spec in CANDIDATE_KINDS.items():
+        extra = "、".join(f"`{f}`" for f in spec["required"]) or "（无）"
+        lines.append(f"| `{kind}` | {spec['label']} | {extra} | "
+                     f"{spec['code'] or '—'} |")
+    return "\n".join(lines)
+
+
+def _kind_rules_md():
+    return "\n".join(f"- **`{kind}`（{spec['label']}）**：{spec['rule']}"
+                     for kind, spec in CANDIDATE_KINDS.items())
+
+
+def extraction_prompt():
+    """交给用户模型的提示词。**从 CANDIDATE_KINDS 渲染，不手抄一份。**"""
+    return f"""# 人格候选提取任务
 
 候选只许从输入来源提取，不许创作。
 找不到就返回空数组，不得用通用句补完整度。
-风格必须给完整多轮对话；学风格，不抄台词。
-里程碑必须同时给发生了什么、怎么读、当前状态。
 
 逐个读取《人格候选输入清单.json》里的语料。每个候选必须填写真实 `source_ref`、
-字符区间 `source_span` 和逐字 `evidence`。每个输入来源都要在 `source_accounting` 中
-登记候选 ID，或明确写 `no_supported_candidate: true`。只返回符合 schema 的 JSON。
+字符区间 `source_span` 和逐字 `evidence`。只返回符合
+《人格候选结果.schema.json》的 JSON，不要输出任何解释文字。
 
-⚠ `evidence` 必须是**原始字符**，不许做任何加工：不要 HTML 转义（`>` 就写 `>`，
-不要写成 `&gt;`；`<`、`&` 同理），不要把直引号改成弯引号，不要改空白与换行。
+## 一、每条候选的通用必填字段
+
+`item_id`（本次结果内唯一）／`text`／`section`（取值见 schema 的 enum）／
+`source_ref`／`source_span`（两个整数，原文的字符区间）／`candidate_kind`／`evidence`。
+
+## 二、`candidate_kind` 只能取下面这几个值
+
+⚠ **填枚举以外的值（包括中文自由值）不会被拦下来，但那条候选的结构检查一条都不会跑**
+——校验器会给一条 `CANDIDATE_KIND_UNCHECKED` 警告说明"这条没被检查过"。
+**不要靠它兜底：请按下表选一个准确的值。**
+
+{_kind_table_md()}
+
+{_kind_rules_md()}
+
+## 三、来源交代表 `source_accounting`
+
+**每一个输入来源都要在这里出现一条**，字段名逐字照抄，不许改写：
+
+```json
+{{"source_accounting": [
+  {{"source_ref": "<清单里的那个路径，逐字照抄>",
+   "{ACCOUNTING_IDS_KEY}": ["<这个来源支撑的候选 item_id>"]}},
+  {{"source_ref": "<另一个来源>", "{ACCOUNTING_NONE_KEY}": true}}
+]}}
+```
+
+- `{ACCOUNTING_IDS_KEY}` 里的每一个 ID **必须真的对应 `items` 里的一条候选**。
+  候选删掉了就把它从这里一起删掉——挂着一个不存在的 ID 会被报
+  `SOURCE_ACCOUNTING_ID_UNKNOWN`。
+- 这个来源确实提不出候选，就写 `"{ACCOUNTING_NONE_KEY}": true`，**不要留空、不要跳过**。
+- ⚠ **键名写错不会被自动纠正**：填成 `item_ids`、`ids` 这类会被报
+  `SOURCE_ACCOUNTING_FIELD_MISSING` 并点名说是键名问题。
+- ⚠ **「已交代」≠「会进人格文件」**：这里登记的是"这个来源你看过了、给出了结论"。
+  候选最终用不用，由用户在后面那一步（十二节选择题）定——**他可以整节弃用**，
+  那时这些来源**仍然算已交代**，不必回头改这份 JSON。
+  所以：**该给的候选照给，不要为了"让每个来源都有东西"硬凑**；
+  确实提不出来就写 `{ACCOUNTING_NONE_KEY}: true`，那也是一个正当结论。
+
+## 四、`evidence` 必须是**原始字符**
+
+不许做任何加工：不要 HTML 转义（`>` 就写 `>`，不要写成 `&gt;`；`<`、`&` 同理），
+不要把直引号改成弯引号，不要改空白与换行。
 校验器是**逐字**比对原文的，改一个字符就整条不过——而报出来的错是
 「evidence 不是原文逐字」，看不出是转义干的。
+
+## 五、一份最小的完整示例（照着这个形状填）
+
+```json
+{{
+  "items": [
+    {{"item_id": "corpus:1", "text": "住在杭州，在做古地图修复。",
+     "section": "user", "source_ref": "<清单里的路径>",
+     "source_span": [0, 18], "candidate_kind": "fact",
+     "evidence": "<span 圈出的那段原文，逐字>"}},
+    {{"item_id": "corpus:2", "text": "第一次独立修完一张海图。",
+     "section": "milestones", "source_ref": "<清单里的路径>",
+     "source_span": [20, 60], "candidate_kind": "milestone",
+     "evidence": "<逐字原文>",
+     "event": "独立修完第一张海图", "reading": "从学徒变成能独立交付",
+     "current_state": "已经完成，现在接第二张"}},
+    {{"item_id": "corpus:3", "text": "互相拌嘴但接得住。",
+     "section": "style", "source_ref": "<清单里的路径>",
+     "source_span": [60, 120], "candidate_kind": "style_dialogue",
+     "evidence": "<逐字原文>",
+     "turns": [{{"speaker": "用户", "text": "<逐字原文里的这一轮>"}},
+               {{"speaker": "AI", "text": "<逐字原文里的下一轮>"}}]}}
+  ],
+  "source_accounting": [
+    {{"source_ref": "<清单里的路径>",
+     "{ACCOUNTING_IDS_KEY}": ["corpus:1", "corpus:2", "corpus:3"]}}
+  ]
+}}
+```
 """
+
+
+# 模块级常量保留：外部若引用过它，渲染结果与 extraction_prompt() 同一份，不是第二份抄写
+EXTRACTION_PROMPT = extraction_prompt()
 
 
 @dataclass(frozen=True)
@@ -59,7 +209,48 @@ class ExtractionPackage:
     schema_path: Path
 
 
+_SUBFIELD_SCHEMA = {
+    "event": {"type": "string", "minLength": 1},
+    "reading": {"type": "string", "minLength": 1},
+    "current_state": {"type": "string", "minLength": 1},
+    "user_to_ai": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+    "ai_to_user": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+    "turns": {
+        "type": "array", "minItems": 2,
+        "items": {"type": "object", "required": ["speaker", "text"],
+                  "properties": {"speaker": {"type": "string", "minLength": 1},
+                                 "text": {"type": "string", "minLength": 1}}},
+    },
+}
+
+
 def _candidate_schema():
+    """结果 schema。**enum 与按 kind 的条件必填全部从 CANDIDATE_KINDS 渲染**——
+    这是"任务包自足"那条前提落到 schema 上的样子：模型不读源码也能知道
+    `style_dialogue` 要带 `turns`、`milestone` 要带三段。
+
+    ⚠ 原先这里 `candidate_kind` 只写 `{"type": "string"}`、`source_accounting` 只写
+    `{"type": "array"}`——**校验器最重的三道结构检查在 schema 里一个字都没有**，
+    模型当然填不对（2026.08.04 走查现场）。"""
+    item_props = {
+        "item_id": {"type": "string"},
+        "text": {"type": "string"},
+        "section": {"enum": list(SECTION_KEYS)},
+        "source_ref": {"type": "string"},
+        "source_span": {
+            "type": "array", "prefixItems": [
+                {"type": "integer"}, {"type": "integer"}],
+            "minItems": 2, "maxItems": 2},
+        "candidate_kind": {"enum": list(CANDIDATE_KINDS)},
+        "evidence": {"type": "string"},
+    }
+    item_props.update({name: dict(schema) for name, schema in _SUBFIELD_SCHEMA.items()})
+    # 按 kind 的条件必填：if/then，不是把子字段一律设成 required（那会逼 fact 也填 turns）
+    conditionals = [{
+        "if": {"required": ["candidate_kind"],
+               "properties": {"candidate_kind": {"const": kind}}},
+        "then": {"required": list(spec["required"])},
+    } for kind, spec in CANDIDATE_KINDS.items() if spec["required"]]
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -71,21 +262,25 @@ def _candidate_schema():
                     "type": "object",
                     "required": ["item_id", "text", "section", "source_ref",
                                  "source_span", "candidate_kind", "evidence"],
-                    "properties": {
-                        "item_id": {"type": "string"},
-                        "text": {"type": "string"},
-                        "section": {"enum": list(SECTION_KEYS)},
-                        "source_ref": {"type": "string"},
-                        "source_span": {
-                            "type": "array", "prefixItems": [
-                                {"type": "integer"}, {"type": "integer"}],
-                            "minItems": 2, "maxItems": 2},
-                        "candidate_kind": {"type": "string"},
-                        "evidence": {"type": "string"},
-                    },
+                    "properties": item_props,
+                    "allOf": conditionals,
                 },
             },
-            "source_accounting": {"type": "array"},
+            "source_accounting": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["source_ref"],
+                    "properties": {
+                        "source_ref": {"type": "string"},
+                        ACCOUNTING_IDS_KEY: {"type": "array", "items": {"type": "string"}},
+                        ACCOUNTING_NONE_KEY: {"const": True},
+                    },
+                    # 两者必居其一：登记 ID，或者明写这个来源提不出候选
+                    "anyOf": [{"required": [ACCOUNTING_IDS_KEY]},
+                              {"required": [ACCOUNTING_NONE_KEY]}],
+                },
+            },
         },
         "additionalProperties": False,
     }
@@ -98,7 +293,7 @@ def build_extraction_package(manifest, out_dir):
     prompt_path = out / "人格候选提取提示.md"
     manifest_path = out / "人格候选输入清单.json"
     schema_path = out / "人格候选结果.schema.json"
-    prompt_path.write_text(EXTRACTION_PROMPT, encoding="utf-8")
+    prompt_path.write_text(extraction_prompt(), encoding="utf-8")
     sources = [{
         "source_ref": str(path),
         "sha256": manifest.source_hashes.get(str(path), ""),
@@ -111,22 +306,36 @@ def build_extraction_package(manifest, out_dir):
     return ExtractionPackage(prompt_path, manifest_path, schema_path)
 
 
+def _nonempty(value):
+    """必填子字段"给了没有"的统一判据：空串、空白串、空数组都算没给。"""
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, dict)):
+        return bool(value)
+    return value is not None and value is not False
+
+
 def issue_codes(candidate):
-    """返回单条候选的结构错误码；不依赖模型或外部 schema 库。"""
+    """返回单条候选的结构错误码；不依赖模型或外部 schema 库。
+
+    ⚠ **必填字段名与错误码都取自 CANDIDATE_KINDS**，不在这里另写一份——那张表同时
+    是任务包里那张表的来源，两边只有一份真相（2026.08.04 走查现场那条卡的病根就是
+    "契约只活在这个函数里"）。
+    ⚠ **未知 kind 在这里返回空集，不代表它没问题**：那条路由到
+    `CANDIDATE_KIND_UNCHECKED` 警告——判的是"有没有说这条没被检查"，不是拦不拦。"""
     kind = candidate.get("candidate_kind")
+    spec = CANDIDATE_KINDS.get(kind)
+    if spec is None:
+        return set()
     issues = set()
-    if kind == "milestone" and not all(
-            str(candidate.get(key, "")).strip()
-            for key in ("event", "reading", "current_state")):
-        issues.add("MILESTONE_INCOMPLETE")
-    if kind == "naming" and not (
-            candidate.get("user_to_ai") and candidate.get("ai_to_user")):
-        issues.add("NAMING_NOT_BIDIRECTIONAL")
-    if kind == "style_dialogue":
+    if any(not _nonempty(candidate.get(name)) for name in spec["required"]):
+        issues.add(spec["code"])
+    if kind == "style_dialogue" and not issues:
+        # 结构要求比"给了 turns"更严：学的是来回接话，不是抄一句台词
         turns = candidate.get("turns") or []
         speakers = {str(turn.get("speaker", "")).strip() for turn in turns}
         if len(turns) < 2 or "" in speakers or len(speakers) < 2:
-            issues.add("STYLE_NOT_DIALOGUE")
+            issues.add(spec["code"])
     return issues
 
 
@@ -150,6 +359,18 @@ def validate_candidate_result(result, manifest):
             issues.append(_issue("CANDIDATE_ID_INVALID", "候选 ID 缺失或重复", item_id or None))
             continue
         seen_ids.add(item_id)
+        # ⚠ **让"这条没被结构检查"这件事可见**（2026.08.05，缺陷 B 的真正修法）：
+        # kind 填了枚举外的值时，三道结构检查一条都不会跑，而输出与"检查通过"
+        # 长得一模一样——不可见的失效正是这张卡的病。
+        # **只出 warning 不 blocking**（维护者拍板）：要挡的不是"填错"，是"填错了
+        # 也没人说"；blocking 会把将来合法的新 kind 一并堵死。
+        if raw.get("candidate_kind") not in CANDIDATE_KINDS:
+            issues.append(_issue(
+                "CANDIDATE_KIND_UNCHECKED",
+                f"candidate_kind={raw.get('candidate_kind')!r} 不在已知类型里"
+                f"（{'、'.join(CANDIDATE_KINDS)}）——**这条候选没有被任何结构检查**，"
+                "它是否符合那类候选的硬要求，本次一个字都没验过。",
+                item_id, severity="warning"))
         structural = issue_codes(raw)
         if structural:
             issues.extend(_issue(code, f"候选结构不完整：{code}", item_id)
@@ -198,23 +419,65 @@ def validate_candidate_result(result, manifest):
             group_id=str(raw.get("group_id", f"corpus:{item_id}"))))
 
     accounting = result.get("source_accounting")
-    accounted = set()
+    accounted, malformed = set(), set()
+    if accounting is not None and not isinstance(accounting, list):
+        issues.append(_issue("SOURCE_ACCOUNTING_INVALID",
+                             "source_accounting 必须是数组（每个输入来源一条记录）"))
     if isinstance(accounting, list):
-        for record in accounting:
+        for pos, record in enumerate(accounting, 1):
+            if not isinstance(record, dict):
+                issues.append(_issue("SOURCE_ACCOUNTING_FIELD_MISSING",
+                                     f"source_accounting 第 {pos} 条不是对象"))
+                continue
             ref = str(record.get("source_ref", ""))
             if ref not in known_sources:
                 issues.append(_issue("SOURCE_UNKNOWN", f"来源交代表含未知来源：{ref}"))
                 continue
-            candidate_ids = record.get("candidate_item_ids") or []
-            no_candidate = record.get("no_supported_candidate") is True
+            candidate_ids = record.get(ACCOUNTING_IDS_KEY) or []
+            no_candidate = record.get(ACCOUNTING_NONE_KEY) is True
             if not candidate_ids and not no_candidate:
+                # ⚠ **指名报错，不再静默 `continue`**（2026.08.05，缺陷 A 的修法）：
+                # 原先这里一声不吭跳过，最后只报一句"以下输入来源没有候选或无候选
+                # 说明"——**把人指向了错误的方向**（真因是键名对不上，走查现场是靠
+                # 读源码才定位到的）。所以这条要说清是**字段**的问题，并**把这条记录
+                # 里实际有的键回显出来**，让人一眼看出自己写的是什么。
+                # ⚠ **明确不做"猜键名"**（见到 `item_ids` 就当成 `candidate_item_ids`）
+                # ——猜是另一种静默，且下一个模型换个写法又猜不中。
+                other = "、".join(f"`{k}`" for k in record if k != "source_ref") or "（没有别的键）"
+                issues.append(_issue(
+                    "SOURCE_ACCOUNTING_FIELD_MISSING",
+                    f"source_accounting 第 {pos} 条（{ref}）既没有 `{ACCOUNTING_IDS_KEY}` "
+                    f"也没有 `{ACCOUNTING_NONE_KEY}: true`；这条记录里实际有的键是："
+                    f"{other}。⚠ 键名要逐字写成 `{ACCOUNTING_IDS_KEY}`，"
+                    "我们不猜别的写法。"))
+                malformed.add(ref)
                 continue
+            # ⚠ 悬空 ID（2026.08.05，缺陷 C）：候选被删掉后交代表还挂着它的 ID，
+            # 而原先这两条循环互不校验——`items` 里一条都没有也照样算"已交代"。
+            # ⚠ **不许把它当成"这个来源没交代"**：那会把"模型笔误"和"模型根本没干活"
+            # 混成同一个错，报错又指错方向，等于让缺陷 A 的病在修 C 的时候复发。
+            dangling = [str(i) for i in candidate_ids if str(i) not in seen_ids]
+            if dangling:
+                issues.append(_issue(
+                    "SOURCE_ACCOUNTING_ID_UNKNOWN",
+                    f"{ref} 的交代里这些候选 ID 在 items 里根本不存在："
+                    + "、".join(dangling)
+                    + "。多半是那条候选后来被删了、或者 ID 写错了——"
+                      "**这不是「没交代」**，是交代指向了一条不存在的候选。"))
             accounted.add(ref)
     missing = sorted(set(known_sources) - accounted)
     if missing:
-        issues.append(_issue(
-            "SOURCE_ACCOUNTING_INCOMPLETE",
-            "以下输入来源没有候选或无候选说明：" + "；".join(missing)))
+        plain = [ref for ref in missing if ref not in malformed]
+        bad = [ref for ref in missing if ref in malformed]
+        parts = []
+        if plain:
+            parts.append("以下输入来源没有候选或无候选说明：" + "；".join(plain))
+        if bad:
+            # 这几条**登记过**，只是那条记录的字段不合格——别把它们混进上面那句话里，
+            # 那正是走查现场把人指错方向的那句
+            parts.append(f"另有 {len(bad)} 条来源登记过，但那条记录的字段不合格"
+                         f"（见上面的 SOURCE_ACCOUNTING_FIELD_MISSING）：" + "；".join(bad))
+        issues.append(_issue("SOURCE_ACCOUNTING_INCOMPLETE", "；".join(parts)))
     if known_sources and not raw_items and not missing:
         issues.append(_issue(
             "NO_SPECIFIC_CANDIDATES", "所有来源均已交代，但没有可支持的具体候选",
@@ -403,7 +666,160 @@ def _selftest():
         assert "候选只许从输入来源提取，不许创作" in prompt
         assert "找不到就返回空数组" in prompt
 
-    print("selftest ok（8组断言：旧候选兼容 + 来源回指 + 结构契约 + 零依赖任务包）")
+        # 9.【任务包自足·靶心一的机械代理】（任务卡《候选任务包与校验器契约不一致》）
+        #    走查现场那条卡的病根：`candidate_kind` 的三个字面值、它们各自的必填
+        #    子字段、以及交代表的两个键名，**只活在校验器代码里，任务包三份文件
+        #    一个字都没写**——而这一步的设计前提是"任务包自足、外包给用户手上的
+        #    模型"。这组断言把"契约必须出现在交出去的文件里"钉死：**从
+        #    CANDIDATE_KINDS 遍历，不是手抄一份名字清单**，所以将来新增一个 kind
+        #    却忘了写进任务包，这里当场红。
+        #    ⚠ **它只是靶心一的机械代理，不是靶心一本身**：真正的判据是"一个只读
+        #    这三份文件、不读源码的模型能不能一次填对"，那要外部模型实测，
+        #    **本条断言不追认那一格**（卡第五节写死了：不许用我们自己填对了代替）。
+        schema_text = package.schema_path.read_text(encoding="utf-8")
+        for kind, spec in CANDIDATE_KINDS.items():
+            assert kind in prompt, f"任务包提示词里没有 candidate_kind 的合法值 {kind}"
+            assert kind in schema_text, f"schema 的 enum 里没有 {kind}"
+            for field in spec["required"]:
+                assert field in prompt, f"{kind} 的必填子字段 {field} 没写进提示词"
+                assert field in schema_text, f"{kind} 的必填子字段 {field} 没写进 schema"
+            if spec["code"]:
+                assert spec["code"] in prompt, f"{kind} 缺字段时报的码没写进提示词"
+        for key in (ACCOUNTING_IDS_KEY, ACCOUNTING_NONE_KEY):
+            assert key in prompt and key in schema_text, f"交代表键名 {key} 没进任务包"
+        schema_obj = json.loads(schema_text)
+        assert schema_obj["properties"]["items"]["items"][
+            "properties"]["candidate_kind"] == {"enum": list(CANDIDATE_KINDS)}, \
+            "candidate_kind 必须是 enum——原先只写 {'type':'string'}，等于没有契约"
+        assert schema_obj["properties"]["source_accounting"]["items"]["anyOf"], \
+            "交代表必须写明「两者必居其一」，原先只写 {'type':'array'}"
+        #    条件必填要覆盖到每一个有必填子字段的 kind，不多不少
+        conds = {c["if"]["properties"]["candidate_kind"]["const"]: set(c["then"]["required"])
+                 for c in schema_obj["properties"]["items"]["items"]["allOf"]}
+        assert conds == {k: set(v["required"]) for k, v in CANDIDATE_KINDS.items() if v["required"]}, \
+            f"schema 的按 kind 条件必填跟契约表对不上：{conds}"
+        #    ⚠ **提示词里的示例必须是能解析的 JSON**：交出去的示例本身写坏了，
+        #    等于教模型填错——而这一步没有任何下游会发现（f-string 里的花括号
+        #    转义正是最容易写坏的地方）。
+        blocks = re.findall(r"```json\n(.*?)```", prompt, re.S)
+        assert len(blocks) >= 2, f"提示词该带交代表片段与完整示例两段 JSON，实得 {len(blocks)}"
+        for block in blocks:
+            parsed = json.loads(block)     # 解析不了就当场红
+            #    ⚠ **示例里的每一个字面值也要是合法的**——⚠ 这条断言不是补充，
+            #    是**当场抓到了一次**：第一版示例里写的 `identity`／`timeline`
+            #    两个 section 根本不在 SECTION_KEYS 里，照着填必报 SECTION_UNKNOWN。
+            #    **交出去的示例写错，等于教模型填错**，而这一步没有任何下游会发现。
+            for item in parsed.get("items", ()):
+                assert item["section"] in SECTION_KEYS, \
+                    f"示例里用了不存在的人格节 {item['section']}——照着填必报 SECTION_UNKNOWN"
+                assert item["candidate_kind"] in CANDIDATE_KINDS, \
+                    f"示例里用了枚举外的 candidate_kind：{item['candidate_kind']}"
+                for field in CANDIDATE_KINDS[item["candidate_kind"]]["required"]:
+                    assert field in item, \
+                        f"示例里 {item['candidate_kind']} 这条漏了必填的 {field}"
+
+        # 10.【靶心二：键名填错要点名，不能报成「没有候选或无候选说明」】
+        #     ⚠ 靶子必须是**真实那次的形态**：执行侧填的是 `item_ids`。
+        good_item = {
+            "item_id": "corpus:1", "text": "林岸：真实证据。",
+            "section": "closing", "source_ref": ref,
+            "source_span": [0, 8], "candidate_kind": "quote",
+            "evidence": "林岸：真实证据",
+        }
+        wrong_key = {"items": [good_item],
+                     "source_accounting": [{"source_ref": ref, "item_ids": ["corpus:1"]}]}
+        _, iss10 = validate_candidate_result(wrong_key, manifest)
+        field_err = [i for i in iss10 if i.code == "SOURCE_ACCOUNTING_FIELD_MISSING"]
+        assert field_err, f"键名填错必须指名报错，实际只有：{[i.code for i in iss10]}"
+        assert "candidate_item_ids" in field_err[0].message and "item_ids" in field_err[0].message, \
+            f"报错要同时说出「该填什么」和「你实际填了什么」：{field_err[0].message}"
+        #     ⚠ 那句会把人指错方向的话，不许再落到这条来源头上
+        inc10 = [i for i in iss10 if i.code == "SOURCE_ACCOUNTING_INCOMPLETE"]
+        assert inc10 and "字段不合格" in inc10[0].message, \
+            f"登记过但字段不合格的来源，不许混进「没有候选或无候选说明」那句：{inc10}"
+
+        # 11.【靶心四：不许靠猜键名兼容】`item_ids` 不得被自动当成 candidate_item_ids
+        #     ——猜是另一种静默，下一个模型换个写法又猜不中。
+        items11, iss11 = validate_candidate_result(wrong_key, manifest)
+        assert any(i.code == "SOURCE_ACCOUNTING_INCOMPLETE" for i in iss11), \
+            "填错键名必须仍然过不去——自动认成同义词就是把静默换了个地方"
+        assert items11, "但候选本身没毛病时不该被连坐（这条是防过度纠正）"
+
+        # 12.【缺陷 C：悬空 ID】交代表挂着一条不存在的候选 ID → 必须报出来，
+        #     且 ⚠ **不许报成「这个来源没交代」**（防过度纠正，卡第二之二节判据）。
+        dangling = {"items": [good_item],
+                    "source_accounting": [{"source_ref": ref,
+                                           "candidate_item_ids": ["已经被丢弃的-c99"]}]}
+        _, iss12 = validate_candidate_result(dangling, manifest)
+        d12 = [i for i in iss12 if i.code == "SOURCE_ACCOUNTING_ID_UNKNOWN"]
+        assert d12 and "已经被丢弃的-c99" in d12[0].message, \
+            f"悬空 ID 必须点名报出来：{[i.code for i in iss12]}"
+        assert not any(i.code == "SOURCE_ACCOUNTING_INCOMPLETE" for i in iss12), \
+            "悬空 ID 不是「没交代」——报成那样就是让缺陷 A 的病在修 C 的时候复发"
+        #     混合形态：一个真 ID ＋ 一个悬空 ID，只报悬空那个
+        mixed = {"items": [good_item],
+                 "source_accounting": [{"source_ref": ref,
+                                        "candidate_item_ids": ["corpus:1", "没这条"]}]}
+        _, iss12b = validate_candidate_result(mixed, manifest)
+        m12 = [i for i in iss12b if i.code == "SOURCE_ACCOUNTING_ID_UNKNOWN"]
+        assert m12 and "没这条" in m12[0].message and "corpus:1" not in m12[0].message
+
+        # 13.【靶心三：未知 kind 必须有输出说「这条没被结构检查」】
+        #     ⚠ 判的是**有没有说**，不是**拦不拦**——维护者拍板：warning，不做 blocking
+        #     （blocking 会把将来合法的新 kind 一并堵死）。
+        #     ⚠ 靶子用**中文自由值**，那就是走查现场模型真填的形态。
+        unknown = {"items": [dict(good_item, candidate_kind="风格片段")],
+                   "source_accounting": [{"source_ref": ref,
+                                          "candidate_item_ids": ["corpus:1"]}]}
+        items13, iss13 = validate_candidate_result(unknown, manifest)
+        warn13 = [i for i in iss13 if i.code == "CANDIDATE_KIND_UNCHECKED"]
+        assert warn13, f"未知 kind 必须留下痕迹，否则「闸门没触发」这件事不可见：{[i.code for i in iss13]}"
+        assert warn13[0].severity == "warning", "拍板是 warning 不是 blocking"
+        assert "没有被任何结构检查" in warn13[0].message, \
+            f"要说清的是「这条没被检查」，不是只说「kind 不认识」：{warn13[0].message}"
+        assert items13, "warning 不拦——这条候选照常进候选池"
+        #     反面：认识的 kind 不许打这条警告（否则它变成噪声，等于没有）
+        known = {"items": [good_item],
+                 "source_accounting": [{"source_ref": ref, "candidate_item_ids": ["corpus:1"]}]}
+        _, iss13b = validate_candidate_result(known, manifest)
+        assert not any(i.code == "CANDIDATE_KIND_UNCHECKED" for i in iss13b)
+
+        # 14.【变异：三道结构检查各打坏一次，必须在真实校验路径上转红】
+        #     ⚠ **这一组不许省，也不许只在 issue_codes 上断**（第 8 组那三条是函数级）：
+        #     这三道闸在 2026.08.04 之前**从来没有被真正触发过**（kind 填的是中文自由值），
+        #     所以「现在不报」证明不了它们能工作——**必须先证明它们会红**。
+        #     方法留成一条：给一个从未被触发过的闸门补上触发条件之后，
+        #     「绿」不是证据，「能红」才是。
+        broken = {
+            "MILESTONE_INCOMPLETE": dict(good_item, candidate_kind="milestone",
+                                         event="发生了", reading="", current_state="结束了"),
+            "NAMING_NOT_BIDIRECTIONAL": dict(good_item, candidate_kind="naming",
+                                             user_to_ai=["哥哥"], ai_to_user=[]),
+            "STYLE_NOT_DIALOGUE": dict(good_item, candidate_kind="style_dialogue",
+                                       turns=[{"speaker": "林岸", "text": "林岸：真实证据"}]),
+        }
+        for code, bad_item in broken.items():
+            payload = {"items": [bad_item],
+                       "source_accounting": [{"source_ref": ref,
+                                              "candidate_item_ids": ["corpus:1"]}]}
+            got_items, got_iss = validate_candidate_result(payload, manifest)
+            assert any(i.code == code for i in got_iss), \
+                f"打坏 {code} 那道结构要求之后必须转红，实际：{[i.code for i in got_iss]}"
+            assert not got_items, f"{code} 没过的候选不许进候选池"
+        #     ⚠ 反面同样要断：**填对了就该真的通过**（不然上面的红可能只是"逢 kind 必红"）
+        ok_ms = dict(good_item, candidate_kind="milestone", event="发生了",
+                     reading="这件事说明她开始独立接活", current_state="已经结束")
+        ok_items, ok_iss = validate_candidate_result(
+            {"items": [ok_ms], "source_accounting": [
+                {"source_ref": ref, "candidate_item_ids": ["corpus:1"]}]}, manifest)
+        assert ok_items and not [i for i in ok_iss if i.severity == "blocking"], \
+            f"三段都给全的 milestone 该通过：{[i.code for i in ok_iss]}"
+
+    print("selftest ok（14组断言：旧候选兼容 + 来源回指 + 结构契约 + 零依赖任务包 + "
+          "任务包自足（kind 枚举／必填子字段／交代表键名都从同一张表渲染进三份文件，"
+          "⚠ 只是靶心一的机械代理，不追认「不读源码的模型能填对」那一格）+ "
+          "键名填错指名报错且不猜 + 悬空 ID 点名但不报成「没交代」+ "
+          "未知 kind 出 warning 说明「这条没被结构检查」+ 三道结构检查变异各自转红）")
 
 
 if __name__ == "__main__":

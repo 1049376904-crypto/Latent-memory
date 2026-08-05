@@ -1279,6 +1279,20 @@ PORTABLE_PREFIX = "${CLAUDE_PROJECT_DIR:-.}/"
 # `✓ 时区：Etc/UTC` 的合格证。**它长得跟判据一模一样，而且不会报错。**
 # ⚠ 默认值同样可能是错的（使用者不在东八区时），所以说明里必须写明"这是默认值、
 # 不对就改这一行"，`--doctor` 那一格也仍然报 ⚠——**默认值不等于验过了**。
+# 解释器那一行的说明，按产出形态二选一（2026.08.05 外部实测第 2 条：样板里写死的
+# `"command": "python"` 在只装了 python3 的机器上照抄必挂，**而症状是 spawn 静默
+# 失败**——客户端只说连不上，没有任何一行指回这个字段）。
+CONFIG_NOTE_PYTHON_ABS = (
+    "command 那一行填的是**跑这次初始化的那个解释器的绝对路径**，不是字面的 python"
+    "——很多机器上根本没有叫 `python` 的命令（只有 `python3`），照抄一个不存在的命令，"
+    "客户端只会说“连不上”，不会告诉你是哪一行的错。"
+    "顺带解决第二件事：`local`／`cloud` 两条检索路线要 pip 装东西，"
+    "装在哪个解释器上，这一行就得指哪个。换机器要连这一行一起改。")
+CONFIG_NOTE_PYTHON_NAME = (
+    "command 那一行是**按跑初始化这台机器探出来的命令名**填的（这台机器上它能跑）。"
+    "这份配置本身可以跟着仓库搬，但**命令名搬不动**——换台机器要先确认那边有同名命令，"
+    "而且 `local`／`cloud` 两条路线 pip 装的东西也要装在同名解释器上。")
+
 CONFIG_NOTE_TZ = (
     "时区那一行（--timezone）决定“今天是几号”按哪个时区算——写回落进哪个窗口文件、"
     "记录标题、检索标签都跟着它。换时区/换机器记得改。")
@@ -1290,6 +1304,39 @@ CONFIG_NOTE_TZ_DEFAULT = (
     "一起错，而且不报任何错。改法：把上面那行的 " + DEFAULT_TIMEZONE + " 换成你的 "
     "IANA 时区（例如 Europe/Berlin）。跑 --doctor 时这一格会报 ⚠ 提醒你确认，"
     "显式配上之后就变 ✓。")
+
+
+def python_command(portable=False):
+    """MCP 配置里 `command` 那一行填什么（2026.08.05 外部实测第 2 条）。
+
+    在此之前这里写死字面量 `"python"`。**很多机器上没有这个命令**（Debian 系默认
+    只有 `python3`），照抄的人拿到的症状是**客户端 spawn 静默失败**——它只说连不上，
+    没有任何一行指回这个字段，自查时几乎不会怀疑到解释器名上。
+
+    两档，跟着路径那两档走（同一个 `rels is not None`）：
+
+    · **绝对路径档**取 `sys.executable`——就是跑这次初始化的解释器。反正整份配置
+      已经写死了这台机器的绝对路径，再让命令名去赌 PATH 没有意义；而且它顺手解决
+      第二件事：`local`／`cloud` 两条路线要 pip 装依赖，**装在哪个解释器上，
+      服务端就得用哪个**，写 `python` 起到另一个解释器上就是一句 ImportError。
+    · **可搬运档**（Claude Code 占位符那一档）不能写绝对路径，否则整档的意义没了。
+      这里退回命令名，但**是探过的**，而且**头一个候选是这次真的跑起来的那个名字**
+      （`Path(sys.executable).stem`）——venv 里它是 `python`、系统装的多半是
+      `python3`，两种形态都不用猜。探不到才依次退 `python3`、`python`。
+
+    ⚠ **这跟时区那条「我们不猜、也不拿这台机器的顶替」不冲突，别照着改**：时区问的是
+    **人在哪儿**，这台机器答不了；解释器问的是**这台机器上什么命令能跑**，
+    正是这台机器唯一能答准的东西。两条的分别在于问的是谁，不在于探不探。
+    ⚠ 探不出来（PATH 里两个都没有，罕见）就落 `python3`：写一个不存在的命令是必然挂，
+    落哪个都一样挂，选覆盖面大的那个，并且**这一档也照样把说明写进配置里**。"""
+    import shutil
+
+    if not portable:
+        return str(Path(sys.executable).resolve()).replace("\\", "/")
+    for name in (Path(sys.executable).stem, "python3", "python"):
+        if name and shutil.which(name):
+            return name
+    return "python3"
 
 
 def mcp_config_snippet(server_path, corpus_dir, threads_path, route=None,
@@ -1346,6 +1393,8 @@ def mcp_config_snippet(server_path, corpus_dir, threads_path, route=None,
         note = CONFIG_NOTE + CONFIG_NOTE_MACHINE_BOUND
     # 时区：人给了就用人给的，没给就落默认值——**但探测结果任何时候都不进 args**
     # （两条规矩的分别见 CONFIG_NOTE_TZ_DEFAULT 上面那段注释）
+    command = python_command(portable=rels is not None)
+    note += CONFIG_NOTE_PYTHON_NAME if rels is not None else CONFIG_NOTE_PYTHON_ABS
     tz = (timezone or "").strip()
     note += CONFIG_NOTE_TZ if tz else CONFIG_NOTE_TZ_DEFAULT
     if not tz:
@@ -1357,7 +1406,7 @@ def mcp_config_snippet(server_path, corpus_dir, threads_path, route=None,
         tz = DEFAULT_TIMEZONE
     cfg = {CONFIG_NOTE_KEY: note,
            "mcpServers": {"memory": {
-               "command": "python",
+               "command": command,
                "args": [vals[0], "--corpus", vals[1], "--threads", vals[2],
                         "--timezone", tz]
                        + route_args(route or ROUTE_DEFAULT),
@@ -1770,6 +1819,36 @@ def corpus_coverage(corpus_dir, entries=None):
             if m:
                 days.append(m.group(0))
     return (min(days), max(days)) if days else None
+
+
+def memory_report_lines(paths, corpus_dir):
+    """出货报告里「记忆库」那一段（2026.08.05 外部实测第 1 条，按杀伤力排第一）。
+
+    在此之前两条出货路径都只打一行 `记忆库：<out>/memory`。**六步走这条路上那是个
+    空目录**——`write_bundle` 只 `mkdir` 出来，一个字都不往里写；检索真正读的是用户
+    `--corpus` 指的那个目录（`mcp-config.json` 里 `--corpus` 也指着它）。
+    报告说的和事实差着一个目录，而**这是新手看到的第一屏**。
+
+    ⚠ 《快速上手》后段确实解释过「七步走不写 timeline」，但那是另一屏——
+    **报告自己说错了话，不能靠文档去追**。
+    ⚠ 判据是「这次到底往哪儿落了盘」，不是「哪条命令」：`--import` 那条路真写了窗口
+    文件（`corpus_files` 非空），那行就照旧报 `<out>/memory`，它此刻是真的。"""
+    memory_dir = paths["memory_dir"]
+    written = paths.get("corpus_files") or []
+    if written:
+        return [f"  记忆库：{memory_dir}（落盘 {len(written)} 个窗口文件）"]
+    if corpus_dir and Path(corpus_dir).resolve() != Path(memory_dir).resolve():
+        return [
+            f"  记忆库：{Path(corpus_dir).resolve()}"
+            f"（就是你 --corpus 指的那个目录；检索读的是它，"
+            f"mcp-config.json 里 --corpus 也指着它）",
+            f"  ⚠ 顺带说清：{memory_dir} 是这次顺手建出来的**空目录**，"
+            f"这条路上我们一个字都不往里写（要我们替你建库是另一条路："
+            f"出货时加 --import <导出文件>）。别把它抄进客户端配置。",
+        ]
+    return [f"  记忆库：{memory_dir}"
+            f"（**空的**——这次既没给 --corpus，也没给 --import，"
+            f"所以还没有任何可检索的内容；补语料的两条路见《快速上手》§2）"]
 
 
 def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
@@ -3035,8 +3114,12 @@ def _selftest():
         for must in ("不会被任何客户端自动读取", "改这个文件不生效"):
             assert must in cfg[CONFIG_NOTE_KEY], \
                 f"样板说明没说到点上，缺：{must!r}"
+        #    ⚠ command 那一行的判据在 73b) 组（**它在这台机器上能不能起进程**）；
+        #    这里只钉结构：说明是个真键，别把配置本体挤歪了。原来这一行顺手比的是
+        #    `command == "python"`——**那正好把缺陷本身写成了断言**，2026.08.05 外部
+        #    实测第 2 条撞的就是它（只装 python3 的机器照抄必挂）。
         assert set(cfg) == {CONFIG_NOTE_KEY, "mcpServers"} and \
-            cfg["mcpServers"]["memory"]["command"] == "python", \
+            set(cfg["mcpServers"]["memory"]) == {"command", "args"}, \
             f"那一行说明把配置结构挤歪了：{sorted(cfg)}"
         #    **说明本身不许把 key 漏出去**：它是随产出目录走的文件，同 key 那条纪律
         assert "sk-" not in cfg[CONFIG_NOTE_KEY]
@@ -4281,14 +4364,157 @@ def _selftest():
         assert _ta("# 它是谁") is None, "「它」在任何一档都不许出现"
         assert _ta("# 我是谁") is None, "不是用户那节的标题句式，读不出来就该是 None"
 
+    # 73.【四个靶心，真命令】2026.08.05 外部实测（星迟＆烬，真实语料＋自建前端）走查
+    #     出来的三条，各自的靶子：
+    #       ① 出货报告里「记忆库」那一行**指的是检索真正读的那个目录**；
+    #       ② mcp-config.json 的 `command` **在这台机器上真能跑**（不是字面 python）；
+    #       ③ 旧的数量断言盖到新并进来的条目头上时，**报得出、也删得掉**；
+    #       ④ 反向：那一节没并进语料时一个字都不许报（在下面 73b 组）。
+    #     ⚠ 这四行故意不写成 `a)` 那个形状：`_count_assertion_groups` 认的就是它，
+    #     写成那样等于凭空多出四个「子组」，项数当场对不上（这一版实测撞过）。
+    #     ⚠ 夹具走真进程、走 --persona ＋ --corpus 那条路——三条缺陷全都只在这条路上
+    #     出现（六步走不写 memory/timeline，也只有这条路会把语料候选并进原文节）。
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        script = str(Path(__file__).resolve())
+        probe_persona = root / "原人格.md"
+        probe_persona.write_text(
+            "# 开篇\n\n虚构开篇。\n\n## 里程碑\n\n（以下三条都逐条确认过。）\n\n"
+            "- 2020-01-01 虚构甲。\n- 2020-02-02 虚构乙。\n- 2020-03-03 虚构丙。\n\n"
+            "## 按需读取\n\n需要细节时读 memory/timeline/ 。\n", encoding="utf-8")
+        probe_corpus = root / "语料"
+        probe_corpus.mkdir()
+        corpus_line = "2020-04-04 虚构丁。"
+        (probe_corpus / "w1.md").write_text(corpus_line + "\n", encoding="utf-8")
+        probe_out = root / "产出"
+        probe_out.mkdir()
+
+        def run_probe(*extra, check=True):
+            return subprocess.run(
+                [sys.executable, script, "--out", str(probe_out),
+                 "--persona", str(probe_persona), "--corpus", str(probe_corpus), *extra],
+                capture_output=True, text=True, encoding="utf-8", check=check).stdout
+
+        def probe_ship(pick_delete):
+            """跑一遍完整六步；pick_delete=True 时里程碑那节选「删除该块」的版本。"""
+            questions = json.loads(run_probe("--step", "choose-sections", "--json"))
+            picks = {}
+            for question in questions["sections"]:
+                versions = question["section_versions"]
+                if question["section"] == "milestones" and pick_delete:
+                    dropped = [version for version in versions
+                               if "以下三条" not in version["markdown"]]
+                    assert dropped, "命中数量断言的那一节必须多出一个「删除该块」的版本"
+                    picks[question["section"]] = dropped[0]["version_id"]
+                else:
+                    picks[question["section"]] = versions[0]["version_id"]
+            run_probe("--step", "choose-sections", "--section-decisions-json",
+                      json.dumps(picks, ensure_ascii=False), "--json")
+            run_probe("--step", "preview", "--json")
+            run_probe("--step", "route", "--route", "zero-dep")
+            return run_probe("--step", "ship", "--client", "generic")
+
+        run_probe("--step", "inspect", "--json")
+        probe_items = []
+        for index, line in enumerate([corpus_line], 1):
+            probe_items.append({
+                "item_id": f"cand:{index:04d}", "text": line, "section": "milestones",
+                "source_ref": str((probe_corpus / "w1.md").resolve()),
+                "source_span": [0, len(line)], "candidate_kind": "milestone",
+                "evidence": line, "event": line[11:], "reading": "虚构解读",
+                "current_state": "虚构状态"})
+        run_probe("--step", "extract", "--candidates", json.dumps({
+            "items": probe_items,
+            "source_accounting": [{"source_ref": str((probe_corpus / "w1.md").resolve()),
+                                   "candidate_item_ids": [i["item_id"] for i in probe_items]}],
+        }, ensure_ascii=False), "--json")
+        keep_ship = probe_ship(pick_delete=False)
+
+        # a)【靶心】报告里的「记忆库」必须指 --corpus 那个目录，而不是空的 <out>/memory。
+        #    ⚠ 判据是**那一行里出现的是哪个路径**，不是"报告里提没提 memory"——
+        #    缺陷版本打的正是 `记忆库：<out>/memory`，而那个目录一个文件都没有
+        #    （六步走这条路 write_bundle 只 mkdir、不写盘），检索读的是 --corpus。
+        #    ⚠ 反面那半也要钉：空目录这件事**必须被说出来**，否则用户照抄它进配置。
+        memory_line = next(line for line in keep_ship.splitlines() if "记忆库：" in line)
+        assert str(probe_corpus.resolve()) in memory_line, \
+            f"出货报告把检索读不到的空目录当成记忆库报出来了：{memory_line}"
+        assert not list((probe_out / "memory").iterdir()), \
+            "夹具前提变了：这条路上 <out>/memory 本该是空的，空目录那半断言失去靶子"
+        assert "空目录" in keep_ship, "空的 <out>/memory 没被说出来，用户会照抄它进配置"
+
+        # b)【靶心】配置里的 command 必须是这台机器上真能跑的解释器。
+        #    ⚠ 判据是**能不能起进程**，不是"是不是字面 python3"：写死任何一个名字都
+        #    会在某类机器上挂（缺陷版本写死 `python`，只装 python3 的机器照抄必挂，
+        #    而症状是客户端 spawn 静默失败、没有一行指回这个字段）。
+        probe_cfg = json.loads(
+            (probe_out / "mcp-config.json").read_text(encoding="utf-8"))
+        probe_command = probe_cfg["mcpServers"]["memory"]["command"]
+        assert subprocess.run([probe_command, "-c", "import sys"],
+                              capture_output=True).returncode == 0, \
+            f"mcp-config.json 里的 command 在这台机器上起不来：{probe_command!r}"
+        assert "command 那一行" in probe_cfg[CONFIG_NOTE_KEY], \
+            "解释器这一行换机器要改，配置说明里必须写着"
+
+        # c)【靶心】旧断言盖新内容：warning 报得出来，且那一节有「删除该块」的出口，
+        #    选了之后 warning 消失、出货文件里也没有那句话。
+        #    ⚠ **必须验"选了删除版本之后 warning 消失"**：那句原文和它的删除孪生条目
+        #    同时躺在 compiler_items 里，按条目判的写法会让这条 warning 改不掉——
+        #    一条改不掉的警告等于没有警告。
+        assert "STALE_COUNT_ASSERTION" in keep_ship and "以下三条" in keep_ship, \
+            f"数量断言盖到新条目头上，出货时一声不吭：{keep_ship}"
+        assert "以下三条" in (probe_out / "persona.md").read_text(encoding="utf-8"), \
+            "报了 warning 却顺手改了用户原文——v2 不许改写原文，只许报和给出口"
+        delete_ship = probe_ship(pick_delete=True)
+        assert "STALE_COUNT_ASSERTION" not in delete_ship, \
+            f"选了「删除该块」之后这条 warning 还在报，等于没有出口：{delete_ship}"
+        shipped_probe = (probe_out / "persona.md").read_text(encoding="utf-8")
+        assert "以下三条" not in shipped_probe and "虚构甲" in shipped_probe, \
+            "删除版本该只删那一块断言，清单本身要留着"
+
+    # 73b.【反向靶心】同一句数量断言，那一节**没有并进语料**时一个字都不许报。
+    #      没有这一段，「见到数字就报」跟「报得准」长得一模一样（同 61c 的形状）。
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        quiet_persona = root / "原人格.md"
+        quiet_persona.write_text(
+            "# 开篇\n\n虚构开篇。\n\n## 里程碑\n\n（以下三条都逐条确认过。）\n\n"
+            "- 2020-01-01 虚构甲。\n- 2020-02-02 虚构乙。\n- 2020-03-03 虚构丙。\n\n"
+            "## 按需读取\n\n需要细节时读 memory/timeline/ 。\n", encoding="utf-8")
+        quiet_out = root / "产出"
+        quiet_out.mkdir()
+
+        def run_quiet(*extra):
+            return subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "--out", str(quiet_out),
+                 "--persona", str(quiet_persona), *extra],
+                capture_output=True, text=True, encoding="utf-8", check=True).stdout
+
+        run_quiet("--step", "inspect", "--json")
+        quiet_questions = json.loads(run_quiet("--step", "choose-sections", "--json"))
+        quiet_milestones = next(question for question in quiet_questions["sections"]
+                                if question["section"] == "milestones")
+        assert len(quiet_milestones["section_versions"]) == 1, \
+            "没并进新内容的那一节不该多出「删除该块」的版本——那是给它自己找的噪声"
+        run_quiet("--step", "choose-sections", "--section-decisions-json", json.dumps(
+            {question["section"]: question["section_versions"][0]["version_id"]
+             for question in quiet_questions["sections"]}, ensure_ascii=False), "--json")
+        run_quiet("--step", "preview", "--json")
+        run_quiet("--step", "route", "--route", "zero-dep")
+        quiet_ship = run_quiet("--step", "ship", "--client", "generic")
+        assert "STALE_COUNT_ASSERTION" not in quiet_ship, \
+            f"那一节一条语料都没并进来，「以下三条」仍然是真话，不许报：{quiet_ship}"
+
     # 72.【一个靶心，元断言】**项数不许再靠增量漂**（2026.08.05 审核轮，CLAUDE.md 第 10 条）。
     #     **判据（先写后数）——一项 ＝ 一个「下辖断言的注释标头」**，只认两种形态：
     #     **A 型主组**＝缩进恰好 4 空格、`# 数字[小写字母].`（如 `# 61e.`）；
     #     **B 型子组**＝任意缩进、`# 小写字母[一位数字])`（如 `# a)` `# b2)`）。
     #     算法：按 A 切主组；主组内有下辖断言的 B → 计 B 的个数（**主组本身不再另计**，
     #     否则一个组数两遍），没有 B → 计 1；**标头到下一个标头之间没有 `assert` 的不计**。
-    #     按这条数出来是 **60**（这一组 `72` 自己也算一组；脚本即下面那个函数）。
-    #     ⚠ **那行斜杠描述有 55 条，跟项数不是一回事**，别拿它当项数的判据。
+    #     按这条数出来是 **64**（这一组 `72` 自己也算一组；脚本即下面那个函数）。
+    #     ⚠ **那行斜杠描述的条数跟项数不是一回事**，别拿它当项数的判据：描述里
+    #     好几段是「甲＋乙＋丙」并着写的，一段对应两三个断言组。
+    #     （这里原来写着一个具体的条数「55」，但**没有写下它是按什么切的**——
+    #     换个人重数得不到同一个数，按 CLAUDE.md 第 10 条那就不是判据，删掉。）
     #     ⚠ 靶心：**总结行不影响任何断言、改错了不会红**，所以让它自己守自己——
     #     下面这条断言现读现数本文件，数不上就红，项数不会静默漂。
     #     变异（先写后跑）：把总结行的数字改成别的 → 本条红；新增／删掉一个断言组
@@ -4303,7 +4529,7 @@ def _selftest():
 
 
 _SELFTEST_SUMMARY = (
-    "selftest ok（60项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
+    "selftest ok（64项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
           "归属句式 / 默认值不预支历史 / 协议层不问用户 / 导出纪律 / 渲染顺序 / "
           "人称锚死一套 / 用户只有一种称呼形态 / 昵称档不被静默吃掉 / 中性档不丢主语 / 人称从语料读出来 / 中性写法不许漏 / 语料侧判定不许猜 / 全文零它 / 称呼不重复拼接 / 关系状态归开篇 / "
           "答案读回不静默丢 / 任务书不泄漏进人格文件 / 长字面量不崩 / 未决草稿不蒸发 / "
@@ -4347,6 +4573,17 @@ _SELFTEST_SUMMARY = (
           "找不到」在预览层单列 stale_versions 不混进未确认；⚠ 这三条是 2026.08.05 真机 "
           "state 打回来的）＋"
           "同一形态走真进程看 CLI 实际打出来的两行（61e b2：坏的就是印的那一层））/ "
+          "出货报告里的「记忆库」指的是检索真正读的那个目录，空的 <out>/memory "
+          "必须被说出来（73：⚠ 判据是那一行里出现的是哪个路径，"
+          "不是「报告里提没提 memory」）＋"
+          "mcp-config.json 的 command 在这台机器上真能起进程（⚠ 判据是能不能起，"
+          "不是像不像 python3——写死任何一个名字都会在某类机器上挂）＋"
+          "旧数量断言盖到新并进来的条目头上时报得出、且那一节有「删除该块」的出口，"
+          "选了之后 warning 消失、原文没被我们改（⚠ 必须验「选了之后不再报」："
+          "原文块和它的删除孪生条目同时在 compiler_items 里，"
+          "按条目判会让这条 warning 改不掉）/ "
+          "反向：那一节没并进语料时同一句数量断言一个字都不许报"
+          "（73b：没有这一段，「见数字就报」跟「报得准」长得一模一样）/ "
           "⚠ 项数自己守自己（72：这一行的数字现读现数本文件，对不上就红——"
           "判据与算法见 72 那组注释）)")
 
@@ -4595,6 +4832,54 @@ _DELETE_EXIT_RULES = (
 )
 
 
+# 原文里的**数量断言**词面（2026.08.05 外部实测第 3 条）。
+# 形状：「以下五条都经她逐条确认」「上述三点均已核对」——**它断言的是一批内容，
+# 而那批内容在合并语料候选之后变多了**，于是这句话原样盖到了没经确认的新条目头上。
+# ⚠ 逐字保留原文是 v2 的硬契约，所以我们**不改写它**，只做两件事：
+#   ① 那一块多给一个「删除该块」的版本（这里）；② 出货时报一条 warning（shipping_issues）。
+# ⚠ 只认「量词＋指代」这个形状，别放宽成「文里有数字就报」——人格文件里数字到处都是。
+_COUNT_ASSERTION_RE = re.compile(
+    r"(以下|下面|上述|以上|前述|这|那)[^。；！？\n]{0,4}?"
+    r"(\d+|[一二两三四五六七八九十]+)\s*(条|点|项|件|句|则)")
+
+
+STALE_COUNT_EXIT_REASON = (
+    "STALE_COUNT_ASSERTION：这一块里有一句数量断言「{hit}」，"
+    "而这一节这次并进了 {count} 条来自语料的新内容——那句话现在**盖到了它没数过、"
+    "也没经人确认的条目头上**。⚠ 这条**不拦你出货**：三条出路自己挑——"
+    "选这个版本把这句话删掉；或者回去改输入人格文件里那一句再从 --step inspect 重跑；"
+    "或者你确认它仍然说得通（比如那个数指的是别的东西），原样留着。")
+
+
+def stale_count_assertion_hits(items):
+    """→ [(item, 命中的那句话, 这一节并进来的语料条数)]；没有就空表。
+
+    **判据有两半，缺一不算**（先写下来再动手）：
+      ① 这一块是**原文块**、且这次是「保留」（keep／move）——删掉的块不用管；
+      ② **它所在的那一节这次并进了 ≥1 条语料候选**——没并进新东西的话，
+         「以下五条」还是那五条，那句话仍然是真的，报了就是噪声。
+
+    ⚠ 第二半是这条规则的全部分量所在：这不是「见到数字就报」，是「**这个数被新内容
+    盖过去了**」。放宽掉它，规则立刻退化成对任何一份带清单的人格文件都刷屏。"""
+    joined = {}
+    for item in items:
+        if item.source_type == "corpus" and item.section:
+            joined[item.section] = joined.get(item.section, 0) + 1
+    hits = []
+    for item in items:
+        if item.source_type != "original_persona" or not item.section:
+            continue
+        if item.operation not in {"keep", "move"}:
+            continue
+        count = joined.get(item.section, 0)
+        if not count:
+            continue
+        match = _COUNT_ASSERTION_RE.search(item.original_text)
+        if match:
+            hits.append((item, match.group(0), count))
+    return hits
+
+
 def task_directive_delete_items(items):
     """给命中出口规则表的原文块，额外造一个「删除该块」的版本。
 
@@ -4614,12 +4899,20 @@ def task_directive_delete_items(items):
     from dataclasses import replace
 
     twins = []
+    # 数量断言那条规则要看**整节的上下文**（这一节这次并进了几条语料），
+    # 词面表那两条只看块自己——所以先按 item_id 摊平成一张表再进循环，
+    # 两种规则最后合流到同一个 `reasons`（同一块仍然只造一个孪生条目）
+    stale_counts = {item.item_id: (hit, count)
+                    for item, hit, count in stale_count_assertion_hits(items)}
     for item in items:
         if item.source_type != "original_persona" or item.section is None:
             continue
         if item.operation not in {"keep", "move"}:
             continue
         reasons = []
+        if item.item_id in stale_counts:
+            hit, count = stale_counts[item.item_id]
+            reasons.append(STALE_COUNT_EXIT_REASON.format(hit=hit, count=count))
         for tokens, template in _DELETE_EXIT_RULES:
             hit = [token for token in tokens if token in item.original_text]
             if hit:
@@ -5096,6 +5389,40 @@ def shipping_issues(state, persona_markdown, manifest):
         selected_versions[section] = next((version for version in
             state.get("section_versions", {}).get(section, [])
             if version_key(version) == decision.get("version_id")), None)
+    # 【旧断言盖新内容】2026.08.05 外部实测第 3 条：原人格 milestones 节首写着
+    # 「（以下五条都经她逐条确认…）」，合并语料候选后那一节变成 14 条，**这句断言被
+    # 原样保留、盖到了 9 条没经确认的新条目头上**——出货闸一声不吭。
+    # ⚠ **判据必须落在「用户选中的那个版本」上，不能像 task_directive_delete_items
+    #   那样按条目判**：那句原文和它的「删除该块」孪生条目**同时躺在 compiler_items
+    #   里**（选择发生在版本层），按条目判的话用户选了删除版本之后这条 warning 照报
+    #   ——一条改不掉的警告等于没有警告。所以这里看的是选中版本的 markdown。
+    # ⚠ **warning 不是 blocking**，同 BANNED_WORD_REMAINS 的先例：那个数可能指的是
+    #   别的东西（正当用法），而我们**不许改写用户原文**，拦死等于替他判断他的原文。
+    #   给的是"看得见 ＋ 有出口"（出口就在那一节的「删除该块」版本里）。
+    stale_counts = []
+    for section, version in selected_versions.items():
+        if not version:
+            continue
+        version_ids = set(version.get("item_ids", ()))
+        joined = sum(1 for item in items
+                     if item.item_id in version_ids and item.source_type == "corpus")
+        if not joined:
+            continue
+        for line in version.get("markdown", "").splitlines():
+            match = _COUNT_ASSERTION_RE.search(line)
+            if match:
+                stale_counts.append((section, line.strip(), match.group(0), joined))
+    if stale_counts:
+        issues.append(CompileIssue(
+            "STALE_COUNT_ASSERTION", "warning",
+            "以下几处是原文里的**数量断言**，而同一节这次并进了语料里的新内容——"
+            "那句话现在盖到了它没数过的条目头上（原文一个字都没被我们改）："
+            + "；".join(f"{section} 节「{line[:40]}」（命中 {hit}，本节并进 {joined} 条）"
+                       for section, line, hit, joined in stale_counts)
+            + "。⚠ 这条不拦出货。出口：--step choose-sections 里那一节有一个"
+              "「删除该块」的版本，带 diff，选它即可；确认那个数指的是别的东西，"
+              "原样留着也行。"))
+
     for conflict in state.get("conflicts", []):
         if conflict.get("severity") != "blocking":
             continue
@@ -5512,7 +5839,8 @@ def _step_ship_v2(args, state):
         raise SystemExit(f"不出货：{exc}")
     print("【四件套】")
     print(f"  人格文件：{paths['persona']}")
-    print(f"  记忆库：{paths['memory_dir']}")
+    for line in memory_report_lines(paths, corpus_path):
+        print(line)
     print(f"  MCP 配置：{paths['mcp_config']}")
     print(f"  引导句：{paths['guidance']}")
     state["step"] = "shipped"
@@ -5781,8 +6109,8 @@ def _step_ship(args, state):
         raise SystemExit(f"不出货：{e}")
     print("【四件套】")
     print(f"  人格文件：{paths['persona']}")
-    print(f"  记忆库：{paths['memory_dir']}"
-          + (f"（落盘 {len(paths['corpus_files'])} 个窗口文件）" if paths["corpus_files"] else ""))
+    for line in memory_report_lines(paths, args.corpus):
+        print(line)
     print(f"  MCP 配置：{paths['mcp_config']}")
     print(f"  引导句：{paths['guidance']}"
           f"（给闭源前端 App 用：贴进它的自定义指令／system prompt 框，"

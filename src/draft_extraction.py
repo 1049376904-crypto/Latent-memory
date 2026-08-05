@@ -339,6 +339,29 @@ def issue_codes(candidate):
     return issues
 
 
+#: 报错正文里最多列几处真实位置——多了正文会被淹没，剩下的只报个数。
+_SPAN_HITS_SHOWN = 5
+
+
+def _find_occurrences(source, needle, limit=_SPAN_HITS_SHOWN + 1):
+    """返回 needle 在 source 里的全部出现位置 [(起, 止), ...]，最多取 limit 处。
+
+    ⚠ **只用于报错，不用于自动定位**：出现两次时该算哪一次没有答案，
+    这正是「让 source_span 变可选、校验器自己 find()」那条路的死结（任务卡岔口 2，
+    未拍板）。这里把每一处都摆出来给人看，**不替它选**。
+    """
+    hits, at = [], source.find(needle)
+    while at >= 0 and len(hits) < limit:
+        hits.append((at, at + len(needle)))
+        at = source.find(needle, at + 1)
+    return hits
+
+
+def _format_spans(hits):
+    shown = "、".join(f"[{a}, {b}]" for a, b in hits[:_SPAN_HITS_SHOWN])
+    return shown + ("（还有更多，只列前几处）" if len(hits) > _SPAN_HITS_SHOWN else "")
+
+
 def _issue(code, message, item_id=None, severity="blocking"):
     return CompileIssue(code, severity, message, (item_id,) if item_id else ())
 
@@ -398,7 +421,44 @@ def validate_candidate_result(result, manifest):
         excerpt = source[start:end]
         evidence = str(raw.get("evidence", ""))
         if not evidence or evidence not in excerpt:
-            issues.append(_issue("EVIDENCE_NOT_VERBATIM", "证据不能逐字回指来源区间", item_id))
+            # ⚠ **报错分档**（2026.08.05，《任务包要模型自己数字符区间》岔口 1）：
+            # evidence 逐字没问题、只是区间圈错，跟 evidence 真被转义／改了引号，
+            # 原来**报的是同一句话**——而提示词整整一节都在讲转义，人读到那句必然
+            # 去查自己的 evidence 有没有被加工，真因却在 span。实测 7 条里 6 条
+            # 是前者（两家模型 evidence 全部逐字正确，错的只有区间）。
+            # ⚠ **这里不放宽任何要求**：区间圈错照样 blocking、照样不进候选池，
+            # 只是把话说对，并且把 evidence 的真实位置一起给出来。
+            # ⚠ **空 evidence 必须先单独挡掉**（2026.08.05 审核轮补）：`"".find` 在任何
+            # 字符串里都命中，落进下面那档会报出「你的 evidence 逐字没问题」＋
+            # `[0, 0]、[1, 1]…` 一串空区间——**根本没给 evidence 的那条，被告知去改区间**，
+            # 正是这张卡要消灭的「报错指错方向」，而且比改之前更误导。
+            # 码沿用 `EVIDENCE_NOT_VERBATIM`（分档前这一档就报它），不新增码、不动契约。
+            if not evidence:
+                issues.append(_issue(
+                    "EVIDENCE_NOT_VERBATIM",
+                    "这一条没给 evidence（字段缺失或是空串）——不是区间的问题，"
+                    "也不是文本对不上：请从原文里原样复制一段能支撑这条候选的文字，"
+                    "并让 source_span 正好圈住它。",
+                    item_id))
+                continue
+            hits = _find_occurrences(source, evidence)
+            if hits:
+                issues.append(_issue(
+                    "SOURCE_SPAN_MISPLACED",
+                    f"span 圈错了：你的 evidence 逐字没问题，但不在你声明的区间里。"
+                    f"它在 {ref} 里的真实位置是 {_format_spans(hits)}，"
+                    f"你声明的 source_span 是 [{start}, {end}]。"
+                    f"要改的是区间，不是 evidence。"
+                    + ("⚠ 它在原文里出现了不止一处，上面每一处都列了出来；"
+                       "该算哪一处只有你知道，校验器不替你选。" if len(hits) > 1 else ""),
+                    item_id))
+            else:
+                issues.append(_issue(
+                    "EVIDENCE_NOT_VERBATIM",
+                    "evidence 在整份原文里一个字都对不上——不是区间的问题，"
+                    "是这段文本本身跟原文不一致（常见于 HTML 转义、直/弯引号互换、"
+                    "空白或换行被改过）。请把原文原样复制过来。",
+                    item_id))
             continue
         kind = raw.get("candidate_kind")
         text = str(raw.get("text", ""))
@@ -815,11 +875,111 @@ def _selftest():
         assert ok_items and not [i for i in ok_iss if i.severity == "blocking"], \
             f"三段都给全的 milestone 该通过：{[i.code for i in ok_iss]}"
 
-    print("selftest ok（14组断言：旧候选兼容 + 来源回指 + 结构契约 + 零依赖任务包 + "
+        # 15.【报错分档：span 圈错 vs evidence 真被改过，两种情形必须分得开】
+        #     （任务卡《任务包要模型自己数字符区间》第五节靶心二／靶心三＋三条变异）
+        #     ⚠ 靶子是**实测那次的形态**：evidence 逐字正确、在原文里找得到，
+        #     只是不在自己声明的区间里（7 条里 6 条是这个形状）。
+        #     ⚠ 两条断言各自带一句「必须不报对方那个码」——**这就是变异③**：
+        #     分档最容易翻车的方式不是不报，是两边都报／报串。
+        span_corpus = root / "window_02.md"
+        span_corpus.write_text("开头这一段是不算数的铺垫。\n林岸：真实证据。\n", encoding="utf-8")
+        span_manifest = build_source_manifest(None, span_corpus)
+        span_ref = str(span_corpus.resolve())
+        真实起 = span_corpus.read_text(encoding="utf-8").find("林岸：真实证据")
+        assert 真实起 > 0, "夹具要保证证据不在文件开头，否则圈错这件事造不出来"
+        misplaced = {
+            "items": [{
+                "item_id": "corpus:1", "text": "林岸：真实证据。",
+                "section": "closing", "source_ref": span_ref,
+                "source_span": [0, 8],          # ← 圈在铺垫那一段上，长度合法、不越界
+                "candidate_kind": "fact", "evidence": "林岸：真实证据",
+            }],
+            "source_accounting": [{"source_ref": span_ref,
+                                   "candidate_item_ids": ["corpus:1"]}],
+        }
+        items15, iss15 = validate_candidate_result(misplaced, span_manifest)
+        mis = [i for i in iss15 if i.code == "SOURCE_SPAN_MISPLACED"]
+        assert mis, f"span 圈错必须报专门的码：{[i.code for i in iss15]}"
+        assert not any(i.code == "EVIDENCE_NOT_VERBATIM" for i in iss15), \
+            "⚠ 变异③：圈错区间不许再报成「证据不能逐字回指」——那句话把人指向转义"
+        assert "区间" in mis[0].message, f"报错要点名是区间的问题：{mis[0].message}"
+        assert f"[{真实起}, {真实起 + len('林岸：真实证据')}]" in mis[0].message, \
+            f"报错必须给出 evidence 的真实位置：{mis[0].message}"
+        assert "[0, 8]" in mis[0].message, f"报错也要复述它声明的那个区间：{mis[0].message}"
+        assert not items15, "⚠ 不放宽：区间圈错照样过不了闸，不许进候选池"
+
+        # 15b.【靶心三·防过度纠正】evidence 压根不在原文里 → 仍报 EVIDENCE_NOT_VERBATIM
+        escaped = {
+            "items": [dict(misplaced["items"][0],
+                           # 弯引号换成 HTML 转义，整份原文里一处都找不到
+                           evidence="林岸：&quot;真实证据&quot;")],
+            "source_accounting": misplaced["source_accounting"],
+        }
+        items15b, iss15b = validate_candidate_result(escaped, span_manifest)
+        assert any(i.code == "EVIDENCE_NOT_VERBATIM" for i in iss15b), \
+            f"evidence 真被改过时必须仍报老码：{[i.code for i in iss15b]}"
+        assert not any(i.code == "SOURCE_SPAN_MISPLACED" for i in iss15b), \
+            "⚠ 变异③反向：这不是区间的问题，报成 MISPLACED 等于把这张卡修的东西抹平"
+        assert not items15b
+
+        # 15c.【防连坐】区间圈对、evidence 逐字对 → 两个码都不许出现
+        right = {
+            "items": [dict(misplaced["items"][0],
+                           source_span=[真实起, 真实起 + len("林岸：真实证据")])],
+            "source_accounting": misplaced["source_accounting"],
+        }
+        items15c, iss15c = validate_candidate_result(right, span_manifest)
+        assert items15c and not [i for i in iss15c if i.severity == "blocking"], \
+            f"圈对了就该真的通过（不然上面的红可能只是逢 evidence 必红）：{[i.code for i in iss15c]}"
+
+        # 15d.【多处出现：列全，且明说不替它选】——这是岔口 2 的死结，报错里要说出来
+        dup = root / "window_03.md"
+        dup.write_text("林岸：真实证据。\n中间隔一段。\n林岸：真实证据。\n", encoding="utf-8")
+        dup_manifest = build_source_manifest(None, dup)
+        dup_ref = str(dup.resolve())
+        dup_payload = {
+            "items": [dict(misplaced["items"][0], source_ref=dup_ref,
+                           source_span=[8, 14])],   # 圈在「中间隔一段」上
+            "source_accounting": [{"source_ref": dup_ref,
+                                   "candidate_item_ids": ["corpus:1"]}],
+        }
+        _, iss15d = validate_candidate_result(dup_payload, dup_manifest)
+        d15 = [i for i in iss15d if i.code == "SOURCE_SPAN_MISPLACED"]
+        assert d15, f"多处出现时也该是区间的问题：{[i.code for i in iss15d]}"
+        assert d15[0].message.count("[") >= 3, \
+            f"出现两处就要把两处都列出来（＋声明的那处，共 3 个区间）：{d15[0].message}"
+        assert "不替你选" in d15[0].message, \
+            "⚠ 出现多处时该算哪一处没有答案，报错必须明说校验器不替它选"
+
+        # 15e.【空 evidence 不许落进「区间圈错」那一档】——审核轮捞出来的回归。
+        #     `"".find` 处处命中，不挡的话「压根没给 evidence」会被报成
+        #     「你的 evidence 逐字没问题，去改区间」＋ [0,0]、[1,1]… 一串空区间：
+        #     ⚠ 这正是本卡要消灭的形状，且比分档之前更误导。
+        for 空值 in ("", None):
+            空条目 = dict(misplaced["items"][0])
+            if 空值 is None:
+                空条目.pop("evidence")
+            else:
+                空条目["evidence"] = 空值
+            items15e, iss15e = validate_candidate_result(
+                {"items": [空条目],
+                 "source_accounting": misplaced["source_accounting"]}, span_manifest)
+            assert not any(i.code == "SOURCE_SPAN_MISPLACED" for i in iss15e), \
+                f"⚠ 没给 evidence 不是「区间圈错」，不许报成那一档（evidence={空值!r}）"
+            e15 = [i for i in iss15e if i.code == "EVIDENCE_NOT_VERBATIM"]
+            assert e15, f"没给 evidence 必须照旧 blocking：{[i.code for i in iss15e]}"
+            assert "逐字没问题" not in e15[0].message, \
+                f"⚠ 不许对着一条空 evidence 说它「逐字没问题」：{e15[0].message}"
+            assert not items15e, "⚠ 不放宽：没给 evidence 照样进不了候选池"
+
+    print("selftest ok（15组断言：旧候选兼容 + 来源回指 + 结构契约 + 零依赖任务包 + "
           "任务包自足（kind 枚举／必填子字段／交代表键名都从同一张表渲染进三份文件，"
           "⚠ 只是靶心一的机械代理，不追认「不读源码的模型能填对」那一格）+ "
           "键名填错指名报错且不猜 + 悬空 ID 点名但不报成「没交代」+ "
-          "未知 kind 出 warning 说明「这条没被结构检查」+ 三道结构检查变异各自转红）")
+          "未知 kind 出 warning 说明「这条没被结构检查」+ 三道结构检查变异各自转红 + "
+          "报错分档：span 圈错报 SOURCE_SPAN_MISPLACED 并给出真实位置、"
+          "evidence 真被改过仍报 EVIDENCE_NOT_VERBATIM，两边互不串码，"
+          "空 evidence 不落进「区间圈错」那一档）")
 
 
 if __name__ == "__main__":

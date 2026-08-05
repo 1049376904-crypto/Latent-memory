@@ -1866,9 +1866,40 @@ def save_state(out_dir, state):
     return p
 
 
+def assert_version_keys_consistent(state):
+    """`section_versions` 里同一个版本的 `id` 与 `version_id` 必须相等。
+
+    ⚠ **这个形态我们自己产生不了**：`_section_version_dict` 是从同一个值写出这两个键的。
+    所以两者不等只有一个来源——**这个文件被手工编辑过**。
+    2026.08.05 拿到的那份真机 state 就是实例：
+    `('opening:confirmed_v1', 'opening:6a6e7b2054d3')`，四节都是这个样子。
+    它的坏法**不报错**：决定层指向哈希、渲染侧查 `id`，于是那四节被当成没确认、
+    **悄悄从预览里消失**，一路走到 ship 才以别的错误码浮出来（那次是 timeline 指针）。
+    ⚠ 这里刻意**只拦不修**——手改的意图我们猜不到，替他选一个键就是替他改人格。
+    """
+    bad = []
+    for section, versions in (state.get("section_versions") or {}).items():
+        for version in versions:
+            if not isinstance(version, dict) or "id" not in version:
+                continue
+            canonical = version.get("version_id", version["id"])
+            if version["id"] != canonical:
+                bad.append(f"{section}：id={version['id']} / version_id={canonical}")
+    if bad:
+        raise SystemExit(
+            "不继续：init_state.json 的节版本表里，同一个版本的 id 与 version_id 不一致——"
+            + "；".join(bad)
+            + "。这个形态本工具产生不了，只可能来自手工编辑。"
+              "⚠ 别在这份状态上继续跑：渲染侧按 id 匹配，对不上的节会被整节丢掉，"
+              "而且**不报错**。出口：换一个干净的 --out 目录从 --step inspect 重跑；"
+              "已经出货的人格文件是好的，直接改那份 md 也行。")
+
+
 def load_state(out_dir):
     p = Path(out_dir) / "init_state.json"
-    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    state = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    assert_version_keys_consistent(state)
+    return state
 
 
 # ---------- selftest（合成数据，全部虚构） ----------
@@ -3289,6 +3320,52 @@ def _selftest():
     unconfirmed["section_decisions"].pop("closing")
     assert "SECTION_UNCONFIRMED" in {
         issue.code for issue in shipping_issues(unconfirmed, preview["persona_markdown"], None)}
+    # 变异靶心（2026.08.05）：拦截**必须自带出口**，否则被拦的人会去手动绕过。
+    #   变异一：把 SECTION_UNCONFIRMED 的出口句删掉 → 这条红。
+    #   变异二：把 apply_section_choice 的报错改回只说"未知节版本" → 下面那条红。
+    unconfirmed_msg = next(
+        issue.message for issue in shipping_issues(unconfirmed, preview["persona_markdown"], None)
+        if issue.code == "SECTION_UNCONFIRMED")
+    assert "--section-decisions-json" in unconfirmed_msg and "init_state.json" in unconfirmed_msg, \
+        f"SECTION_UNCONFIRMED 必须自带出口与「别手改状态」的提醒：{unconfirmed_msg}"
+    try:
+        apply_section_decisions(v2_state, {"closing": "closing:不存在的版本"})
+    except ValueError as exc:
+        assert "choose-sections" in str(exc) and "closing:" in str(exc), \
+            f"未知节版本要说清合法 id 从哪儿抄：{exc}"
+    else:
+        raise AssertionError("未知节版本必须报错")
+
+    # 变异靶心（2026.08.05，真机 state 打回来的）：**已确认但版本 id 找不到**
+    # 不能跟"没确认"共用一句话——那次的代价是用户据此判断确认没生效、去改了源码。
+    stale_state = dict(v2_state)
+    stale_state["section_decisions"] = dict(v2_state["section_decisions"])
+    stale_state["section_decisions"]["closing"] = {
+        "section": "closing", "version_id": "closing:confirmed_v1", "status": "confirmed"}
+    stale_codes = {issue.code for issue in
+                   shipping_issues(stale_state, preview["persona_markdown"], None)}
+    assert "SECTION_VERSION_STALE" in stale_codes, "已确认但版本查不到要有独立错误码"
+    assert "SECTION_UNCONFIRMED" not in stale_codes, \
+        "已确认的节不许再被说成「未确认」——那句话把人指向了错的出口"
+    stale_preview = preview_payload(stale_state)
+    assert stale_preview["stale_versions"] == ["closing"], "预览要单列这类节，别混进未确认里"
+    assert "closing" in stale_preview["unresolved"], "它确实渲染不出来，仍要算未解决"
+
+    # 变异靶心（同上）：同一个版本 id != version_id 只可能来自手改，必须当场拦。
+    handmade = dict(v2_state)
+    handmade["section_versions"] = dict(v2_state["section_versions"])
+    handmade["section_versions"]["closing"] = [
+        dict(version, id="closing:confirmed_v1")
+        for version in v2_state["section_versions"]["closing"]]
+    try:
+        assert_version_keys_consistent(handmade)
+    except SystemExit as exc:
+        assert "手工编辑" in str(exc) and "--step inspect" in str(exc), \
+            f"双键不一致要说清来源与出口：{exc}"
+    else:
+        raise AssertionError("id 与 version_id 不一致必须拦住")
+    assert_version_keys_consistent(v2_state)      # 正常状态不许误伤
+
     assert "TIMELINE_POINTER_MISSING" in {
         issue.code for issue in shipping_issues(v2_state, preview["persona_markdown"].replace(
             "timeline", "history"), None)}
@@ -3798,7 +3875,7 @@ def _selftest():
         assert _ta("# 它是谁") is None, "「它」在任何一档都不许出现"
         assert _ta("# 我是谁") is None, "不是用户那节的标题句式，读不出来就该是 None"
 
-    print("selftest ok（66项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
+    print("selftest ok（69项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
           "归属句式 / 默认值不预支历史 / 协议层不问用户 / 导出纪律 / 渲染顺序 / "
           "人称锚死一套 / 用户只有一种称呼形态 / 昵称档不被静默吃掉 / 中性档不丢主语 / 人称从语料读出来 / 中性写法不许漏 / 语料侧判定不许猜 / 全文零它 / 称呼不重复拼接 / 关系状态归开篇 / "
           "答案读回不静默丢 / 任务书不泄漏进人格文件 / 长字面量不崩 / 未决草稿不蒸发 / "
@@ -3822,7 +3899,12 @@ def _selftest():
           "零材料 state 走中性写法、这条恒真） / "
           "mcp-config.json 里三个路径都是绝对的（⚠ 只查 server 那一条在缺陷面前全绿） / "
           "归节题的说明按块的类型给（标题块要说清「选哪一节都不改变出货正文」，"
-          "⚠ 正文块不许被这么说，那是反着错））")
+          "⚠ 正文块不许被这么说，那是反着错） / "
+          "拦截自带出口（SECTION_UNCONFIRMED 说清 --section-decisions-json 且提醒别手改状态、"
+          "未知节版本列出该节合法 id）＋「已确认但版本 id 查不到」有独立错误码 "
+          "SECTION_VERSION_STALE、不再被说成「未确认」＋同一版本 id != version_id "
+          "当场拦（⚠ 这三条是 2026.08.05 真机 state 打回来的：那次报错说的是现象不是处境，"
+          "用户据此判断确认没生效、去改了源码））")
 
 
 def _rebuild(state):
@@ -4305,6 +4387,7 @@ def preview_payload(state):
     """完整预览只能机械拼接已选节版本，不在预览阶段再次改写。"""
     lines = ["# 核心人格", ""]
     unresolved = []
+    stale = []
     source_summary = {}
     # 节标题的人称跟正文同源一份（见 persona_pronouns）：原来这里写死 None，
     # 于是写「她」的用户拿到的标题是中性的「对方是谁」——同一份文件里两种称呼。
@@ -4319,7 +4402,10 @@ def preview_payload(state):
         selected = next((version for version in versions
                          if version["id"] == decision.get("version_id")), None)
         if selected is None:
+            # 确认过、但版本 id 找不到：仍然渲染不出来（所以照旧进 unresolved），
+            # 但**成因和出口都跟"没确认"不同**，单独列一份给 CLI 说清楚。
             unresolved.append(section)
+            stale.append(section)
             continue
         source_summary[section] = selected.get("source_summary", [])
         if selected.get("markdown", "").strip():
@@ -4334,9 +4420,50 @@ def preview_payload(state):
         "preview_hash": hashlib.sha256(markdown.encode("utf-8")).hexdigest(),
         "source_summary": source_summary,
         "unresolved": unresolved,
+        # 已确认但版本 id 找不到的那些：是 unresolved 的子集，单独列出来是为了
+        # 让 CLI 能说对话——同一句“未确认”曾经把人指向了改源码（见 stale_section_versions）
+        "stale_versions": stale,
         "warnings": warnings,
         "return_targets": [section for section, _label in SECTION_ORDER],
     }
+
+
+STALE_VERSION_EXIT = (
+    "（出口：--step choose-sections --json 取该节当前的版本 id，再重新确认一次。"
+    "⚠ 这种情况几乎只有两个来源：init_state.json 被手改过，或者版本表在确认之后"
+    "重建过——**不是「这一节没确认」**，别去重走确认以外的路）")
+
+
+def stale_section_versions(state):
+    """已确认、但记下的版本 id 在当前版本表里找不到的节。
+
+    ⚠ **这跟"这一节没确认"是两回事，不能共用一句报错**（2026.08.05 外部实测的代价）：
+    那位用户的四节**确认过**，预览却报"未确认节"，于是他判断确认步骤没生效、
+    去翻源码、改了两行匹配逻辑——**报错说的是现象，不是他的处境**，
+    而现象那句恰好把人指向了错的方向。
+    """
+    stale = []
+    for section, _label in SECTION_ORDER:
+        decision = state.get("section_decisions", {}).get(section) or {}
+        if decision.get("status") != "confirmed":
+            continue          # 那是 SECTION_UNCONFIRMED 的事，不是这里
+        versions = state.get("section_versions", {}).get(section, [])
+        if not any(version.get("id") == decision.get("version_id")
+                   for version in versions):
+            stale.append(section)
+    return stale
+
+
+def stale_section_version_issues(state):
+    from persona_compiler import CompileIssue
+
+    stale = stale_section_versions(state)
+    if not stale:
+        return []
+    return [CompileIssue(
+        "SECTION_VERSION_STALE", "blocking",
+        "以下人格节已确认，但它记下的版本 id 在当前版本表里不存在，"
+        "所以渲染时会被整节丢掉：" + "、".join(stale) + STALE_VERSION_EXIT)]
 
 
 def shipping_issues(state, persona_markdown, manifest):
@@ -4353,9 +4480,19 @@ def shipping_issues(state, persona_markdown, manifest):
     missing_sections = [section for section, _label in SECTION_ORDER
                         if decisions.get(section, {}).get("status") != "confirmed"]
     if missing_sections:
+        # 出口写进 message 里（同 TASK_DIRECTIVE_REMAINS 的先例）：这条原来只说"哪几节
+        # 没确认"，不说怎么才算确认。2026.08.04 外部实测的代价——用户被拦在这里，
+        # 报错没给方向，于是 `cp persona_preview.md memory/persona.md` 手动绕过**整道闸**
+        # 出货了（连带跳过 TIMELINE_POINTER_MISSING，而那正是他下一步要验的写回层）。
+        # **拦得对但不给出路，人会翻墙。**
         issues.append(CompileIssue(
             "SECTION_UNCONFIRMED", "blocking",
-            "以下人格节尚未确认：" + "、".join(missing_sections)))
+            "以下人格节尚未确认：" + "、".join(missing_sections)
+            + "（出口：--step choose-sections --json 拿到每节的版本 id，再 "
+              "--step choose-sections --section-decisions-json '{\"节名\": \"版本id\"}' "
+              "提交；⚠ 不要去手改 init_state.json，出货闸认的是 section_decisions，"
+              "手写 section_versions 不产生任何确认）"))
+    issues.extend(stale_section_version_issues(state))
     if any(token in persona_markdown for token in TASK_DIRECTIVE_TOKENS):
         issues.append(CompileIssue(
             "TASK_DIRECTIVE_REMAINS", "blocking",
@@ -4770,9 +4907,16 @@ def _step_preview_v2(args, state):
         print(json.dumps(payload, ensure_ascii=False))
     else:
         print(payload["persona_markdown"])
-        if payload["unresolved"]:
-            print("未确认节：" + "、".join(payload["unresolved"]))
-        else:
+        # ⚠ 这两行分开印：把 stale 的节混进「未确认节」，说的就是**现象而不是处境**，
+        # 而那句话曾经把一位用户指向了「确认步骤没生效」→ 翻源码 → 改匹配逻辑。
+        stale = payload.get("stale_versions") or []
+        if [section for section in payload["unresolved"] if section not in stale]:
+            print("未确认节：" + "、".join(
+                section for section in payload["unresolved"] if section not in stale))
+        if stale:
+            print("以下节**已确认**，但它记的版本 id 在当前版本表里找不到，"
+                  "所以渲染时被整节丢掉了：" + "、".join(stale) + STALE_VERSION_EXIT)
+        if not payload["unresolved"]:
             print("预览已固定。下一步：--step route，再 --step ship。")
 
 

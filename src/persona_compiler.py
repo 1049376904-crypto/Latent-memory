@@ -587,7 +587,15 @@ def apply_section_choice(state, section, version_id):
     version = next((candidate for candidate in versions
                     if candidate.version_id == version_id), None)
     if version is None:
-        raise ValueError(f"未知节版本：{section}/{version_id}")
+        # 出口写进报错里：版本 id 是内容哈希（`section:` ＋ sha256 前 12 位），
+        # **人不可能猜对，只能从上一条命令的输出里抄**——报错却不说抄哪儿，
+        # 2026.08.04 外部实测就卡在这里（`memory_init.py` 那两条同形的报错一起改的）。
+        known = "、".join(candidate.version_id for candidate in versions) or "（这一节还没有任何版本）"
+        raise ValueError(
+            f"未知节版本：{section}/{version_id}。这一节当前的合法版本是：{known}"
+            "（出口：--step choose-sections --json，从 sections[].section_versions[].id "
+            "里原样抄；⚠ 版本 id 是内容哈希，改一次来源项就会变，别沿用旧的、"
+            "更别去手改 init_state.json）")
     selected = set(version.item_ids)
     items = tuple(replace(item, confirmed=(item.item_id in selected))
                   if item.section == section else item for item in state.items)

@@ -53,11 +53,15 @@ import re
 import tempfile
 import time
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timezone as tz
 from pathlib import Path
 
 # 复用 chunking 实验里已验证的切块（同目录模块，import 不触发它的 CLI）
 from chunking_experiment import chunk_heading, bigram_counts, cosine
+# 时区语义（任务卡"写回时区与跨日归窗"）：所有"今天是几号"的判断都走 TimeContext，
+# 这个文件里不许再出现裸的 datetime.fromtimestamp(...) 去算用户自然日
+from time_context import (TimeContext, record_time_marker, parse_record_time_marker,
+                          tzdb_available)
 # 真 embedding 走可插拔提供方层：本地 fastembed／云端 HTTP 都从这里进来，
 # 检索层不认识任何一家（同 draft_extraction.llm_call 的口子）
 from embedding_provider import (VectorCache, embed_with_cache, resolve_provider,
@@ -993,10 +997,43 @@ def infer_date_order(texts):
     return None
 
 
+_SELF_RECORD_HEAD_RE = re.compile(r"^#{1,6}\s*(20\d{2})-(\d{1,2})-(\d{1,2})\s*记\s*$",
+                                  re.MULTILINE)
+
+
+def record_level_date(chunk_text):
+    """服务器自己写下的那种块 → (epoch, 'YYYY-MM-DD', 来源) 或 None。
+
+    两种形态，都**只有 append_record 会产出**：
+      `record_iso` —— 记录级精确时刻标记（带 UTC offset 的 ISO 8601），2026.08.04
+        那张卡之后写的记录都有；
+      `record_head` —— 只有 `## YYYY-MM-DD 记` 这个 H2 的老记录（那张卡之前写的），
+        年月日仍是真的，只是没有时刻。
+
+    ⚠ **这个函数的边界就是"记录级日期优先于文件名"这条规则的边界**：两种形态都是
+    我们自己的出货格式，所以抬高它们的优先级碰不到用户导入的历史语料——那些没有
+    这两种标记，仍然走"文件名最可信"的老顺序。**不许放宽成"正文里有日期就算"**，
+    那会把全库的优先级翻过来（任务卡明写：不能全库翻转）。"""
+    rec = parse_record_time_marker(chunk_text)
+    if rec is not None:
+        return rec[0], rec[1], "record_iso"
+    m = _SELF_RECORD_HEAD_RE.search(chunk_text or "")
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        ts = _ymd_ts(y, mo, d)
+        if ts is not None:
+            return ts, f"{y:04d}-{mo:02d}-{d:02d}", "record_head"
+    return None
+
+
 def parse_chunk_timestamp(filename, chunk_text, fallback_year, date_order=None):
     """解析 chunk 时间戳 → (epoch秒, 来源) 或 (None, None)。
 
     来源按可信度排优先级：
+      0. **服务器自己写下的记录级日期**（`record_iso`／`record_head`，见
+         record_level_date）——2026.08.04 那张卡加的一档，**只对自生成写回块生效**。
+         排在文件名前面的理由是相邻缺口那一条：显式复用昨天的窗口文件时，文件名
+         是昨天、记录是今天，而文件名优先会把新记录的日期压回旧日
       1. filename——按日期命名的语料，带年份，最可信
       2. chunk 开头几行里的完整日期（"chunk_head"）——真实 cloud window 语料文件名
          不带日期（window_36_xxx.md 这类），完整日期写在标题行，且分两种历史格式：
@@ -1012,6 +1049,9 @@ def parse_chunk_timestamp(filename, chunk_text, fallback_year, date_order=None):
     误差，接受：语料按时间推进命名，同文件跨年罕见）。
     都拿不到返回 (None, None)，由调用方兜底（load_corpus 先试文件级日期、再试同
     窗口号的邻层文件，最后退 mtime）。"""
+    rec = record_level_date(chunk_text)
+    if rec is not None:
+        return rec[0], rec[2]
     m = _DATE_FULL_RE.search(filename)
     if m:
         ts = _ymd_ts(int(m.group(1)), int(m.group(2)), int(m.group(3)))
@@ -1043,6 +1083,25 @@ def parse_chunk_timestamp(filename, chunk_text, fallback_year, date_order=None):
     return None, None
 
 
+def _local_date_of(chunk_text, ts, ts_source):
+    """块 → 展示用自然日 `YYYY-MM-DD`，拿不到真实日期依据就 None。
+
+    **为什么日期要跟 epoch 分开存**（任务卡"写回时区与跨日归窗"第二节）：epoch 只
+    负责排序，而"这条记忆是哪一天的事"是**记忆所有者时区里的一个日历日**，跟读它的
+    那个进程在哪个时区无关。只留 epoch 的话，同一条记忆在 UTC 的服务器上被格式化
+    出来就少一天——事故现场召回块标 `[2026.08.03]` 就是这么来的。
+
+    ⚠ mtime 档一律 None：那一档本来就没有日期依据（召回层标"时间未知"）。"""
+    rec = record_level_date(chunk_text)
+    if rec is not None:
+        return rec[1]                       # 记录自带的自然日，不经过任何时区换算
+    if ts is None or ts_source == "mtime":
+        return None
+    # 其余几档的 epoch 都是 _ymd_ts 按本地零点造出来的，原样格式化回去就是当初
+    # 解析出的那个日历日（不是"按宿主时区重新算一遍"，是回读同一个数）
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+
+
 def timeline_chunks(text, filename, mtime, date_order=None):
     """单个 timeline md 文件 → [(chunk_text, meta)]。切块+时间戳解析的公共段：
     load_corpus 和 memory_import 的 markdown 翻译器共用，逻辑只此一份不复制。"""
@@ -1069,7 +1128,8 @@ def timeline_chunks(text, filename, mtime, date_order=None):
             # 全目录 mtime 刷成同一时刻，基本没有排序信号，timestamp_source 标出成色
             ts, ts_source = mtime, "mtime"
         out.append((chunk, {"source": filename, "heading": heading.lstrip("# ").strip(),
-                            "chunk_index": i, "timestamp": ts, "timestamp_source": ts_source}))
+                            "chunk_index": i, "timestamp": ts, "timestamp_source": ts_source,
+                            "local_date": _local_date_of(chunk, ts, ts_source)}))
     return out
 
 
@@ -1132,15 +1192,23 @@ def load_corpus(corpus_dir, embed=False, recursive=True, provider=None, cache_pa
     file_info = {}
     for p in files:
         text, mtime = raw[p]
-        ts, _ = parse_chunk_timestamp(p.name, "\n".join(_head_lines(text)),
-                                      datetime.fromtimestamp(mtime).year, date_order)
+        head = "\n".join(_head_lines(text))
+        ts, ts_source = parse_chunk_timestamp(p.name, head,
+                                              datetime.fromtimestamp(mtime).year, date_order)
+        # 自然日跟着 epoch 一起在这里定死：file_ts 可能是**精确时刻**（自生成写回块
+        # 的 record_iso 标记），不再是"某日本地零点"，所以下游不能拿它反格式化出日期
         file_info[p] = {"text": text, "mtime": mtime, "file_ts": ts,
+                        "file_date": _local_date_of(head, ts, ts_source),
                         "window": parse_window_no(p.name), "layer": layer_of(p)}
-    # 窗口号 → 该窗已知的日期（同一窗口号的不同层共享一次会话，取先解析出的那个）
-    window_ts = {}
+    # 窗口号 → 该窗已知的时间戳与自然日（同一窗口号的不同层共享一次会话，取先解析
+    # 出的那个）。**两个数一起借，且必须来自同一个文件**：epoch 管排序，自然日管
+    # "这是哪天的事"，拆开借就会出现"同一窗两个日期"
+    window_ts, window_date = {}, {}
     for info in file_info.values():
         if info["window"] is not None and info["file_ts"] is not None:
-            window_ts.setdefault(info["window"], info["file_ts"])
+            if info["window"] not in window_ts:
+                window_ts[info["window"]] = info["file_ts"]
+                window_date[info["window"]] = info["file_date"]
 
     for p in files:
         info = file_info[p]
@@ -1150,6 +1218,12 @@ def load_corpus(corpus_dir, embed=False, recursive=True, provider=None, cache_pa
                 borrowed = window_ts.get(info["window"])
                 if borrowed is not None:
                     meta["timestamp"], meta["timestamp_source"] = borrowed, "window_sibling"
+                    # 日期跟着一起借：借的是"同一次会话"这个依据，不是只借个排序位。
+                    # ⚠ **借的是兄弟文件定死的那个自然日，不是把 epoch 在这里格式化
+                    # 一遍**——兄弟是自生成写回块时，borrowed 是带 offset 的精确时刻，
+                    # 在这里 fromtimestamp 一次就变回"读它的这个进程所在时区"的日期，
+                    # UTC 的服务器上东八区凌晨那条又少一天（正是这张卡要杀的那个形状）
+                    meta["local_date"] = window_date.get(info["window"])
             index.add(chunk, meta)
     # 推断结论挂在库上，**让它可见**：出了问题能一眼看出"这份语料被按哪种顺序解的"，
     # 而不是只能从时间戳倒推。None＝没找到决定性证据，那些歧义日期没被采信
@@ -1159,7 +1233,8 @@ def load_corpus(corpus_dir, embed=False, recursive=True, provider=None, cache_pa
 
 # ---------- 写回：记忆库正文层的笔（任务卡"记忆写回与权重持久化"） ----------
 
-def append_record(corpus_dir, text, current_state, window=None, now=None):
+def append_record(corpus_dir, text, current_state, window=None, now=None,
+                  time_context=None):
     """把"刚发生的值得记的事"落成 timeline 记录 → (path, chunk_text, meta)。
 
     这是记忆库自己生长的那半支笔（thread 是会话状态层，这里是正文层）。
@@ -1174,14 +1249,26 @@ def append_record(corpus_dir, text, current_state, window=None, now=None):
         自己写的文件没理由掉 mtime 兜底；
       同一天的写回进同一个窗口文件，跨天开新窗口——窗口号取语料现有最大值 +1，
         "同天=同窗口"是近似（一天开两次会话会并进一个窗口），先用日期分组，
-        等真机跑出问题再升级成显式传窗口号。window 参数可显式覆盖。"""
+        等真机跑出问题再升级成显式传窗口号。window 参数可显式覆盖。
+
+    ⚠ **"同一天"是记忆所有者时区里的一天，不是宿主进程时区里的一天**（2026.08.04
+    真机事故，任务卡"写回时区与跨日归窗"）：原先这里是裸的
+    `datetime.fromtimestamp(now)`，UTC 的 VPS ＋ 东八区的用户，凌晨 00:00～07:59 的
+    写回稳定记成前一天，而错误日期同时进文件名、H1、H2、检索标签，重启后还会被
+    当成最高优先级的排序信号。`time_context` 不传时退宿主本地时区（兼容旧调用），
+    但服务端起动路径一律显式传，`--doctor` 会把"没配"报成 WARN。
+
+    每条记录同时落一行**带 UTC offset 的 ISO 8601 精确时刻**（HTML 注释，渲染后
+    不可见）：Markdown 正文只有"某日"，重启后精确写入时刻不可恢复，排序就只能从
+    "那天零点"猜；有了它，"这条写于哪个时区的什么时刻"是可核对的事实。"""
     if not (isinstance(text, str) and text.strip()):
         raise ValueError("写回内容不能为空")
     if not (isinstance(current_state, str) and current_state.strip()):
         raise ValueError("当下状态必填（病灶迁移）：这件事现在是什么状态？"
                          "不写的话，未来重读会把它当成正在发生的事")
     now = time.time() if now is None else now
-    day = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+    tc = time_context if time_context is not None else TimeContext.default()
+    day = tc.local_date(now)
     timeline = Path(corpus_dir) / "timeline"
     timeline.mkdir(parents=True, exist_ok=True)
 
@@ -1199,7 +1286,8 @@ def append_record(corpus_dir, text, current_state, window=None, now=None):
         existing = sorted(timeline.glob(f"window_{window:02d}_*.md"))
         path = existing[0] if existing else timeline / f"window_{window:02d}_{day}.md"
 
-    record = f"## {day} 记\n{text.strip()}\n当下状态：{current_state.strip()}"
+    record = (f"## {day} 记\n{record_time_marker(now, tc)}\n"
+              f"{text.strip()}\n当下状态：{current_state.strip()}")
     if path.exists():
         path.write_text(path.read_text(encoding="utf-8").rstrip() +
                         "\n\n" + record + "\n", encoding="utf-8")
@@ -1219,7 +1307,10 @@ def append_record(corpus_dir, text, current_state, window=None, now=None):
     # 那种形态下内存态与文件态本来就不可能是同一块，--doctor 的孤儿撤回检查兜底。
     chunk_text = chunk_heading(path.read_text(encoding="utf-8"))[-1]
     meta = {"source": path.name, "heading": f"{day} 记", "timestamp": now,
-            "timestamp_source": "append", "window": window, "layer": "timeline"}
+            "timestamp_source": "append", "window": window, "layer": "timeline",
+            # 排序看 timestamp（epoch），展示与归窗看 local_date（用户自然日）——
+            # 两者分开是这张卡的第二节：一个数管排序，一个数管"这是哪天的事"
+            "local_date": day, "timezone": tc.name or ""}
     return path, chunk_text, meta
 
 
@@ -1922,7 +2013,11 @@ def _selftest(embed=False):
 
     # 17.【变异靶心：写回落盘可回读】append_record 是记忆库自己生长的那半支笔
     with tempfile.TemporaryDirectory() as td:
-        t0 = datetime(2026, 7, 31, 21, 0).timestamp()
+        #   ⚠ **夹具的时刻要显式绑时区**（2026.08.05 默认时区改成东八区之后返修）：
+        #   原写 `datetime(2026, 7, 31, 21, 0).timestamp()` 是**宿主本地**的 21:00，
+        #   而下面断言的是自然日——两者一旦不同源，这批断言就跟着跑它的机器变。
+        #   现在按默认时区的当天 21:00 造，宿主在哪个时区结果都一样。
+        t0 = TimeContext.default().midnight_epoch("2026-07-31") + 21 * 3600
         #   当下状态必填（病灶迁移在写入口强制，同 close_thread）
         try:
             append_record(td, "她说了一件重要的事。", "", now=t0)
@@ -1974,6 +2069,74 @@ def _selftest(embed=False):
         assert all("措辞不太对" not in x["text"]
                    for x in idxB.retrieve("那条临时记录写了什么", topN=5)), \
             "被撤回的旧说法重启后不许再被召回——'撤回成功'不许只活一个进程"
+
+    # 18.【跨时区归窗·靶心】（2026.08.04 手机 Connector 真机事故，任务卡
+    #    「写回时区与跨日归窗」）：**"今天是几号"必须按记忆所有者的时区算，不是按
+    #    宿主进程的**。事故现场是 UTC 的 VPS ＋ 东八区的用户，凌晨 00:00～07:59 写下的
+    #    记忆稳定被记成前一天，且错误日期同时进文件名、H1、H2、检索标签，重启后又
+    #    被 parse_chunk_timestamp 当成最高优先级的持久化排序信号。
+    #    变异：把 append_record 里的 `tc.local_date(now)` 改回
+    #    `datetime.fromtimestamp(now).strftime(...)` → 下面这批在非东八区的机器上全红。
+    east8 = "Asia/Shanghai" if tzdb_available() else "UTC+08:00"   # 采集条件见 time_context
+    with tempfile.TemporaryDirectory() as td:
+        sh, utc = TimeContext(east8), TimeContext("UTC")
+        #   固定 epoch：2026-08-03 18:05:00 UTC ＝ 东八区 08-04 02:05
+        epoch = datetime(2026, 8, 3, 18, 5, 0, tzinfo=tz.utc).timestamp()
+        p, chunk, meta = append_record(td, "凌晨两点记下的一件事。", "记完了。",
+                                       now=epoch, time_context=sh)
+        assert p.name == "window_01_2026-08-04.md", \
+            f"东八区的凌晨该记成 08-04，实际 {p.name}——这就是那次真机事故本身"
+        assert meta["local_date"] == "2026-08-04" and meta["timezone"] == east8
+        assert "## 2026-08-04 记" in chunk, f"H2 也得是用户自然日：{chunk[:40]}"
+        #   同一个时刻，UTC 的用户该记成 08-03：这个数不是常量，是配置的函数
+        with tempfile.TemporaryDirectory() as td_u:
+            pu, _, mu = append_record(td_u, "同一时刻，另一个时区的用户。", "记完了。",
+                                      now=epoch, time_context=utc)
+            assert pu.name == "window_01_2026-08-03.md" and mu["local_date"] == "2026-08-03"
+        #   自然日边界：东八区 23:59 与次日 00:00 分属相邻两个窗口，中间没有别的规则
+        with tempfile.TemporaryDirectory() as td_b:
+            before = datetime(2026, 8, 3, 15, 59, 0, tzinfo=tz.utc).timestamp()   # 东八区 23:59
+            after = datetime(2026, 8, 3, 16, 0, 0, tzinfo=tz.utc).timestamp()     # 东八区 00:00
+            pb, _, mb = append_record(td_b, "睡前那条。", "睡了。", now=before, time_context=sh)
+            pa, _, ma = append_record(td_b, "刚过零点那条。", "还没睡。", now=after, time_context=sh)
+            assert mb["window"] == 1 and ma["window"] == 2, \
+                f"跨自然日该开新窗口：{mb['window']} → {ma['window']}"
+            assert pb.name.endswith("2026-08-03.md") and pa.name.endswith("2026-08-04.md")
+        #  【当场态＝重启态】落盘后重新解析出来的日期，必须还是那个用户自然日——
+        #   宿主在哪个时区都一样（记录级 ISO 标记带 offset，不靠环境变量还原）
+        rt18 = load_corpus(td)
+        m18 = next(m for m in rt18.meta if m["source"] == p.name)
+        assert m18["timestamp_source"] == "record_iso", \
+            f"自生成写回块该走记录级精确时刻，实际 {m18['timestamp_source']}"
+        assert m18["local_date"] == "2026-08-04" and abs(m18["timestamp"] - epoch) < 1
+        #  【显式窗口跨日·相邻缺口】显式复用昨天的窗口文件时，新记录仍是自己的日期，
+        #   不被"文件名日期优先"压回去（只改 UTC 偏移会留下同一失效形态的第二个入口）
+        next_day = epoch + 86400
+        _, chunk2, meta2 = append_record(td, "第二天又往同一个窗口记了一条。", "继续。",
+                                         now=next_day, window=1, time_context=sh)
+        assert meta2["local_date"] == "2026-08-05"
+        rt18b = load_corpus(td)
+        m18b = next(m for m, c in zip(rt18b.meta, rt18b.chunks) if "第二天又往同一个窗口" in c)
+        assert m18b["local_date"] == "2026-08-05", \
+            f"显式窗口跨日后，记录仍该保留自己的日期，实际 {m18b['local_date']}"
+        #  【同窗兄弟层借日期】index 层没有自己的日期依据（退 mtime），跟 timeline
+        #   借同一次会话的时间戳——**日期要借兄弟定死的那个自然日**。把它改回
+        #   `datetime.fromtimestamp(borrowed)` → 在非东八区的机器上这条转红：兄弟的
+        #   record_iso 是精确时刻，反格式化一次就落回宿主时区的日历日，同一窗两个日期
+        idx_dir = Path(td, "index")
+        idx_dir.mkdir(exist_ok=True)
+        Path(idx_dir, "window_01.md").write_text(
+            "# 这一窗的摘要\n\n## 说了什么\n摘要正文。\n", encoding="utf-8")
+        m18d = next(m for m in load_corpus(td).meta if m["layer"] == "index")
+        assert m18d["timestamp_source"] == "window_sibling", m18d["timestamp_source"]
+        assert m18d["local_date"] == "2026-08-04", \
+            f"兄弟层该借到同一个自然日，实际 {m18d['local_date']}——同一窗两个日期就是事故原样复发"
+        #   ⚠ 历史/导入语料不跟着翻转：没有记录级标记的块，文件名仍然最可信
+        Path(td, "timeline", "window_09_2026-07-01.md").write_text(
+            "# 第9个窗口 · 2026-07-01\n\n## 别处导来的一段\n正文。\n", encoding="utf-8")
+        m18c = next(m for m in load_corpus(td).meta if m["source"].startswith("window_09"))
+        assert m18c["timestamp_source"] == "filename", \
+            f"没有记录级标记的块不该被这条新规则碰到：{m18c['timestamp_source']}"
 
     print("selftest ok" + ("（含真embedding路径）" if embed else "（零依赖）"))
 

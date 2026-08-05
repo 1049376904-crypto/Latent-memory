@@ -25,9 +25,11 @@ tools/list / tools/call，字段名与错误分层均照规格），**已查证�
 
 ⚠ **剩下的边界仍然作数，别读成“都验过了”**：Claude 桌面 App 那一格仍未连过；
 超长文本怎么截断、参数容忍度这些真机问题只在一家客户端上过过手。
-另有三条与宿主拉起有关的实测事实记在《快速上手》§3c「部署形态一」：
+另有四条与宿主拉起有关的实测事实记在《快速上手》§3c「部署形态一」：
 stdio 只能由宿主拉起（手动 `nohup` 必崩）、懒加载每次调用重读语料、
-客户端的 `lastStartTime` 不能当跑通判据。
+客户端的 `lastStartTime` 不能当跑通判据、这条路上终端里不会有请求日志
+（stdio 没有端口，“HTTP 终端没收到 memory_search”在这条路上永远成立，
+不是没跑通的证据）。
 
 工具集一一对应现成能力，不新造：
   memory_search  → MemoryIndex.retrieve
@@ -60,7 +62,7 @@ import sys
 import threading
 import time
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone as _dt_tz
 from pathlib import Path
 
 # 同目录模块，import 不触发各自的 CLI
@@ -72,6 +74,9 @@ from embedding_provider import resolve_provider
 from chunking_experiment import chunk_body as _chunk_body, chunk_heading
 from session_recall import SessionRecall, format_recall_block, SELF_CHECK_FOOTER  # noqa: F401
 from session_thread import ThreadStore, close_thread
+# 记忆所有者的时区（任务卡"写回时区与跨日归窗"）：一个进程一份，stdio 与 HTTP
+# 两种起动形态共用同一个，不各自造一份换算逻辑
+from time_context import TimeContext
 
 PROTOCOL_VERSION = "2025-06-18"   # 官方规格版本，已查证
 SERVER_INFO = {"name": "memory-protocol", "title": "记忆协议", "version": "0.1.0"}
@@ -207,13 +212,18 @@ class MemoryServer:
 
     def __init__(self, index=None, thread_store=None, search_topN=5, recall_topN=3,
                  corpus_dir=None, weights_path=None, retractions_path=None,
-                 entities_path=None, loader=None):
+                 entities_path=None, loader=None, time_context=None):
         # 两个 topN 分开（2026.07.31 真实语料冒烟后拆的）：显式检索是用户/模型
         # 主动问一件事，多给几条值；开场召回每次换窗都付一遍，条数要克制
         self.index = index if index is not None else MemoryIndex().build()
         self.thread_store = thread_store if thread_store is not None else ThreadStore()
         self.search_topN = search_topN
-        self.recall = SessionRecall(self.index, topN=recall_topN, thread_store=self.thread_store)
+        # 时区：没传就退宿主本地时区（兼容旧配置），但 --doctor 会报 WARN。
+        # ⚠ 这一份要穿到三处——写回算自然日、召回标日期、检索结果标日期，
+        # 少接一处就会出现"当场对、重启错"或"文件对、标签错"的半拉形态
+        self.time_context = time_context if time_context is not None else TimeContext.default()
+        self.recall = SessionRecall(self.index, topN=recall_topN, thread_store=self.thread_store,
+                                    time_context=self.time_context)
         self.initialized = False
         # 写回与权重持久化（任务卡"记忆写回与权重持久化"）：
         # corpus_dir 是写回的落点，没配就明确拒写；weights_path 没配则权重只活在
@@ -284,7 +294,7 @@ class MemoryServer:
         # 模型拿去圆"，而这个判断只有读到内容的模型能下——机制层负责把不确定性
         # 摆到台面上，不负责替它拒绝。
         # 拼接走 annotate_block（库函数），外壳仍然只是转发+组合调用，不自己拼字符串
-        return annotate_block(format_recall_block(results),
+        return annotate_block(format_recall_block(results, time_context=self.time_context),
                               query_miss_rate(self.index, query))
 
     def _tool_session_start(self, args, now=None):
@@ -303,7 +313,7 @@ class MemoryServer:
             path, chunk_text, meta = append_record(
                 self.corpus_dir, args.get("text") or "",
                 args.get("current_state") or "",
-                window=args.get("window"), now=now)
+                window=args.get("window"), now=now, time_context=self.time_context)
         except (ValueError, OSError) as e:
             raise ToolError(str(e))
         # 写完立刻进内存索引并重建，本会话的 memory_search 就能查到——
@@ -336,7 +346,8 @@ class MemoryServer:
             try:
                 path, chunk_text, meta = append_record(
                     self.corpus_dir, f"【更正】{correction}",
-                    args.get("current_state") or "", now=now)
+                    args.get("current_state") or "", now=now,
+                    time_context=self.time_context)
             except (ValueError, OSError) as e:
                 if self.retractions_path is not None:
                     self.index.save_retractions(self.retractions_path)
@@ -895,7 +906,7 @@ _MTIME_WARN_RATIO = 0.2
 _HEADING_ONLY_WARN_RATIO = 0.5
 
 
-def diagnose(corpus_dir, threads_path=None, embed=False):
+def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None):
     """体检语料目录与接线，返回 [{level,title,detail}, ...]。**纯读，不写盘。**
 
     检的是"配好了没有"，不是"检索好不好"——后者归回归集（regression_set.py）。
@@ -1116,9 +1127,28 @@ def diagnose(corpus_dir, threads_path=None, embed=False):
                               "上面关于语料/时间戳/sidecar 的结论跟检索路线无关，照样作数；"
                               "embed 那一路通不通请直接起一次服务看。")
 
+    # 时区：**没配的那一档必须报出来**（任务卡"写回时区与跨日归窗"）。它是这份报告里
+    # 最典型的"不报错的失败"——服务照起、工具照返回成功，只是每天凌晨那几个小时写下的
+    # 记忆被记成前一天，而错误日期会进文件名、H2、检索标签和重启后的排序信号。
+    # ⚠ 报的是**实际在用的那个时区名**，不是"没配"三个字：用户要能一眼看出
+    # 服务器认的是不是他自己那个时区（事故现场服务器认的是 Etc/UTC，用户在东八区）。
+    # ⚠ **没配那一档仍然报 ⚠，哪怕默认值已经改成东八区**（2026.08.05 维护者拍板）：
+    # 默认值对东八区以外的使用者就是错的，而且照样不报错——这一格是它唯一会露头的
+    # 地方。⚠ 别把它降成 ✓：那等于让报告对着"可能不对的日期"打合格证。
+    tc = time_context if time_context is not None else TimeContext.default()
+    if tc.explicit:
+        add(OK, "时区", f"{tc.name}——自然日按这个时区的 00:00～23:59 算，"
+                        "写回、归窗、检索标签同一个口径")
+    else:
+        add(WARN, "时区", f"没配 --timezone，用的是默认值 {tc.name}（东八区）。"
+                          "你就在东八区的话这条可以不管；**不在的话现在写下的记忆"
+                          "日期是错的**，且不报错——文件名、记录标题、检索标签和重启后"
+                          "的新鲜度信号会一起错。在 MCP 配置里补一行 "
+                          "--timezone <你的 IANA 时区>（例如 Europe/Berlin）。")
+
     # 接线本身：握手 + 工具表 + 一次真检索。前面全绿也可能死在这一步，
     # 而这是唯一一处能证明"这份语料真能被查到"的检查
-    srv = MemoryServer(index=index, thread_store=ThreadStore(threads_path))
+    srv = MemoryServer(index=index, thread_store=ThreadStore(threads_path), time_context=tc)
     #    ⚠ 故意不接 weights_path：接了的话下面这次检索会把权重落盘，体检就不再只读。
     #    要改这行之前先读 selftest 第 14 项——它就是守这个的。
     hs = srv.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
@@ -2113,7 +2143,60 @@ def _selftest():
         f"CLI 入口没把 stdout 锁成 UTF-8（当前 {sys.stdout.encoding}）：" \
         "中文 Windows（cp936）下 --doctor 遇到 emoji 会 UnicodeEncodeError"
 
-    print("selftest ok（19项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层 / "
+    # 20.【时区穿到进程级·靶心】（2026.08.04 手机 Connector 真机事故，任务卡
+    #     「写回时区与跨日归窗」）。**前面 memory_retrieval／session_recall 的断言
+    #     喂的都是直接构造的 TimeContext，够不着"CLI 那个值有没有真的接上"**——
+    #     而事故现场坏的正是接线那一层（服务器压根没有这个概念）。所以这一项走
+    #     真进程，从 `--timezone` 一路断到写出来的文件名、H2 与召回标签。
+    #     四格矩阵：UTC 宿主／东八区用户 × 当场／重启。
+    from time_context import tzdb_available as _tzdb
+    east8_20 = "Asia/Shanghai" if _tzdb() else "UTC+08:00"    # 采集条件见 time_context
+    epoch20 = datetime(2026, 8, 3, 18, 5, 0, tzinfo=_dt_tz.utc).timestamp()   # 东八区 08-04 02:05
+    with tempfile.TemporaryDirectory() as td20:
+        corpus20 = _P(td20) / "corpus"
+        (corpus20 / "timeline").mkdir(parents=True)
+        srv20 = MemoryServer(index=MemoryIndex().build(), thread_store=ThreadStore(),
+                             corpus_dir=corpus20, time_context=TimeContext(east8_20))
+        r20 = srv20.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                            "params": {"name": "memory_append",
+                                       "arguments": {"text": "凌晨两点记下的一件事。",
+                                                     "current_state": "记完了。"}}},
+                           now=epoch20)
+        assert not r20["result"]["isError"], r20
+        assert "2026-08-04" in r20["result"]["content"][0]["text"], \
+            f"回执里的文件名该是用户自然日：{r20['result']['content'][0]['text']}"
+        #    a) 当场：memory_search 标的日期就是用户自然日（宿主在 UTC 也一样）
+        s20 = srv20.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                            "params": {"name": "memory_search",
+                                       "arguments": {"query": "凌晨两点记下的"}}})
+        assert "[2026.08.04" in s20["result"]["content"][0]["text"], \
+            f"当场检索的标签该是 08-04：{s20['result']['content'][0]['text']}"
+        #    b) 重启：换个新进程态的 server 从盘上重建，四处日期仍要一致
+        srv20b = MemoryServer(index=load_corpus(corpus20), thread_store=ThreadStore(),
+                              corpus_dir=corpus20, time_context=TimeContext(east8_20))
+        b20 = srv20b.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                             "params": {"name": "session_start", "arguments": {}}})
+        assert "[2026.08.04" in b20["result"]["content"][0]["text"], \
+            f"重启后的开场召回该还是 08-04：{b20['result']['content'][0]['text']}"
+        #    c) 走真进程：--timezone 非法值必须非零退出，不许静默退 UTC
+        code20, out20 = run_doctor(td20, "--corpus", "corpus", "--timezone", "Asia/Shenzhen")
+        assert code20 != 0 and "Asia/Shenzhen" in out20, \
+            f"非法时区该报错退出（静默退 UTC 就是把这张卡的缺陷留回去）：{code20} / {out20}"
+        #    d) 走真进程：没配 --timezone 时 --doctor 必须报 ⚠ 并打出实际在用的时区
+        code20b, out20b = run_doctor(td20, "--corpus", "corpus")
+        assert "⚠ 时区" in out20b and "没配 --timezone" in out20b, \
+            f"没配时区要报 ⚠，这是那次事故唯一会露头的地方：{out20b}"
+        #    ⚠ 默认值改成东八区之后（2026.08.05 拍板），这一格**不许降成 ✓**：
+        #    对东八区以外的使用者它就是错的，降成 ✓ 等于给可能错的日期发合格证
+        assert "Asia/Shanghai" in out20b or "UTC+08:00" in out20b, \
+            f"没配时也要打出实际在用的默认时区，不能只说「没配」：{out20b}"
+        assert code20b == 0, "⚠ 不算失败（能用，只是会悄悄变差），退出码仍该是 0"
+        #    e) 配了就该是 ✓ 且报出名字——用户要能一眼认出服务器认的是不是他那个时区
+        code20c, out20c = run_doctor(td20, "--corpus", "corpus", "--timezone", east8_20)
+        assert f"✓ 时区：{east8_20}" in out20c and code20c == 0, \
+            f"配了时区该报 ✓ 并写出名字：{out20c}"
+
+    print("selftest ok（20项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层 / "
           "完整链路 / stdio / UTF-8 / 写回当场可查 / 用进撑过重启 / "
           "无可靠命中明确说 / 撤回更正闭环 / 缺失率标注接线 / 实体标注接线 / "
           "部署体检只读 / 部署体检走真进程（相对路径解析开、空语料非零退出、"
@@ -2126,7 +2209,9 @@ def _selftest():
           "正常请求照旧不打，token 与请求体不进日志，刷屏上限 60 行且溢出条数补一行）"
           "）/ "
           "CLI 入口把 stdout 锁成 UTF-8（⚠ 变异要在 PYTHONIOENCODING=gbk 下跑，"
-          "默认 UTF-8 的机器上这条恒真））")
+          "默认 UTF-8 的机器上这条恒真）/ "
+          "时区穿到进程级（--timezone 一路到文件名／H2／当场检索标签／重启后开场召回，"
+          "非法名非零退出、没配报 ⚠ 且打出实际时区、配了报 ✓ 并写出名字））")
 
 
 if __name__ == "__main__":
@@ -2155,16 +2240,32 @@ if __name__ == "__main__":
                          "HTTP 的客户端（Kelivo/Operit 这类）直连用，不再需要 "
                          "supergateway 桥。非回环地址必须配 token，否则拒绝起动；"
                          "绑非回环还会多打一行 TLS 提醒——那条链路是裸 HTTP")
+    ap.add_argument("--timezone", metavar="IANA名",
+                    help="记忆所有者的时区（例如 Asia/Shanghai），也可用环境变量 "
+                         "MEMORY_TIMEZONE。自然日＝这个时区的 00:00～23:59，写回归窗、"
+                         "记录标题与检索标签同一个口径。不配就用默认值 Asia/Shanghai"
+                         "（东八区），--doctor 会报 ⚠——⚠ 不在东八区的话一定要配，"
+                         "否则写下的记忆日期会静默错一天。没有 IANA 时区数据库的机器"
+                         "（Windows 裸装）可以装 tzdata，或退而写固定偏移 UTC+08:00"
+                         "（⚠ 不懂夏令时）")
     ap.add_argument("--token",
                     help="HTTP 传输的 Bearer token（也可用环境变量 MEMORY_HTTP_TOKEN；"
                          "客户端侧填进 bearerToken/Authorization 头）")
     args = ap.parse_args()
+    # 时区一个进程一份，stdio／HTTP／--doctor 三条路共用（任务卡"写回时区与跨日归窗"）。
+    # ⚠ 非法时区名直接非零退出：静默退 UTC 就是把这张卡修的缺陷原样留回去
+    tz_name = args.timezone or os.environ.get("MEMORY_TIMEZONE") or ""
+    try:
+        time_ctx = TimeContext(tz_name.strip()) if tz_name.strip() else TimeContext.default()
+    except ValueError as e:
+        ap.error(str(e))
     if args.selftest:
         _selftest()
     elif args.doctor:
         if not args.corpus:
             ap.error("--doctor 要跟 --corpus 一起用：体检的就是它指向的那个目录")
-        checks = diagnose(args.corpus, threads_path=args.threads, embed=args.embed)
+        checks = diagnose(args.corpus, threads_path=args.threads, embed=args.embed,
+                          time_context=time_ctx)
         print(format_doctor_report(checks))
         # 退出码给自动化用：有 ✗ 就非零，⚠ 不算失败（那些是"能用但会悄悄变差"）
         sys.exit(1 if any(c["level"] == FAIL for c in checks) else 0)
@@ -2181,7 +2282,7 @@ if __name__ == "__main__":
                            weights_path=Path(args.corpus) / ".weights.json",
                            retractions_path=Path(args.corpus) / ".retractions.json",
                            entities_path=Path(args.corpus) / ".entities.json",
-                           loader=loader)
+                           loader=loader, time_context=time_ctx)
         if args.http:
             host, _, port = args.http.rpartition(":")
             host = host or "127.0.0.1"

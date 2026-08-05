@@ -26,6 +26,9 @@
                      （它 docstring 里"留给翻译器层再补"的口从这里接上）
 入口 load_any(path)：按扩展名+结构嗅探分发——"选个文件，点导入"的体验目标；
 认不出的结构明确报错，不静默猜。
+目录入口 load_dir(dir) / corpus_dir_files(dir)：递归吃一整个语料目录（用户的语料
+常常就是解压出来的一堆文件），逐个走 load_any——**认不出的逐个报出是哪个文件、
+不计进统计**，那条纪律一个字没稀释，只是多认了一种输入（2026.08.04，走查台账第四条）。
 
 **诚实边界（核对状态分翻译器记，别混）**：
   1. Claude 全家翻译器**已与真实导出两轮核对**（2026.07.30，维护者提供官方导出，
@@ -57,7 +60,8 @@
 零依赖，stdlib only。
 用法：
   python memory_import.py --selftest
-  python memory_import.py --stats <导出文件>     # 接真实样本前的核对步骤
+  python memory_import.py --stats <导出文件或语料目录>   # 接真实样本前的核对步骤
+                                                # 目录递归；认不出的文件逐个报出、退出码 1
 """
 
 import argparse
@@ -82,11 +86,22 @@ DEFAULT_MAX_CHARS = 800
 class MemoryEntry:
     """中间标准格式（设计笔记"通用导入"：{时间戳, 说话人, 文本, 标签?}）。
     timestamp 是 epoch 秒或 None；speaker 叙事体语料（timeline）为空串；
-    tags 第一个元素约定为来源（chatgpt/claude/chatlog/timeline）。"""
+    tags 第一个元素约定为来源（chatgpt/claude/chatlog/timeline）。
+
+    ⚠ **`timestamp_source` 不是装饰，是「这个时间戳能不能拿来下结论」**
+    （2026.08.04 审查侧黑盒抓到）：timeline 那条链的时间戳有优先级
+    （`chunk_head_slash` / `file_head` / `heading` / `chunk_head` / **`mtime`**），
+    而 `mtime` 是**没有日期依据时的兜底**——拷贝一遍目录、重新 clone，它就变成"刚刚"。
+    `parse_markdown_timeline` 原先只取 `timestamp` 把来源丢了，于是语料目录里
+    **随便一份今天改过的 README.md 就能把「这份语料最新停在哪天」顶成今天**，
+    第 0 步那道旧快照体检当场失效、且不报错。**取时间戳的地方必须能看见它的来源。**
+    ⚠ 只有 timeline 那条链会填这个字段；其余翻译器的时间戳来自导出文件里的真实时间，
+    留空即可——**判据是「是不是 mtime」，不是「有没有标注」**，所以留空按可信算。"""
     text: str
     speaker: str = ""
     timestamp: float = None
     tags: tuple = ()
+    timestamp_source: str = ""
 
 
 # ---------- 翻译器一：ChatGPT conversations.json ----------
@@ -241,7 +256,8 @@ def parse_markdown_timeline(text, filename="timeline.md", mtime=0.0):
     entries = []
     for chunk, meta in timeline_chunks(text, filename, mtime):
         entries.append(MemoryEntry(text=chunk, speaker="", timestamp=meta["timestamp"],
-                                   tags=("timeline", meta["heading"]) if meta["heading"] else ("timeline",)))
+                                   tags=("timeline", meta["heading"]) if meta["heading"] else ("timeline",),
+                                   timestamp_source=meta.get("timestamp_source", "")))
     return entries
 
 
@@ -314,16 +330,122 @@ def load_any(path):
     return parse_line_chat(raw)
 
 
+def corpus_dir_files(directory):
+    """语料目录 → 参与统计的文件（递归、排序、跳过隐藏项）。
+
+    **递归不是「更全」，是范围要跟建库对齐**：`persona_compiler.py`、
+    `memory_init.py`、`mcp_server` 体检那条链读语料目录一律 `rglob("*")`。
+    这里只看一层的话，**体检的范围会小于实际建库的范围**——用户把旧的那批
+    放在子目录里，第 0 步照样报不出旧快照，比崩掉更坏（崩掉至少看得见）。
+
+    ⚠ 路径任何一段以 `.` 开头的一律跳过：语料目录里会有本项目自己写的 sidecar
+    （`.weights.json` 每次检索都落盘，见 `mcp_server._corpus_signature`），
+    那不是用户语料。不跳的话跑过服务的用户会被报一堆「认不出格式」，
+    **而那些噪声会把真正认不出的那份名单淹掉**。"""
+    root = Path(directory)
+    return sorted(p for p in root.rglob("*")
+                  if p.is_file() and not any(part.startswith(".") for part in p.relative_to(root).parts))
+
+
+def load_dir(directory):
+    """目录 → ([MemoryEntry], [(路径, 原因)])：逐个文件走 load_any。
+
+    ⚠ **load_any 那条纪律一个字不动**——单文件认不出的结构照旧抛。这里只是让
+    「一个目录」也成为合法输入，**不是把纪律稀释成静默跳过**：认不出的文件
+    逐个记下**是哪个文件、为什么**，由调用方原样报给人看。
+
+    一个坏文件不顶掉整份汇总（用户的语料目录里混进一张图、一个 pdf 是常态，
+    为它整个不出结果，第 0 步就又被跳过去了），但**它没被统计进去这件事必须说出来**
+    ——否则用户会以为上面那个条数覆盖了目录里所有东西。
+
+    ⚠ **第三个返回值 `empties` 是 2026.08.04 审查侧黑盒补的**：原先只挡住**抛异常**的
+    文件，挡不住**读得进去但一条都没解析出来**的（几行散文的 `笔记.txt` 就是）。
+    那种文件被静默计进「N 个文件」，而它一条都没贡献——**单文件跑时用户看得见那个
+    `0 条`，目录汇总里它被淹掉了**。「认不出就报出来，不猜也不静默跳过」这条纪律
+    在目录这个新入口上原本有这个洞。
+    ⚠ **它跟 `problems` 分两个桶、退出码也不同**：认不出（抛异常）是**错**，退出码 1；
+    解析出 0 条多半是语料目录里那份 README，是**常态**，只报不红——
+    让它也红会逼用户去清理一个本来就该允许存在的文件。"""
+    entries, problems, empties = [], [], []
+    for p in corpus_dir_files(directory):
+        try:
+            got = load_any(p)
+        except (ValueError, UnicodeDecodeError, OSError) as exc:
+            problems.append((p, f"{type(exc).__name__}: {exc}"))
+            continue
+        if not got:
+            empties.append(p)          # 读得进去、一条也没解析出来：见 docstring
+            continue
+        entries.extend(got)
+    return entries, problems, empties
+
+
 def stats(path):
-    """接真实样本前的核对步骤：只打聚合统计，不打内容（语料不该进终端记录）。"""
-    entries = load_any(path)
+    """接真实样本前的核对步骤：只打聚合统计，不打内容（语料不该进终端记录）。
+
+    文件和目录都吃。返回退出码：认不出的文件存在时返回 1（**不是崩**——没有
+    traceback、汇总照打，只是不让第 0 步这条命令在脚本里被当成完全通过）。
+
+    ⚠ **这个函数的目的不是「打统计」，是让第 0 步能发现旧快照**（走查台账第四条）：
+    所以时间范围之外还要**单独把最新那个日期摆出来**并跟一句让人对一对的话，
+    口径与 `mcp_server` 体检的「时间范围」那条同源。只报一个 `A ~ B` 区间的话，
+    人眼会滑过去——2026.08.04 那次真实的旧快照就是被 `--doctor` 抓到的，不是这里。"""
+    p = Path(path)
+    if not p.exists():
+        print(f"找不到这个路径：{path}")
+        return 1
+    if p.is_dir():
+        entries, problems, empties = load_dir(p)
+        counted = len(corpus_dir_files(p)) - len(problems) - len(empties)
+        head = f"{counted} 个文件参与统计（目录，递归）；"
+    else:
+        entries, problems, empties = load_any(p), [], []
+        head = ""
     speakers = sorted({e.speaker for e in entries if e.speaker})
-    ts = [e.timestamp for e in entries if e.timestamp is not None]
+    # ⚠ **落 mtime 的时间戳不参与任何结论**（2026.08.04 审查侧黑盒抓到）：它是
+    #    「这块没有任何日期依据」的兜底，拷一遍目录就变成"刚刚"。混进来的话，
+    #    语料目录里随便一份今天改过的 README.md 就能把「最新停在哪天」顶成今天，
+    #    **第 0 步这道旧快照体检当场失效，而且不报错。**
+    ts = [e.timestamp for e in entries
+          if e.timestamp is not None and e.timestamp_source != "mtime"]
+    n_mtime = sum(1 for e in entries
+                  if e.timestamp is not None and e.timestamp_source == "mtime")
     fmt = lambda t: datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M")  # noqa: E731
-    line = f"{len(entries)} 条；说话人：{'/'.join(speakers) or '（叙事体，无说话人）'}；带时间戳 {len(ts)} 条"
+    line = (f"{head}{len(entries)} 条；说话人：{'/'.join(speakers) or '（叙事体，无说话人）'}"
+            f"；带时间戳 {len(ts)} 条")
     if ts:
         line += f"；时间范围 {fmt(min(ts))} ~ {fmt(max(ts))}"
     print(line)
+    if ts:
+        print(f"⚠ 这份语料最新的一条停在 {datetime.fromtimestamp(max(ts)):%Y-%m-%d}"
+              "——盯住这个日期，问 TA 一句：跟 TA 最近一次聊天真的是这天吗？"
+              "对不上说明这份导出是旧快照，让 TA 重新导一份（时间范围选「全部」）再建库"
+              "（条数再漂亮也救不了停在过去的语料）。")
+    elif n_mtime:
+        # ⚠ 说法要跟抬头那个「带时间戳 0 条」对得上：那个数只数可信的，
+        #    这里再说一次「有 N 条带时间戳」，同一屏里两个数打架，人会以为程序错了。
+        print(f"⚠ 另有 {n_mtime} 条**只有文件修改时间**（没有任何日期依据，因此没算进上面"
+              "那个「带时间戳」数）"
+              "——「这份导出是不是旧快照」这道体检**在这份语料上无效**，别当成查过了。"
+              "修法是把日期写进文件名（window_04_2026-06-17.md 这种）或标题行。")
+    else:
+        print("⚠ 一条都没有时间戳，算不出时间范围——这份语料上「导出是不是旧快照」"
+              "这道体检无效，别当成查过了；换窗召回按时间新鲜度排序，也没有排序依据。")
+    if ts and n_mtime:
+        print(f"⚠ 另有 {n_mtime} 条只有文件修改时间，**没有算进上面那个日期**"
+              "——它们没有任何日期依据，拷一遍目录就会变成「刚刚」，"
+              "算进去会把旧快照伪装成新语料。")
+    if empties:
+        print(f"⚠ 另有 {len(empties)} 个文件读得进去、但一条都没解析出来"
+              "（多半是 README／随手记这类不是语料的东西，已从上面的文件数里剔除）：")
+        for e in empties:
+            print(f"    - {e}")
+    if problems:
+        print(f"⚠ 另有 {len(problems)} 个文件认不出格式，没有计入上面的数"
+              "（认不出就报出来，不猜也不静默跳过）：")
+        for bad, why in problems:
+            print(f"    - {bad}：{why}")
+    return 1 if problems else 0
 
 
 # ---------- selftest（合成 fixture，全部虚构，不含任何真实语料） ----------
@@ -507,9 +629,129 @@ def _selftest():
         f"CLI 入口没把 stdout 锁成 UTF-8（当前 {sys.stdout.encoding}）：" \
         "中文 Windows（cp936）下 --stats 遇到 emoji 会 UnicodeEncodeError"
 
-    print("selftest ok（12项断言：六个翻译器 / 两个消费方真接上 / 分发与兜底 / "
+    # 13.【变异靶心：--stats 吃目录 + 第 0 步真能发现旧快照】走查台账第四条。
+    #     ⚠ **夹具是判据的一部分，不许简化**：一个文件的目录证明不了「吃目录」、
+    #     全同一种格式证明不了分发、没有时间戳会让靶心二恒真（那三种都是空跑）。
+    #     所以这里的夹具**必须**是：≥3 个文件、≥2 种格式、带真时间戳、含子目录、
+    #     另有一份认不出格式的文件、外加一个隐藏 sidecar。
+    import io
+    import contextlib
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "子目录").mkdir()
+        Path(root, "c.json").write_text(json.dumps([_CHATGPT_FIXTURE]), encoding="utf-8")
+        Path(root, "w.txt").write_text(_LINECHAT_FIXTURE, encoding="utf-8")
+        Path(root, "子目录", "t.md").write_text(_TIMELINE_FIXTURE, encoding="utf-8")
+        Path(root, ".weights.json").write_text("{}", encoding="utf-8")  # sidecar，不是语料
+        # 13a. 目录被递归收齐、隐藏 sidecar 被跳过
+        got = corpus_dir_files(root)
+        assert [p.name for p in got] == ["c.json", "w.txt", "t.md"], \
+            f"目录要递归收齐并跳过隐藏 sidecar，实际 {[p.name for p in got]}"
+        # 13b.【靶心一】目录跑得通，且混合格式各进各的翻译器（不是只认了一种）
+        d_entries, d_problems, d_empties = load_dir(root)
+        assert d_problems == [] and d_empties == [], f"这三个都该认得出且都有内容：{d_problems} {d_empties}"
+        assert {e.tags[0] for e in d_entries} == {"chatgpt", "chatlog", "timeline"}, \
+            "三种格式要各进各的翻译器——只认出一种说明目录那层把分发吃掉了"
+        # 13c.【靶心二】汇总里要有时间范围，**且最新那个日期旁边跟着那句让人对一对的话**
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = stats(root)
+        out = buf.getvalue()
+        #      ⚠ 最早 2025-07-14、最新 2026-07-15 **必须是两个不同的日期**，
+        #      否则「单独摆出来的是不是最新那个」这条断言恒真（拿最早的顶上也过）
+        assert rc == 0 and "时间范围 2025-07-14" in out and "~ 2026-07-15" in out, \
+            f"目录汇总要打出时间范围（最早~最晚）：{out}"
+        assert "最新的一条停在 2026-07-15" in out and "真的是这天吗" in out, \
+            f"最新日期要单独摆出来并跟一句让人对一对——只报区间人眼会滑过去：{out}"
+        # 13d.【靶心三】混进认不出格式的文件：报出是哪个文件，不静默跳过、也不整个崩掉
+        Path(root, "坏.json").write_text('{"foo": 1}', encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = stats(root)
+        out = buf.getvalue()
+        assert "时间范围" in out, f"一个坏文件不该顶掉整份汇总：{out}"
+        assert "坏.json" in out and "没有计入上面的数" in out, \
+            f"认不出的要报出是哪个文件、并说明它没进统计（不静默跳过）：{out}"
+        assert rc == 1, "有认不出的文件时退出码要非 0（不是崩，是别被当成完全通过）"
+        # 13e. 没有时间戳的语料：⚠ 说清这道体检无效，不许沉默
+        with tempfile.TemporaryDirectory() as td2:
+            Path(td2, "n.txt").write_text("林岸：随便说一句\n星回：嗯", encoding="utf-8")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                stats(Path(td2))
+            assert "这道体检无效" in buf.getvalue(), \
+                f"一条时间戳都没有时要说清第 0 步这道体检无效：{buf.getvalue()}"
+        # 13f.【靶心四·mtime 不许顶掉「最新停在哪天」】2026.08.04 审查侧黑盒抓到：
+        #     语料目录里随便一份**今天改过、没有日期**的 md（README／随手记那种）走
+        #     mtime 兜底，会把整份语料的「最新一条停在」顶成今天，**第 0 步这道旧快照
+        #     体检当场失效且不报错**——而这正是这张卡存在的全部理由。
+        #     ⚠ **夹具的两个条件缺一不可**：那份 md 必须**没有任何日期依据**（否则走不到
+        #     mtime 那一支）、且它的 mtime 必须**晚于**真语料里的日期（否则这条恒真）。
+        #     这里靠 `_TIMELINE_FIXTURE` 里是 2025/2026 年的日期、而临时文件是"刚写的"
+        #     来保证后者。变异：把 stats 里 ts 的 `!= "mtime"` 过滤去掉 → 这条红。
+        with tempfile.TemporaryDirectory() as td3:
+            Path(td3, "t.md").write_text(_TIMELINE_FIXTURE, encoding="utf-8")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                stats(Path(td3))
+            base = buf.getvalue()
+            assert "最新的一条停在 2026-07-15" in base, f"先确认干净时是对的：{base}"
+            Path(td3, "README.md").write_text("# 项目说明\n\n这个文件夹是我导出来的语料\n",
+                                              encoding="utf-8")
+            #     先确认变异夹具真的打上了：那份 README 确实走了 mtime 兜底
+            only_readme = parse_markdown_timeline(
+                Path(td3, "README.md").read_text(encoding="utf-8"), "README.md",
+                Path(td3, "README.md").stat().st_mtime)
+            assert only_readme and all(e.timestamp_source == "mtime" for e in only_readme), \
+                "夹具没打上：那份 README 没走 mtime 兜底，下面这条就测不出东西了"
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                stats(Path(td3))
+            out3 = buf.getvalue()
+            assert "最新的一条停在 2026-07-15" in out3, \
+                f"一份今天改过的 README 不许把「最新停在哪天」顶掉：{out3}"
+            assert "只有文件修改时间" in out3 and "没有算进上面那个日期" in out3, \
+                f"落 mtime 的条目要如实披露，不能只是悄悄排除掉：{out3}"
+        # 13g.【靶心五·读得进去但解析出 0 条的文件要报出来】同日同一轮黑盒抓到：
+        #     原先只挡住**抛异常**的文件，几行散文的「笔记.txt」读得进去、解析出 0 条，
+        #     被静默计进「N 个文件」——单文件跑看得见那个 `0 条`，目录汇总里被淹掉。
+        #     ⚠ 它跟认不出的分两个桶：这类是常态（语料目录里就该允许有 README），
+        #     **只报不红**；退出码仍只由 problems 决定。
+        with tempfile.TemporaryDirectory() as td4:
+            Path(td4, "t.md").write_text(_TIMELINE_FIXTURE, encoding="utf-8")
+            Path(td4, "笔记.txt").write_text("这是我随手写的一份笔记\n没有对话结构\n",
+                                             encoding="utf-8")
+            assert load_any(Path(td4, "笔记.txt")) == [], \
+                "夹具没打上：这份笔记居然解析出东西了，下面测不出静默计入"
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc4 = stats(Path(td4))
+            out4 = buf.getvalue()
+            assert "笔记.txt" in out4 and "一条都没解析出来" in out4, \
+                f"解析出 0 条的文件要点名报出来，不许静默计进文件数：{out4}"
+            assert "1 个文件参与统计" in out4, \
+                f"文件数要只数真正贡献了条目的那些：{out4}"
+            assert rc4 == 0, "解析出 0 条是常态（README 那类），只报不红——退出码只由认不出的决定"
+        # 13h.【全部时间戳都只有 mtime 这一支】2026.08.04 审查侧终验时补：
+        #     这一支原先没有任何断言看着（13f 走的是「有真日期 ＋ 混进 mtime」那支）。
+        #     ⚠ 它还得跟抬头那个数**说法一致**：抬头 `带时间戳 0 条` 只数可信的，
+        #     这里若再说一句「有 1 条带时间戳」，同一屏两个数打架，人会当成程序错了。
+        with tempfile.TemporaryDirectory() as td5:
+            Path(td5, "README.md").write_text("# 项目说明\n\n这个文件夹是我导出来的语料\n",
+                                              encoding="utf-8")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc5 = stats(Path(td5))
+            out5 = buf.getvalue()
+            assert "带时间戳 0 条" in out5 and "在这份语料上无效" in out5, \
+                f"全是 mtime 时不许编出一个「最新停在 X」，要说这道体检无效：{out5}"
+            assert "条带时间戳，但" not in out5, \
+                f"抬头说 0 条、下面说「有 1 条带时间戳」，同一屏两个数打架：{out5}"
+            assert rc5 == 0, "只有 mtime 不是错（是语料本身没日期），只报不红"
+
+    print("selftest ok（13项断言：六个翻译器 / 两个消费方真接上 / 分发与兜底 / "
           "CLI 入口把 stdout 锁成 UTF-8（⚠ 变异要在 PYTHONIOENCODING=gbk 下跑，"
-          "默认 UTF-8 的机器上这条恒真））")
+          "默认 UTF-8 的机器上这条恒真）/ --stats 吃目录且报得出旧快照（⚠ 含：落 mtime 的时间戳不参与「最新停在哪天」、解析出 0 条的文件要点名报出））")
 
 
 if __name__ == "__main__":
@@ -522,11 +764,12 @@ if __name__ == "__main__":
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
-    ap.add_argument("--stats", metavar="FILE", help="导入前核对：条数/说话人/时间范围（不打内容）")
+    ap.add_argument("--stats", metavar="PATH",
+                    help="导入前核对：条数/说话人/时间范围（不打内容）。文件或目录都吃，目录递归")
     args = ap.parse_args()
     if args.selftest:
         _selftest()
     elif args.stats:
-        stats(args.stats)
+        sys.exit(stats(args.stats))
     else:
         ap.print_help()

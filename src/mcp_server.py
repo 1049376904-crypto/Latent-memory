@@ -52,15 +52,18 @@ stdio 只能由宿主拉起（手动 `nohup` 必崩）、懒加载每次调用�
 """
 
 import argparse
+import errno
 import hmac
 import http.server
 import io
 import ipaddress
 import json
 import os
+import socket
 import sys
 import threading
 import time
+import traceback
 import urllib.parse
 from datetime import datetime, timezone as _dt_tz
 from pathlib import Path
@@ -726,11 +729,16 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None):
                     pass
             return True
 
-        def _log_deny(self, code, msg):
+        def _log_deny(self, code, msg, note=None):
             """被拒的请求在 stderr 上留一行（八条拒绝全走 `_deny`，所以落点只有这一处）。
 
             形如：`被拒 404 GET /nope 来自 127.0.0.1：没有这个端点`
             ——状态码、方法、**剥掉 query 的**路径、客户端 IP、原因短语。
+
+            `note` 是**调用点写死的一句常量补注**，原样缀在行尾（不过原因短语那道
+            截断）。⚠ **只许传常量，永远不许把客户端来的值塞进 `note`**——下面
+            三条硬边界与「变量插值放分隔符之后」那条规矩对它同样作数，而 `note`
+            恰恰绕过了截断这道保险。目前唯一的调用点是 405（见 `do_GET`）。
 
             ⚠ **三条硬边界（「为了让人能排查」而写进日志，正好是明文那张卡在防的
             事的另一个出口——日志会被重定向进文件、会被贴进 issue 找人帮看）**：
@@ -757,10 +765,11 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None):
             ip = self.client_address[0] if self.client_address else "?"
             deny_log(f"被拒 {code} {_log_sanitize(self.command or '?', 16)} "
                      f"{_log_sanitize(path, 120)} 来自 {_log_sanitize(ip, 60)}："
-                     f"{_log_sanitize(reason, 80)}")
+                     f"{_log_sanitize(reason, 80)}"
+                     + (f"（{note}）" if note else ""))
 
-        def _deny(self, code, msg, extra=()):
-            self._log_deny(code, msg)
+        def _deny(self, code, msg, extra=(), note=None):
+            self._log_deny(code, msg, note=note)
             extra = list(extra)
             if not self._drain():
                 self.close_connection = True
@@ -795,8 +804,14 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None):
         def do_GET(self):
             if not self._gate():
                 return
+            # ⚠ 这一条**不是故障**：Operit 这类客户端连 Streamable HTTP 时会先发
+            # GET 想建 SSE 长流，收到 405 后自动回退到 POST，然后一切正常。
+            # 而日志上「被拒 405 GET」跟真失败长得一模一样——2026.08.05 实测里
+            # 连接其实已经成功了，日志却让人以为没成，**差一点把一条通的路判成不通**。
+            # 修法不是去支持 SSE（我们没有服务器主动推送的场景），是在那行后面补一句。
             self._deny(405, "本 server 不提供 SSE 长流，请用 POST（Streamable HTTP）",
-                       extra=[("Allow", "POST, DELETE")])
+                       extra=[("Allow", "POST, DELETE")],
+                       note="客户端通常会自动改用 POST，这不是错误")
 
         def do_DELETE(self):
             if not self._gate():
@@ -1198,6 +1213,236 @@ def format_doctor_report(checks):
         lines.append("结论：全部通过。")
     lines.append("（体检只读，没有向语料目录写入任何文件。）")
     return "\n".join(lines)
+
+
+# ---------- 启动失败：给人话、给出口、让用户真的看得见（任务卡"服务端起不来时全是裸堆栈"） ----------
+#
+# **病在哪**（2026.08.05 维护者本人走完一遍 Operit 接入，一条一条撞出来的）：
+# `mcp_server.py` 起不来时全是裸 Python 堆栈，而 stdio 形态下**客户端只显示
+# 「连接失败」四个字，那段堆栈用户根本看不到**——手上没有任何下一步。
+# 跟《出货闸报错不带出口》是同一个病搬到启动层，而且更严重：出货闸至少把报错
+# 打在用户眼前，这里连打都打不出来。
+#
+# **修法（2026.08.06 维护者拍板：协议降级壳 ＋ 文件留痕）**：
+# 1. **协议降级壳**——stdio 档启动失败时不直接死，改起一个「只会说这一句话」的
+#    最小 server（`StartupFailureServer`）：照常回 `initialize`，人话进 `instructions`；
+#    任何 `tools/call` 一律 `isError=true` 回同一句话。这是**唯一不依赖客户端实现、
+#    在 Operit 和 Claude Code 上都能进用户眼**的路径——stderr 那条路已经证明进不去。
+# 2. **文件留痕**——同一句话连同完整堆栈写进 `startup_log_path()`，横幅与人话都指这条路。
+#
+# ⚠ **降级壳不是变相放宽检查**（任务卡第五节第一条）：它**一个真工具都不提供**，
+# `tools/list` 只有 `memory_startup_error` 一个诊断工具，任何调用都失败。
+# 检查该拒还是拒了，改的只是**拒绝怎么说话**。谁以后想往这个壳里塞一个"能用的"
+# 工具当降级服务，那就是这张卡明确禁止的事。
+#
+# ⚠ **这一节管不到「用户真的看见了没有」**：那要拿真客户端故意造一次失败、看它
+# 界面上出现了什么（任务卡靶心二）。**我们在终端里看到了不算**——终端是我们的
+# 视角，不是用户的。
+
+# 慢加载提示的两道门槛（秒）。第一道给"是不是卡死了"一个答复，第二道让久等的人
+# 知道进程还活着。⚠ 只提示，**不改加载时序**（任务卡靶心四：改成全异步/懒加载会
+# 把可见的慢换成不可见的慢——握手秒回、第一次 memory_search 卡死，更糟）。
+_SLOW_LOAD_NOTICE_SECONDS = (5.0, 30.0)
+
+# 启动失败报告落盘的目录，可用环境变量顶掉（容器里 HOME 可能不可写）
+STARTUP_LOG_DIR_ENV = "MEMORY_MCP_LOG_DIR"
+
+
+def startup_log_path():
+    """启动失败报告写哪儿：`$MEMORY_MCP_LOG_DIR`／默认 `~/.memory-mcp`。
+
+    ⚠ **刻意不落在 `--corpus` 目录下**：第 1 条（语料/模型加载失败）里那个目录
+    本身就可能是出问题的一方，而且语料目录是**会被同步、会被贴给别人看**的地方，
+    堆栈里带着本机路径。"""
+    base = os.environ.get(STARTUP_LOG_DIR_ENV) or (Path.home() / ".memory-mcp")
+    return Path(base) / "last-startup-error.log"
+
+
+def _looks_offline(exc):
+    """这个异常是不是「拉不到模型」那一类（没网／下不动／库没装）。
+
+    ⚠ **只在 embed 档的加载阶段问这句话**——分档主要靠**出错在哪个阶段**
+    （加载 vs 绑端口），不靠翻异常文本，这样第 1 条与第 3 条不可能串。
+    这里问的是加载阶段内部的第二层：是"拿不到模型"还是"语料本身有问题"。"""
+    for e in (exc, exc.__cause__, exc.__context__):
+        if e is None:
+            continue
+        if isinstance(e, (socket.gaierror, TimeoutError)):
+            return True
+        if isinstance(e, OSError) and e.errno in (
+                errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ECONNREFUSED,
+                errno.ETIMEDOUT, errno.ENETDOWN):
+            return True
+        if isinstance(e, ImportError):
+            # fastembed/onnxruntime 没装：跟没网是同一条出口（先联网备好这一档）
+            return True
+        name = type(e).__name__
+        if name in ("ConnectError", "ConnectTimeout", "ReadTimeout", "ProxyError",
+                    "RequestError", "TransportError", "SSLError", "HTTPError",
+                    "ConnectionError", "MaxRetryError", "NewConnectionError",
+                    "URLError"):
+            return True
+        text = str(e)
+        for probe in ("Network is unreachable", "Temporary failure in name resolution",
+                      "Max retries exceeded", "Failed to establish a new connection",
+                      "getaddrinfo failed", "Name or service not known"):
+            if probe in text:
+                return True
+    return False
+
+
+def startup_failure_report(stage, exc, *, embed=False, http_bind=None, log_path=None):
+    """把一次启动失败翻成「一句人话 ＋ 一条可照抄的出口」。
+
+    `stage` 只有两个值，对应任务卡那张表里仍然作数的两条**失败**路径：
+      - `"load"`  → 建索引/加载语料这一段（第 1 条在这里）
+      - `"bind"`  → `--http` 绑端口这一段（第 3 条在这里）
+    （表里第 4 条「语料很大时像卡死」不是失败，走 `slow_load_notice`；
+    ⚠ **编号按任务卡那张表，故意不重排**——②虽已划掉也不把③④提上来，
+    重排会让别处对「②」的引用悄悄指向另一条。）
+
+    返回一段多行文本，第一行是人话、第二行是出口，末行指向落盘的完整堆栈。"""
+    if stage == "bind" and isinstance(exc, OSError) and exc.errno == errno.EADDRINUSE:
+        why = f"要监听的地址已经被别的进程占着，起不来（{http_bind}）。"
+        how = ("出口：换一个端口重起（例如 --http 127.0.0.1:8766），"
+               "或者先把占着这个端口的进程停掉再重起"
+               "（Linux/macOS：lsof -i :<端口>；Windows：netstat -ano | findstr :<端口>）。")
+    elif stage == "load" and embed and _looks_offline(exc):
+        why = "这台机器上没有现成的 embedding 模型，而现在也下不下来（没网或下载被挡）。"
+        how = ("出口：二选一——①连上网再起一次，让它把模型下完（只需一次，之后离线可用）；"
+               "②不想下模型就重跑 python memory_init.py --step route --route zero-dep，"
+               "让它重新生成客户端配置。"
+               "⚠ 不要自己把配置里的 --embed 删掉：--embed 必须跟 init_state 记的检索路线一致，"
+               "手删参数是隐患，正确出口是重跑 --step route。")
+    elif stage == "load":
+        why = "语料读不进来，索引没建起来（--corpus 指的目录不对、读不了，或里面的文件有问题）。"
+        how = ("出口：把同一行参数里的 --http/--threads 都留着、"
+               "把命令换成 python mcp_server.py --doctor --corpus <同一个目录> 跑一次，"
+               "体检只读不写盘，会逐项说清哪一项过不去。")
+    else:
+        why = "服务端在启动阶段失败了。"
+        how = ("出口：python mcp_server.py --doctor --corpus <同一个目录> 跑一次体检，"
+               "再看下面那份完整报错。")
+    lines = ["记忆协议服务端没能起来。",
+             f"原因：{why}",
+             how,
+             f"（技术细节：{type(exc).__name__}: {exc}）"]
+    if log_path is not None:
+        lines.append(f"完整报错已经写进 {log_path}，排查时把那个文件贴出来即可。")
+    return "\n".join(lines)
+
+
+def write_startup_log(report, exc, path=None):
+    """把人话和完整堆栈一起落盘，返回落点；写不进去就返回 None（**不许因此再崩一次**）。
+
+    ⚠ 写失败必须吞掉：这段代码只在"已经失败了"的路径上跑，让它自己抛异常
+    等于把用户仅剩的那句人话也弄丢——正是这张卡在治的形状。"""
+    path = Path(path) if path is not None else startup_log_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(_dt_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"# 记忆协议 MCP server 启动失败（{stamp}）\n\n{report}\n\n")
+            f.write("--- 完整堆栈（给排查用，上面那几行才是给你看的）---\n")
+            f.write("".join(traceback.format_exception(
+                type(exc), exc, exc.__traceback__)))
+        return path
+    except OSError:
+        return None
+
+
+def slow_load_notice(stream=None, thresholds=_SLOW_LOAD_NOTICE_SECONDS):
+    """加载慢过门槛就说一句话，返回一个「加载完了叫我」的取消函数。
+
+    治的是任务卡那张表**第 4 条**：语料很大时握手前要先把全库读完建索引，
+    这段时间里进程一声不吭，看起来跟卡死一模一样，客户端只会超时。
+
+    ⚠ **这一轮只做到「慢的时候有话说」**（靶心四，防过度纠正）：
+    不把加载改成全异步/懒加载——那样握手秒回、第一次 `memory_search` 卡死，
+    是把可见的慢换成不可见的慢。真要改加载时序另开卡。
+
+    ⚠ **这句话走 stderr，因此在 stdio 形态下用户多半看不到**——这跟降级壳
+    （失败路径）不是一回事：第 4 条最终是"加载完了、能起来"，协议流那时才开始，
+    没有一个既不撒谎又能提前说话的口子。别把这条读成"第 4 条也解决了可见性"。"""
+    stream = stream or sys.stderr
+    timers = []
+
+    def say(text):
+        print(text, file=stream)
+        try:
+            stream.flush()
+        except (ValueError, OSError):
+            pass
+
+    first, second = thresholds
+    timers.append(threading.Timer(first, say, args=(
+        "正在读语料建索引……语料多的时候这一步要花点时间，进程没有卡死，请再等等。",)))
+    timers.append(threading.Timer(second, say, args=(
+        "还在建索引（已经超过 %g 秒）。首次启动最慢，之后会快一些；"
+        "现在中断它不会损坏任何数据。" % second,)))
+    for t in timers:
+        t.daemon = True          # 别让这两只表拖住进程退出
+        t.start()
+
+    def done():
+        for t in timers:
+            t.cancel()
+    return done
+
+
+class StartupFailureServer:
+    """启动失败时顶上来的最小 stdio 壳：照常握手，把那句人话送进客户端界面。
+
+    ⚠ **它一个真工具都不提供**。`tools/list` 只有 `memory_startup_error`，
+    而且**任何** `tools/call`（包括模型习惯性调的 `memory_search`）一律回
+    `isError=true` ＋ 同一句人话。这是**刻意偏离规格**的一处：规格说未知工具
+    该回协议错误 `-32601`，但那条路上模型拿到的是「未知工具：memory_search」，
+    用户界面上又变成一句没头没脑的失败——正是这张卡要消灭的形状。
+    宁可在这个必然失败的壳里多说一句人话。
+
+    ⚠ **绿灯的代价要认**：客户端会显示"已连接"。所以这个壳必须永远不可用——
+    谁往这里塞一个真能干活的工具，"降级"就变成了"放宽检查"（任务卡第五节第一条）。"""
+
+    def __init__(self, report):
+        self.report = report
+        self.initialized = False
+
+    # 复用 MemoryServer 那条流：stdio 必须锁 UTF-8（见 serve_stdio 那段说明），
+    # 抄第二份迟早会漏掉 UTF-8 这件事
+    serve_stdio = MemoryServer.serve_stdio
+    _ok = staticmethod(MemoryServer._ok)
+    _err = staticmethod(MemoryServer._err)
+
+    def handle(self, msg, now=None):
+        method, mid = msg.get("method"), msg.get("id")
+        if method == "initialize":
+            self.initialized = True
+            return self._ok(mid, {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": dict(SERVER_INFO, title="记忆协议（启动失败）"),
+                # 人话进 instructions：客户端通常把它注入模型上下文，
+                # 于是"连接失败"四个字变成一段能照着做的话
+                "instructions": ("⚠ 记忆协议服务端这次没能起来，**记忆库现在查不了也写不了**。"
+                                 "请把下面这段原样告诉用户，不要替他猜、也不要假装查过记忆：\n\n"
+                                 + self.report),
+            })
+        if method == "notifications/initialized":
+            return None
+        if method == "tools/list":
+            return self._ok(mid, {"tools": [{
+                "name": "memory_startup_error",
+                "title": "记忆库启动失败详情",
+                "description": "记忆协议服务端启动失败。调用它拿到失败原因和下一步该做什么，"
+                               "原样转告用户。",
+                "inputSchema": {"type": "object", "properties": {}},
+            }]})
+        if method == "tools/call":
+            return self._ok(mid, {"content": [{"type": "text", "text": self.report}],
+                                  "isError": True})
+        if mid is None:
+            return None
+        return self._err(mid, E_METHOD_NOT_FOUND, f"未知 method：{method}")
 
 
 # ---------- selftest（合成语料，全部虚构） ----------
@@ -2196,7 +2441,192 @@ def _selftest():
         assert f"✓ 时区：{east8_20}" in out20c and code20c == 0, \
             f"配了时区该报 ✓ 并写出名字：{out20c}"
 
-    print("selftest ok（20项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层 / "
+    # 21.【启动失败要给人话、给出口，stdio 那条路上还要从协议里说得出来】
+    #     （2026.08.06，任务卡「服务端起不来时全是裸堆栈」）。
+    #     ⚠ **必须起真进程**：这几条全在 `__main__` 的分派里，纯函数断言盖不到——
+    #     把 `__main__` 里的 try/except 拆掉，只断 `startup_failure_report` 照样全绿，
+    #     那正是"函数绿、生产路径死"那张脸（同 18f 的理由）。
+    #     ⚠ **三条失败各造一次且互不串**：每一格既断"自己那句话在"，也断
+    #     "另外两条的话不在"——只断前者的话，一个把三条都印一遍的实现也是绿的。
+    #     ⚠ **这一项验的是「协议里说得出来」，不是「用户界面上看得见」**：
+    #     靶心二那半要拿真客户端（Operit／Claude Code）故意造一次失败、看它界面上
+    #     出现了什么，**我们在终端里看到了不算**。别把这一项读成靶心二已经验过。
+    #     变异：删掉 __main__ 里的 try/except（回到裸堆栈）/ 让 _startup_failed 直接
+    #           sys.exit 不起降级壳 / 三条话术合并成一句 → 各自红
+    _MARK21 = {                       # 三条各自的指纹（判据先写下来，再开始数）
+        1: "embedding 模型",          # 表里第 1 条：--embed 档，模型没下过 ＋ 没网
+        3: "被别的进程占着",           # 表里第 3 条：--http 端口被占
+        4: "正在读语料建索引",         # 表里第 4 条：语料大、加载慢（不是失败，只要求有话说）
+    }
+    # ⚠ 编号照任务卡那张表，**故意不重排**（②已划掉也不把③④提上来）：
+    # 重排会让别处对「②」的引用悄悄指向另一条。
+
+    def _only21(text, want):
+        """断言 `want` 那条的指纹在、另外两条的不在。"""
+        assert _MARK21[want] in text, f"第 {want} 条要说出自己那句人话：{text!r}"
+        for other, mark in _MARK21.items():
+            if other != want:
+                assert mark not in text, \
+                    f"第 {want} 条串出了第 {other} 条的话（「{mark}」）：{text!r}"
+
+    import socket as _socket21
+    with tempfile.TemporaryDirectory() as td21:
+        corpus21 = _P(td21) / "corpus"
+        (corpus21 / "timeline").mkdir(parents=True)
+        (corpus21 / "timeline" / "window_01_2026-06-01.md").write_text(
+            "## 起不来的那天\n服务端一句话都不说，只有一段堆栈。\n", encoding="utf-8")
+        logdir21 = _P(td21) / "logs"
+
+        def run_startup21(*argv, stdin_text=None, env_extra=None, timeout=90):
+            """起真进程，返回 (退出码, stdout, stderr)。"""
+            env21 = dict(os.environ, MEMORY_MCP_LOG_DIR=str(logdir21))
+            env21.update(env_extra or {})
+            p21 = subprocess.run(
+                [sys.executable, str(here / "mcp_server.py"),
+                 "--corpus", str(corpus21), *argv],
+                input=stdin_text, capture_output=True, text=True,
+                encoding="utf-8", env=env21, timeout=timeout)
+            return p21.returncode, p21.stdout, p21.stderr
+
+        #    a) 表里第 3 条：`--http` 端口被占。**真占一个端口**，不是模拟异常。
+        squat21 = _socket21.socket()
+        squat21.setsockopt(_socket21.SOL_SOCKET, _socket21.SO_REUSEADDR, 1)
+        squat21.bind(("127.0.0.1", 0))
+        squat21.listen(1)
+        busy_port21 = squat21.getsockname()[1]
+        try:
+            code21a, _, err21a = run_startup21("--http", f"127.0.0.1:{busy_port21}")
+        finally:
+            squat21.close()
+        assert code21a != 0, "端口被占该非零退出（能起来才是问题）"
+        assert "Traceback" not in err21a, \
+            f"第 3 条不许再出现裸堆栈——这正是本卡要消灭的东西：{err21a!r}"
+        _only21(err21a, 3)
+        assert "lsof" in err21a and "--http 127.0.0.1:8766" in err21a, \
+            f"第 3 条的出口要可照抄（换端口／查占用进程）：{err21a!r}"
+
+        #    b) 表里第 1 条：`--embed` 拿不到模型。**用一个真的连不上的 endpoint**
+        #       （刚关掉的本机端口 → ECONNREFUSED），不看这台机器装没装 fastembed——
+        #       靠"本机恰好没装某个包"的夹具，等哪天装上了就会静默变绿。
+        dead21 = _socket21.socket()
+        dead21.bind(("127.0.0.1", 0))
+        dead_port21 = dead21.getsockname()[1]
+        dead21.close()
+        embed_env21 = {"MEMORY_EMBED_ENDPOINT": f"http://127.0.0.1:{dead_port21}/v1/embeddings",
+                       "MEMORY_EMBED_API_KEY": "x-selftest-not-a-real-key"}
+        code21b, _, err21b = run_startup21(
+            "--embed", "--embed-provider", "cloud:selftest-model",
+            "--http", "127.0.0.1:0", env_extra=embed_env21)
+        assert code21b != 0, "拿不到模型该非零退出（不许悄悄降级成不带向量那档）"
+        assert "Traceback" not in err21b, f"第 1 条不许再出现裸堆栈：{err21b!r}"
+        _only21(err21b, 1)
+        assert "--step route --route zero-dep" in err21b, \
+            f"第 1 条的出口要写清正确出口是重跑 --step route：{err21b!r}"
+        assert "不要自己把配置里的 --embed 删掉" in err21b, \
+            f"第 1 条必须挡住「手删 --embed」那条隐患（配置要与 init_state 记的路线一致）：{err21b!r}"
+
+        #    c) 落盘：同一句话连完整堆栈写进 MEMORY_MCP_LOG_DIR 指的文件
+        log21 = logdir21 / "last-startup-error.log"
+        assert log21.exists(), f"启动失败要留一份可贴出来的报告：{logdir21}"
+        text21 = log21.read_text(encoding="utf-8")
+        assert "记忆协议服务端没能起来。" in text21 and "Traceback" in text21, \
+            f"报告里人话与完整堆栈都要有（人话给用户，堆栈给排查）：{text21[:400]!r}"
+
+        #    d) 【靶心二·代码那半】stdio 档失败时**不是死掉，而是起降级壳**，
+        #       那段人话从协议里回出去（instructions ＋ 任何 tools/call 的 isError）。
+        #       ⚠ 这只证明"协议里说得出来"；"用户界面上看得见"要真机验。
+        req21 = "\n".join(json.dumps(m, ensure_ascii=False) for m in (
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": PROTOCOL_VERSION, "clientInfo": {"name": "x"}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+             "params": {"name": "memory_search", "arguments": {"query": "随便查点什么"}}},
+        )) + "\n"
+        code21d, out21d, _ = run_startup21(
+            "--embed", "--embed-provider", "cloud:selftest-model",
+            stdin_text=req21, env_extra=embed_env21)
+        resp21 = [json.loads(x) for x in out21d.splitlines() if x.strip()]
+        assert len(resp21) == 3, \
+            f"降级壳也要照常按协议逐条回（否则客户端还是只有「连接失败」四个字）：{out21d!r}"
+        init21, list21, call21 = resp21
+        assert init21["result"]["protocolVersion"] == PROTOCOL_VERSION, init21
+        _only21(init21["result"]["instructions"], 1)
+        assert "--step route --route zero-dep" in init21["result"]["instructions"], \
+            "人话要进 instructions——客户端把它注入模型上下文，用户才看得到下一步"
+        names21 = [t["name"] for t in list21["result"]["tools"]]
+        assert names21 == ["memory_startup_error"], \
+            f"⚠ 降级壳一个真工具都不许提供（提供了就是变相放宽检查）：{names21}"
+        #       ⚠ 模型习惯性调 memory_search：那也必须回人话，不是「未知工具」
+        assert call21["result"]["isError"] is True, \
+            f"降级壳里任何调用都必须失败：{call21}"
+        _only21(call21["result"]["content"][0]["text"], 1)
+        assert code21d != 0, "壳退出时仍要非零——它不是一个能干活的服务"
+
+        #    e) 表里第 4 条：慢的时候有话说（靶心四：**只提示，不动加载时序**）。
+        #       ⚠ 这条走函数级夹具而不是真进程：真造一份"大到会慢"的语料，
+        #       跑一次要按分钟计，且多大会咬本来就没量过（任务卡第一节末那条）。
+        buf21, old21 = io.StringIO(), sys.stderr
+        sys.stderr = buf21
+        try:
+            done21 = slow_load_notice(thresholds=(0.05, 0.15))
+            time.sleep(0.4)
+            done21()
+        finally:
+            sys.stderr = old21
+        _only21(buf21.getvalue(), 4)
+        assert "没有卡死" in buf21.getvalue(), \
+            f"第 4 条要正面答「不是卡死」——客户端那头看到的就是像卡死：{buf21.getvalue()!r}"
+        #       不慢就不许出声（一进门就刷一行提示，是拿噪声冒充修好了）
+        buf21b, old21b = io.StringIO(), sys.stderr
+        sys.stderr = buf21b
+        try:
+            slow_load_notice(stream=buf21b, thresholds=(5.0, 30.0))()
+            time.sleep(0.2)
+        finally:
+            sys.stderr = old21b
+        assert buf21b.getvalue() == "", \
+            f"加载够快时一个字都不许打：{buf21b.getvalue()!r}"
+
+    # 22.【靶心三：`被拒 405 GET` 那行要说清它不是故障】（2026.08.06 同卡）。
+    #     Operit 连 Streamable HTTP 时先发 GET 建 SSE、收 405 后自动回退到 POST，
+    #     **连接其实是成功的**，但日志上那行跟真失败长得一模一样——实测里差一点
+    #     把一条通的路判成不通。⚠ **不去支持 SSE**（没有服务器主动推送的场景），
+    #     只在那一行后面补一句。
+    #     ⚠ **补注只准缀在 405 那一行**：401/403/404/411/413 那几条已经各说各的
+    #     原因、工作正常，不许被这句话糊上（所以下面同时断 404 那行没有它）。
+    #     变异：把 note 去掉 / 把它挂到 _log_deny 所有行上 → 各自红
+    _NOTE22 = "客户端通常会自动改用 POST，这不是错误"
+    import http.client as _httpc22
+    with tempfile.TemporaryDirectory() as td22:
+        corpus22 = _P(td22)
+        (corpus22 / "a.md").write_text("## 一\n随便一段话。\n", encoding="utf-8")
+        loader22 = lambda: load_corpus(corpus22)
+        srv22 = MemoryServer(index=loader22(), thread_store=ThreadStore(),
+                             corpus_dir=corpus22, loader=loader22)
+        httpd22 = make_http_server(srv22, host="127.0.0.1", port=0)
+        port22 = httpd22.server_address[1]
+        threading.Thread(target=httpd22.serve_forever, daemon=True).start()
+        buf22, old22 = io.StringIO(), sys.stderr
+        sys.stderr = buf22
+        try:
+            for path22 in ("/mcp", "/nope"):
+                c22 = _httpc22.HTTPConnection("127.0.0.1", port22, timeout=10)
+                c22.request("GET", path22)
+                c22.getresponse().read()
+                c22.close()
+            time.sleep(0.3)
+        finally:
+            sys.stderr = old22
+            httpd22.shutdown()
+        lines22 = buf22.getvalue().splitlines()
+        got405 = [ln for ln in lines22 if ln.startswith("被拒 405 ")]
+        got404 = [ln for ln in lines22 if ln.startswith("被拒 404 ")]
+        assert len(got405) == 1 and _NOTE22 in got405[0], \
+            f"405 那行要补上「这不是错误」：{got405!r}"
+        assert len(got404) == 1 and _NOTE22 not in got404[0], \
+            f"这句只属于 405，别糊到别的被拒行上（404 是真的没这个端点）：{got404!r}"
+
+    print("selftest ok（22项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层 / "
           "完整链路 / stdio / UTF-8 / 写回当场可查 / 用进撑过重启 / "
           "无可靠命中明确说 / 撤回更正闭环 / 缺失率标注接线 / 实体标注接线 / "
           "部署体检只读 / 部署体检走真进程（相对路径解析开、空语料非零退出、"
@@ -2211,7 +2641,12 @@ def _selftest():
           "CLI 入口把 stdout 锁成 UTF-8（⚠ 变异要在 PYTHONIOENCODING=gbk 下跑，"
           "默认 UTF-8 的机器上这条恒真）/ "
           "时区穿到进程级（--timezone 一路到文件名／H2／当场检索标签／重启后开场召回，"
-          "非法名非零退出、没配报 ⚠ 且打出实际时区、配了报 ✓ 并写出名字））")
+          "非法名非零退出、没配报 ⚠ 且打出实际时区、配了报 ✓ 并写出名字）/ "
+          "启动失败给人话给出口·真进程（端口被占／拿不到模型／慢加载三条各造一次且互不串，"
+          "都不再是裸堆栈，报告连堆栈落盘；stdio 档起降级壳把那段话从协议里回出去——"
+          "instructions ＋ 任何 tools/call 都 isError，且一个真工具都不提供。"
+          "⚠ 这验的是「协议里说得出来」，「用户界面上看得见」要真机）/ "
+          "被拒 405 GET 那行补「客户端会自动回退到 POST，这不是错误」（且只补这一行））")
 
 
 if __name__ == "__main__":
@@ -2276,13 +2711,41 @@ if __name__ == "__main__":
         loader = lambda: load_corpus(args.corpus, embed=args.embed,
                                      provider=(resolve_provider(args.embed_provider)
                                                if args.embed else None))
-        srv = MemoryServer(index=loader(),
-                           thread_store=ThreadStore(args.threads),
-                           corpus_dir=args.corpus,
-                           weights_path=Path(args.corpus) / ".weights.json",
-                           retractions_path=Path(args.corpus) / ".retractions.json",
-                           entities_path=Path(args.corpus) / ".entities.json",
-                           loader=loader, time_context=time_ctx)
+
+        def _startup_failed(stage, exc):
+            """启动失败的唯一出口：给人话、落盘、然后按传输形态决定怎么送到用户眼前。
+
+            ⚠ **别在这里加任何"那就降级起来吧"的分支**——检查该拒还是拒
+            （任务卡第五节第一条：这次的问题是失败时没给出路，不是失败判得太严）。"""
+            path = write_startup_log(
+                startup_failure_report(stage, exc, embed=args.embed,
+                                       http_bind=args.http), exc)
+            report = startup_failure_report(stage, exc, embed=args.embed,
+                                            http_bind=args.http, log_path=path)
+            print(report, file=sys.stderr)
+            if args.http:
+                # HTTP 档用户是自己在终端里敲的命令，stderr 就在他眼前，照常非零退出
+                sys.exit(1)
+            # stdio 档：stderr 进不了用户界面（客户端只显示「连接失败」），
+            # 改由降级壳把这段话从协议里送过去（2026.08.06 维护者拍板的修法）
+            StartupFailureServer(report).serve_stdio()
+            sys.exit(1)
+
+        # 慢的时候要有话说（第 4 条）：只加提示，不动加载时序（靶心四）
+        _load_done = slow_load_notice()
+        try:
+            srv = MemoryServer(index=loader(),
+                               thread_store=ThreadStore(args.threads),
+                               corpus_dir=args.corpus,
+                               weights_path=Path(args.corpus) / ".weights.json",
+                               retractions_path=Path(args.corpus) / ".retractions.json",
+                               entities_path=Path(args.corpus) / ".entities.json",
+                               loader=loader, time_context=time_ctx)
+        except Exception as e:                       # noqa: BLE001（裸堆栈正是本卡要消灭的）
+            _load_done()
+            _startup_failed("load", e)
+        finally:
+            _load_done()
         if args.http:
             host, _, port = args.http.rpartition(":")
             host = host or "127.0.0.1"
@@ -2291,6 +2754,8 @@ if __name__ == "__main__":
                 httpd = make_http_server(srv, host=host, port=int(port), token=token)
             except ValueError as e:
                 ap.error(str(e))
+            except OSError as e:                     # 端口被占等绑定失败（第 3 条）
+                _startup_failed("bind", e)
             # 起动横幅进 stderr（stdio 传输里 stdout 是协议流，这里沿用习惯）
             print(f"Streamable HTTP 服务在 http://{host}:{httpd.server_address[1]} "
                   f"（鉴权：{'Bearer token' if token else '无——仅限回环+外层反代'}；"

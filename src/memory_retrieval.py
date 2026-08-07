@@ -698,7 +698,7 @@ class MemoryIndex:
     # 设计判断：**文件只进不退，检索可进可退**。原 md 文件永远不改不删（时间线
     # 是档案，销毁历史跟"不废退"一样是产品底线），撤回改变的只是检索可见性；
     # 撤回账本（原文哈希+原因+时间+出处）单独落盘，错误怎么进来的、什么时候
-    # 被谁以什么理由撤掉的，全程可追溯。更正内容走 memory_append 正常写回，
+    # 被谁以什么理由撤掉的，全程可追溯。更正内容走 latent_append 正常写回，
     # 新旧两条在账本里互相指认。
 
     def retract(self, quote, reason, now=None, replaced_by=None):
@@ -716,7 +716,7 @@ class MemoryIndex:
 
         **追溯链**：`replaced_by` 记下更正后那条记录的内容哈希，让账本能回答
         "哪条记录改了哪条"，而不只是"这条被撤了"。调用方先写更正、再把新块文本
-        传进来（MCP 的 memory_correct 就是这个顺序）。只撤不补时为 None。"""
+        传进来（MCP 的 latent_correct 就是这个顺序）。只撤不补时为 None。"""
         if not (isinstance(quote, str) and quote.strip()):
             raise ValueError("quote 必填：从检索结果里逐字摘一段要撤回的原文")
         if not (isinstance(reason, str) and reason.strip()):
@@ -726,7 +726,7 @@ class MemoryIndex:
                    if quote in c and i not in self.retracted]
         if not matches:
             raise ValueError("没有找到包含这段原文的记录（或它已被撤回）。"
-                             "quote 要从 memory_search 返回的原文里逐字摘，别转述。")
+                             "quote 要从 latent_search 返回的原文里逐字摘，别转述。")
         if len(matches) > 1:
             raise ValueError(f"这段原文命中了 {len(matches)} 条记录，定位不到唯一一条"
                              "——换一段更长、更独特的原文再试。")

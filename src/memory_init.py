@@ -322,7 +322,7 @@ PROTOCOL_DEFAULTS = {
     "pointers_writeback": (
         "pointers", "指针必须盖住写回层",
         "这一节的指针无论怎么增改，**必须包含语料目录的 timeline 层**——"
-        "记忆写回（memory_append）永远落在那里，按窗口号加日期开新文件。"
+        "记忆写回（latent_append）永远落在那里，按窗口号加日期开新文件。"
         "指针漏掉这个目录，之后新长出来的记忆就按需读不到（检索工具照样查得到，"
         "但主动翻文件时会漏掉最新的那部分，而且不报错）。"),
     "degradation_protocol": (
@@ -331,20 +331,20 @@ PROTOCOL_DEFAULTS = {
         "答不上硬事实／逻辑不连贯／卡在循环道歉里）才按分级处理；信号干净时的"
         "自我怀疑是清醒判断，原样说出来。"),
     # 措辞与 2026.07.31 第三轮真机实测通过的最小人格 md 一致（设计笔记"真机主动性
-    # 实测"）：工具名（memory_search）要写明——那轮测试证明这份写法能把主动性带起来，
+    # 实测"）：工具名（latent_search）要写明——那轮测试证明这份写法能把主动性带起来，
     # 出货物就该跟被验证过的写法一字对齐，不出一个"差不多"的变体
     RETRIEVAL_CONVENTION_FIELD: (
         "architecture", "检索约定",
         "对方提到过去发生过的事、某个约定、某个日期／地点／称呼／人名，或者你对"
-        "细节拿不准时，先用记忆检索工具（memory_search）查一遍再开口；不要在查"
+        "细节拿不准时，先用记忆检索工具（latent_search）查一遍再开口；不要在查"
         "之前说“我不记得”。查完自然接上话，不用报告自己搜过。\n"
-        "**会话约定**：新会话开场先调一次 session_start；会话结束前调一次 "
-        "thread_close，记下聊到哪、当下状态、有什么没聊完。\n"
+        "**会话约定**：新会话开场先调一次 latent_session_start；会话结束前调一次 "
+        "latent_thread_close，记下聊到哪、当下状态、有什么没聊完。\n"
         # ↓ 2026.08.02 追加的行为层两句。**只做加法**：上面那两段是三轮真机验证过的
         # 措辞，一字未动（自检里有逐字黄金串钉着）。
         #
         # 为什么必须在人格文件里、而不是在工具返回值里（真机轨迹给出的结构性结论）：
-        # 那次 memory_search 四次全空之后，模型**自己转去 grep 了**——没放弃也没编，
+        # 那次 latent_search 四次全空之后，模型**自己转去 grep 了**——没放弃也没编，
         # 但我们所有的诚实护栏（可靠命中门槛、缺失率提示、空结果止血话术）都挂在
         # MCP 的返回值上，**它一绕过工具就一条都不生效**，而绕过恰恰发生在检索失败、
         # 最需要护栏的时候。人格文件是唯一覆盖"不管你用什么方式查"的那一层。
@@ -1519,7 +1519,7 @@ def backup_corpus_dir(timeline):
     `.bak` 的命名形状跟人格文件那侧对齐（`<名>.bak`），但多一条：备份目录被占了就
     往后顺号（`timeline.bak2`、`timeline.bak3`……），**不像人格文件那侧那样直接盖掉
     旧的 .bak**。语料这侧不能盖，因为每份备份存的是那一刻的全量，而两次出货之间
-    用户可能用 memory_append 写进过新窗口：拿新备份盖旧备份，会把只存在于旧备份里
+    用户可能用 latent_append 写进过新窗口：拿新备份盖旧备份，会把只存在于旧备份里
     的那部分记忆抹掉——那正是这条护栏要挡的事，护栏自己不能犯。
     人格文件能重新生成，记忆不能。"""
     timeline = Path(timeline)
@@ -1536,7 +1536,7 @@ def guard_corpus_overwrite(timeline, planned, mode="block"):
     """写之前的护栏：按 mode 决定拦下来、先备份、还是照写。返回备份目录或 None。
 
     **默认 blocking**（2026.08.04）。原先是同名文件直接 `write_text` 覆盖——不备份、
-    不提示、不报错，而 `memory_append` 写回用的是同一套命名形状，所以出货第二遍到
+    不提示、不报错，而 `latent_append` 写回用的是同一套命名形状，所以出货第二遍到
     同一个 memory/，会盖掉用户后来写进去的窗口。人格文件那侧 08.01 就为「覆盖自己
     那份」加了 .bak 护栏，那段注释自己写着**「沉默地覆盖才是最坏的形态」**——同一个
     最坏形态，语料侧一直一点护栏都没有。而**语料是用户唯一不可再生的东西**：人格
@@ -1560,7 +1560,7 @@ def guard_corpus_overwrite(timeline, planned, mode="block"):
     raise PermissionError(
         f"{CORPUS_OVERWRITE_CODE}：目标记忆库 {Path(timeline)} 里已有 "
         f"{len(conflicts)} 个窗口会被这次出货改写（{windows}）。"
-        "语料是不可再生的——你后来用 memory_append 写进去的窗口就长在这些文件里，"
+        "语料是不可再生的——你后来用 latent_append 写进去的窗口就长在这些文件里，"
         "盖掉就没了。两条出口，挑一条重跑本步："
         "加 --backup-corpus（先把整个 timeline 备份成 timeline.bak 再写，只加不减），"
         "或加 --accept-corpus-overwrite（我知道会覆盖，就这么办）。"
@@ -2690,7 +2690,7 @@ def _selftest():
             "覆盖区间那条没带过期提示——{end} 出货即过期，写死就是在授权假否定"
         for stale in ("这个范围之外的事你没有记录", f"我的记录到 {days_in[-1]} 为止"):
             assert stale not in cov_md, f"人格文件里还留着没有余地的断言：{stale!r}"
-        #    验收判据 1 的完整形态：ship 之后 memory_append 写一条**晚于 {end}** 的
+        #    验收判据 1 的完整形态：ship 之后 latent_append 写一条**晚于 {end}** 的
         #    记录，重读人格文件——文本不该（也不会）变，但它说的话必须仍然成立：
         #    有过期提示兜着，晚于 {end} 的这条记忆不会被人格文件授权否定
         from memory_retrieval import append_record
@@ -2834,7 +2834,7 @@ def _selftest():
     #     断言里，不引用常量——引用常量的话改了常量断言跟着变，等于没钉）
     GOLDEN_RETRIEVAL = (
         "对方提到过去发生过的事、某个约定、某个日期／地点／称呼／人名，或者你对"
-        "细节拿不准时，先用记忆检索工具（memory_search）查一遍再开口；不要在查"
+        "细节拿不准时，先用记忆检索工具（latent_search）查一遍再开口；不要在查"
         "之前说“我不记得”。查完自然接上话，不用报告自己搜过。")
     assert GOLDEN_RETRIEVAL in pron_md, \
         "检索约定那段的措辞被改了——它是三轮真机验证过的基准写法，一字不许动（其余向它对齐）"
@@ -2948,8 +2948,8 @@ def _selftest():
         assert _load_json_arg(str(f)) == long_payload, "传文件路径时该读文件"
 
     GOLDEN_SESSION = (
-        "**会话约定**：新会话开场先调一次 session_start；会话结束前调一次 "
-        "thread_close，记下聊到哪、当下状态、有什么没聊完。")
+        "**会话约定**：新会话开场先调一次 latent_session_start；会话结束前调一次 "
+        "latent_thread_close，记下聊到哪、当下状态、有什么没聊完。")
     assert GOLDEN_RETRIEVAL in conv and GOLDEN_SESSION in conv, \
         "改动了三轮真机验证过的措辞——这两段只许在后面加，不许动"
 
@@ -4191,7 +4191,7 @@ def _selftest():
 
     # 62.【两个靶心，真命令】重跑出货不许静默覆盖已有语料。
     #     夹具：现造一份虚构聊天 txt（两段会话跨两天、间隔超 gap → 落成两个窗口文件），
-    #     走 v1 全流程真命令出货，再用 append_record（memory_append 那支笔本身）
+    #     走 v1 全流程真命令出货，再用 append_record（latent_append 那支笔本身）
     #     往 window_02 里写一条，然后**重跑出货**。
     #     ⚠ 靶心二那条才是原始现场：靶心一只证明「已有文件时会停」，
     #       靶心二证明「用户后来写进去的那句话没被吃掉」。
@@ -4243,7 +4243,7 @@ def _selftest():
             {"window_01_2026-07-15.md", "window_02_2026-07-16.md"}
         assert not backups(), "第一次出货没覆盖任何东西，不该凭空造备份"
 
-        #    靶心二的现场：用户用 memory_append 往已有窗口里写了一句
+        #    靶心二的现场：用户用 latent_append 往已有窗口里写了一句
         append_record(root / "memory", APPEND_ONE, "还没报名", window=2)
         assert APPEND_ONE in window_02()
 
@@ -4545,7 +4545,7 @@ _SELFTEST_SUMMARY = (
           "TASK_DIRECTIVE_REMAINS 在该节有一个带 diff 的「删除该块」版本，选它能出货 / "
           "重跑出货不许静默覆盖语料（判据落在目录层、取「内容不同」；两条出口"
           "--backup-corpus／--accept-corpus-overwrite 都实跑过；⚠ 靶心二看的是"
-          "memory_append 写进去的那句话还在不在，不拿「出货成功、无报错」当证据） / "
+          "latent_append 写进去的那句话还在不在，不拿「出货成功、无报错」当证据） / "
           "节标题在产出文件里只出现一次（标题块打 delete，原文仍被逐字认领）＋"
           "人称取用户自己在标题里的写法，不是中性的「对方」"
           "（⚠ 两条分开断言；⚠ 不拿覆盖率 1.0 当通过证据，它不看 operation） / "
@@ -6127,7 +6127,7 @@ def _step_ship(args, state):
         # 跟静默覆盖是同一种坏法，只是多了一份没人知道的备份
         print(f"\n⚠ 目标记忆库里原来那些窗口会被这次出货改写，整个 timeline 已备份成："
               f"{paths['corpus_backup']}")
-        print("   你后来用 memory_append 写进去的内容在那份备份里，"
+        print("   你后来用 latent_append 写进去的内容在那份备份里，"
               "对着它把该留的贴回 memory/timeline/。（备份只加不减，我们不会删它。）")
     if paths.get("overwritten_backup"):
         # **沉默地覆盖才是最坏的形态**：老用户升级重跑 ship 是对的做法，但他手改过
@@ -6277,7 +6277,7 @@ if __name__ == "__main__":
                     help="confirm 步：只列出待确认草稿，不进交互循环")
     ap.add_argument("--decisions-json", dest="decisions_json",
                     help="confirm 步：结构化决定（同上三种取值），非交互落盘")
-    # 重跑出货会盖掉目标 timeline 里已有的窗口（包括用户后来用 memory_append 写进去
+    # 重跑出货会盖掉目标 timeline 里已有的窗口（包括用户后来用 latent_append 写进去
     # 的），所以默认拦住。**拦截必须留出口**，这两个就是；「换目录」那一支刻意不做
     # ——`--out` 本来就能换，为它新开开关等于凭空多一套目录语义
     ap.add_argument("--backup-corpus", dest="backup_corpus", action="store_true",

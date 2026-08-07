@@ -3,8 +3,8 @@
 时间语义显式化（任务卡"写回时区与跨日归窗"第一节）。
 
 **这个文件存在的理由是一次真机事故**：2026.08.04 东八区当地时间 02:03～02:06，用户从手机
-Connector 调 `memory_append`／`memory_correct`，工具全部返回成功，五个写回块却全部落进
-`window_39_2026-08-03.md`，检索与 `session_start` 统一标成 `[2026.08.03]`。根因是
+Connector 调 `latent_append`／`latent_correct`，工具全部返回成功，五个写回块却全部落进
+`window_39_2026-08-03.md`，检索与 `latent_session_start` 统一标成 `[2026.08.03]`。根因是
 `append_record()` 用 `datetime.fromtimestamp(now)` 算"今天"——那是**宿主进程的本地
 时区**，不是记忆所有者的时区。服务器在 UTC 的 VPS 上，于是东八区每天 00:00～07:59
 写下的记忆，稳定地被记成前一天。

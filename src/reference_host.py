@@ -8,7 +8,7 @@
 刹车（内部设计资料里写死，逐字执行）：**永远不超过"能验证契约"的最小形态**——
 多一个产品功能（流式、多轮管理、配置系统、idle 超时……）就是在做前端，直接砍。
 会话 = 进程一次运行：每次起动从磁盘重读 persona（契约三），exit/Ctrl-D 结束。
-session_start / thread_close 都不由宿主代调——模型主不主动，正是异构实测要看的。
+latent_session_start / latent_thread_close 都不由宿主代调——模型主不主动，正是异构实测要看的。
 
 用法：
   python reference_host.py <产出目录>    # 目录里要有 persona.md 与 mcp-config.json
@@ -177,18 +177,18 @@ def _selftest():
             "args": [str(server), "--corpus", str(corpus)]}}}), encoding="utf-8")
         mcp = McpClient(cfgp)
         try:
-            assert [t["name"] for t in mcp.tools] == ["memory_search", "session_start",
-                                                      "memory_append", "memory_correct",
-                                                      "thread_close"]
+            assert [t["name"] for t in mcp.tools] == ["latent_search", "latent_session_start",
+                                                      "latent_append", "latent_correct",
+                                                      "latent_thread_close"]
             assert "长期" in mcp.instructions, "instructions 要拿到手——坑①的宿主侧责任"
-            assert "保险丝熔断" in mcp.call("memory_search", {"query": "咖啡机"})
+            assert "保险丝熔断" in mcp.call("latent_search", {"query": "咖啡机"})
 
             # 工具调用回路（假 API，不联网）：先要工具、再作答；tool 结果要回进
             # history，且回路里每一轮的请求都重走 build_request（契约二穿透真回路）
             seen = []
             replies = [{"role": "assistant", "content": None, "tool_calls": [
                             {"id": "c1", "type": "function",
-                             "function": {"name": "memory_search",
+                             "function": {"name": "latent_search",
                                           "arguments": '{"query": "咖啡机"}'}}]},
                        {"role": "assistant", "content": "查到了。"}]
             fake = lambda payload: (seen.append(payload), replies.pop(0))[1]

@@ -11,8 +11,8 @@
 1. **CLI 一次性流程，不是 MCP 工具**：初始化要多轮来回确认，塞不进模型驱动的
    单次工具往返。
 2. **产出成套文件，不是一份 md**：人格文件走客户端原生格式（Claude Code 的
-   CLAUDE.md / Codex 的 AGENTS.md），因为人格是不变量层、本来就该常驻上下文，
-   走检索是错配。
+   CLAUDE.md／Codex 的 AGENTS.md／Grok Build 的 `.grok/agents/companion.md`），
+   因为人格是不变量层、本来就该常驻上下文，走检索是错配。
 3. **LLM 默认走"导出 prompt 让用户拿去自己的模型跑"**：零密钥、零 HTTP 依赖、
    语料不出本机，而且用户手上的模型往往比我们能内置的便宜模型更好。纯本地规则
    兜底（draft_extraction 已能出候选），内置 API 留作将来可选项。
@@ -34,7 +34,7 @@
 用法：
   python memory_init.py --selftest
   python memory_init.py --out <产出目录> [--persona <原人格文件>] [--corpus <语料目录>]
-                        [--client claude-code|codex|generic]
+                        [--client claude-code|codex|grok|generic]
 """
 
 import argparse
@@ -63,8 +63,41 @@ from persona_template import (
 CLIENT_FILENAMES = {
     "claude-code": "CLAUDE.md",
     "codex": "AGENTS.md",
+    "grok": ".grok/agents/companion.md",
     "generic": "persona.md",
 }
+
+GROK_AGENT_FRONTMATTER = (
+    "---\n"
+    "name: companion\n"
+    "description: 记忆协议生成的长期陪伴主会话\n"
+    "---\n\n"
+)
+
+
+def client_persona_text(client, rendered):
+    """按宿主文件契约包装最终人格正文；不改变已确认的人格内容。"""
+    if client == "grok":
+        return GROK_AGENT_FRONTMATTER + rendered
+    return rendered
+
+
+def shipped_persona_state_value(out_dir, persona_path):
+    """状态保存相对产出目录的 POSIX 路径，兼容平面文件与嵌套客户端目录。"""
+    return Path(persona_path).resolve().relative_to(Path(out_dir).resolve()).as_posix()
+
+
+def retirable_persona_path(out_dir, previous_persona):
+    """只把受支持且仍位于产出目录内的已知人格路径交给退役文件操作。"""
+    if previous_persona not in CLIENT_FILENAMES.values():
+        return None
+    out = Path(out_dir).resolve()
+    stale = out / previous_persona
+    try:
+        stale.resolve().relative_to(out)
+    except ValueError:
+        return None
+    return stale
 
 # 自建前端档要随货带一份注入契约：机制能不能立住全看宿主侧那四件事做没做到
 # （逐字/每轮/重读/整块），而 generic 档恰恰没有宿主替他做。契约不随货，
@@ -388,6 +421,58 @@ COVERAGE_TEMPLATE = (
     "别因为一件事晚于 {end} 就说“我这儿没有”。真查不到再说“我这边翻到的记录"
     "到某某为止”（用你实际查到的最晚日期，不是 {end}）。"
     "早于 {start} 的事你确实没有记录——不是没发生过，是不在你这儿。")
+
+
+# 「原人格直接使用」是用户主动选择的旁路：不拆块、不归入十二节，也不声称通过了
+# 编译闸门；只给**出货副本**追加这一段受管协议。输入位于产出目录外时一个字不动。
+# 两个标记是我们唯一有权在重跑时替换的范围；标记坏了宁可停，也不猜用户正文边界。
+DIRECT_PROTOCOL_START = "<!-- LATENT_MEMORY_PROTOCOL_START -->"
+DIRECT_PROTOCOL_END = "<!-- LATENT_MEMORY_PROTOCOL_END -->"
+DIRECT_PROTOCOL_HEADING = "## Latent 记忆协议"
+DIRECT_PROTOCOL_SIMILAR_TEXT = "DIRECT_PROTOCOL_SIMILAR_TEXT"
+
+
+def direct_protocol_markdown():
+    """渲染直接接入的最低协议；检索约定只从现有黄金串取，不另抄近似版本。"""
+    retrieval = fill_pronouns(PROTOCOL_DEFAULTS[RETRIEVAL_CONVENTION_FIELD][2], {})
+    return (
+        f"{DIRECT_PROTOCOL_START}\n{DIRECT_PROTOCOL_HEADING}\n\n"
+        f"{retrieval}\n\n"
+        "**写回约定**：对话中出现值得跨会话保留的新事实，用 latent_append 写入记忆库。\n"
+        f"{DIRECT_PROTOCOL_END}"
+    )
+
+
+def render_direct_persona(source_text):
+    """返回（原人格＋受管协议块, warnings）；只替换自己标记的范围。"""
+    start_count = source_text.count(DIRECT_PROTOCOL_START)
+    end_count = source_text.count(DIRECT_PROTOCOL_END)
+    if start_count != end_count or start_count > 1:
+        raise ValueError(
+            "DIRECT_PROTOCOL_MARKER_BROKEN：Latent 受管协议标记缺一边或重复；"
+            "请保留一对完整起止标记，或删掉坏标记后重跑。")
+
+    managed = direct_protocol_markdown()
+    if start_count == 1:
+        start = source_text.index(DIRECT_PROTOCOL_START)
+        end = source_text.index(DIRECT_PROTOCOL_END)
+        if end < start:
+            raise ValueError(
+                "DIRECT_PROTOCOL_MARKER_BROKEN：Latent 受管协议结束标记跑到了开始标记前面；"
+                "请把一对标记顺序修正后重跑。")
+        end += len(DIRECT_PROTOCOL_END)
+        outside = source_text[:start] + source_text[end:]
+        rendered = source_text[:start] + managed + source_text[end:]
+    else:
+        outside = source_text
+        rendered = source_text.rstrip("\n") + "\n\n" + managed + "\n"
+
+    warnings = []
+    # 只把「记忆库」标题当作既有协议信号；普通正文提到记忆库很常见，不能因此每次报警。
+    has_memory_heading = re.search(r"(?m)^#{1,6}\s+记忆库(?:\s|$)", outside) is not None
+    if "latent_search" in outside or DIRECT_PROTOCOL_HEADING in outside or has_memory_heading:
+        warnings.append(DIRECT_PROTOCOL_SIMILAR_TEXT)
+    return rendered, warnings
 
 # 检索约定那条的中性写法**由模板生成，不在上面手抄一份**：它整段包含三轮真机验证过
 # 的黄金串，手抄就等于把黄金串复制成两份，改一处漏一处。这一条是唯一允许机械填充的
@@ -1340,7 +1425,8 @@ def python_command(portable=False):
 
 
 def mcp_config_snippet(server_path, corpus_dir, threads_path, route=None,
-                       client=None, portable_root=None, timezone=None):
+                       client=None, portable_root=None, timezone=None,
+                       index_dir=None):
     """给用户直接粘贴的 MCP 配置。路径统一用正斜杠——JSON 里反斜杠要转义，
     而正斜杠在 Windows 上一样认，少一个踩坑点。
 
@@ -1352,7 +1438,8 @@ def mcp_config_snippet(server_path, corpus_dir, threads_path, route=None,
     **但绝对路径跟着机器走**（2026.08.02，真实用户在云端容器里当场接不上）：
     同一份配置换台机器/换个容器就断，而且 MCP server 起不来**不报到用户脸上**
     ——会话照开、模型照回话，只是没有那五个工具。所以 Claude Code 档在
-    「三个路径都在产出目录下」时（§3b 那种整套进仓库的形态）改产
+    「全部路径都在产出目录下」时（当前出货是 server、语料、threads、独立索引四条；
+    §3b 那种整套进仓库的形态）改产
     `${CLAUDE_PROJECT_DIR:-.}/…` 可搬运写法。三个硬边界：
       - **只有 Claude Code 认这个占位符**（官方文档核过），Codex/闭源前端/自建
         前端给了就是 file not found——所以按 client 分档，不猜别家有等价物；
@@ -1371,6 +1458,8 @@ def mcp_config_snippet(server_path, corpus_dir, threads_path, route=None,
     **key 永远不进这个文件**——云端档只在这里写"走云端"，endpoint/模型/key 全从
     环境变量读；这份配置会跟着产出目录走，用户会随手把它贴给别人。"""
     paths = [Path(server_path), Path(corpus_dir), Path(threads_path)]
+    if index_dir is not None:
+        paths.append(Path(index_dir))
     rels = None
     if client == "claude-code" and portable_root:
         root = Path(portable_root).resolve()
@@ -1382,7 +1471,7 @@ def mcp_config_snippet(server_path, corpus_dir, threads_path, route=None,
         vals = [PORTABLE_PREFIX + str(r).replace("\\", "/") for r in rels]
         note = CONFIG_NOTE + CONFIG_NOTE_PORTABLE
     else:
-        # ⚠ 三个都要 `resolve()`，不是只有 server 那个（走查台账 08-03 第六条）：
+        # ⚠ 全部都要 `resolve()`，不是只有 server 那个（走查台账 08-03 第六条）：
         # 原来只有 `paths[0]` 解了，`corpus_dir` 与 `threads_path` 是裸 `str()`
         # ——而同一行拼进去的 `CONFIG_NOTE_MACHINE_BOUND` 写着"写死了这台机器的
         # 绝对路径"，**三分之一是真的**。用户拿相对路径起 `--out` 时，配置里落下的
@@ -1404,12 +1493,14 @@ def mcp_config_snippet(server_path, corpus_dir, threads_path, route=None,
                      f"跟上面填的默认值不一样。这**不代表**该填 {here_tz}——"
                      "要填的是你自己所在的时区，不是这台机器的。仅供你核对时参考。）")
         tz = DEFAULT_TIMEZONE
+    args = [vals[0], "--corpus", vals[1]]
+    if index_dir is not None:
+        args += ["--index-dir", vals[3]]
+    args += ["--threads", vals[2], "--timezone", tz]
     cfg = {CONFIG_NOTE_KEY: note,
            "mcpServers": {"memory": {
                "command": command,
-               "args": [vals[0], "--corpus", vals[1], "--threads", vals[2],
-                        "--timezone", tz]
-                       + route_args(route or ROUTE_DEFAULT),
+               "args": args + route_args(route or ROUTE_DEFAULT),
            }}}
     return json.dumps(cfg, ensure_ascii=False, indent=2)
 
@@ -1423,7 +1514,8 @@ INDEX_README = """这个目录是记忆库的索引层（规格 §5）：高密�
 原话、当时在处理什么，都留着，不要润色成读后感。有两种补法，各补各的缺口：
 
 【一】按窗口摘要
-把 ../timeline/ 里的某个窗口整段贴给模型，写一段 200 字左右的摘要，存成跟那个
+把主语料 timeline/ 里的某个窗口（路径见 mcp-config.json 的 --corpus）整段贴给模型，
+写一段 200 字左右的摘要，存成跟那个
 窗口同名的文件，例如 window_07_2026-07-20.md 。索引层和叙事层同名同窗口号，
 检索层会自动把它们认成同一次会话的两种写法，日期也跟着继承过来。
 
@@ -1737,6 +1829,10 @@ def ship_note(client):
                 f"照产出目录里的《{CONTRACT_DOC}》把 persona.md 拼进你自己的请求"
                 "（逐字完整／每轮都在／每会话从磁盘重读／整块连续／易变内容后置），"
                 "再按契约末尾那步验证接通。")
+    if client == "grok":
+        return ("【下一步】Grok 人格已写入 .grok/agents/companion.md。"
+                "在 Grok Build 的 /agents 中选择 companion，或从产出目录运行 "
+                "grok --agent companion，再把 mcp-config.json 中的配置接入客户端。")
     return ("【下一步】把 mcp-config.json 里的配置加进你的客户端，然后"
             "**从产出目录起会话**——人格文件在那儿才会被宿主读到。")
 
@@ -1824,9 +1920,9 @@ def corpus_coverage(corpus_dir, entries=None):
 def memory_report_lines(paths, corpus_dir):
     """出货报告里「记忆库」那一段（2026.08.05 外部实测第 1 条，按杀伤力排第一）。
 
-    在此之前两条出货路径都只打一行 `记忆库：<out>/memory`。**六步走这条路上那是个
-    空目录**——`write_bundle` 只 `mkdir` 出来，一个字都不往里写；检索真正读的是用户
-    `--corpus` 指的那个目录（`mcp-config.json` 里 `--corpus` 也指着它）。
+    在此之前两条出货路径都只打一行 `记忆库：<out>/memory`。六步走的叙事语料其实在
+    用户 `--corpus` 指的目录；现在 `<out>/memory` 只承载独立 `index/`，不能把整个目录
+    再冒充叙事记忆库，也不能说它全空。报告必须把两处分别指明。
     报告说的和事实差着一个目录，而**这是新手看到的第一屏**。
 
     ⚠ 《快速上手》后段确实解释过「七步走不写 timeline」，但那是另一屏——
@@ -1834,21 +1930,24 @@ def memory_report_lines(paths, corpus_dir):
     ⚠ 判据是「这次到底往哪儿落了盘」，不是「哪条命令」：`--import` 那条路真写了窗口
     文件（`corpus_files` 非空），那行就照旧报 `<out>/memory`，它此刻是真的。"""
     memory_dir = paths["memory_dir"]
+    index_dir = paths["index_dir"]
     written = paths.get("corpus_files") or []
     if written:
-        return [f"  记忆库：{memory_dir}（落盘 {len(written)} 个窗口文件）"]
-    if corpus_dir and Path(corpus_dir).resolve() != Path(memory_dir).resolve():
-        return [
+        lines = [f"  记忆库：{memory_dir}（落盘 {len(written)} 个窗口文件）"]
+    elif corpus_dir and Path(corpus_dir).resolve() != Path(memory_dir).resolve():
+        lines = [
             f"  记忆库：{Path(corpus_dir).resolve()}"
             f"（就是你 --corpus 指的那个目录；检索读的是它，"
             f"mcp-config.json 里 --corpus 也指着它）",
-            f"  ⚠ 顺带说清：{memory_dir} 是这次顺手建出来的**空目录**，"
-            f"这条路上我们一个字都不往里写（要我们替你建库是另一条路："
-            f"出货时加 --import <导出文件>）。别把它抄进客户端配置。",
         ]
-    return [f"  记忆库：{memory_dir}"
-            f"（**空的**——这次既没给 --corpus，也没给 --import，"
-            f"所以还没有任何可检索的内容；补语料的两条路见《快速上手》§2）"]
+    else:
+        lines = [f"  记忆库：{memory_dir}"
+                 f"（**没有叙事语料**——这次既没给 --corpus，也没给 --import；"
+                 f"补语料的两条路见《快速上手》§2）"]
+    lines.append(
+        f"  索引摘要目录：{Path(index_dir).resolve()}"
+        "（README.txt 只是写法说明；放入摘要 .md 后才有索引层）")
+    return lines
 
 
 def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
@@ -1861,7 +1960,7 @@ def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
 
     **只写我们自己的产出，只动我们上一次真的出过的那一个文件**（2026.08.02 三轮
     验收后改准；原话是"不动同目录其它 md"，退役逻辑加进来之后那句已经不成立）。
-    `previous_persona` 是**上一次出货写下的人格文件名**，由调用方（CLI 从
+    `previous_persona` 是**上一次出货写下的人格相对路径**，由调用方（CLI 从
     init_state.json）传进来；只有它、且它跟这次的档不同名时才退役。不传就一个都不碰。
 
     entries 给了就把语料落成记忆库（write_corpus）；没给就只把目录建出来——
@@ -1900,6 +1999,9 @@ def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
     else:
         written = []
     (out / "memory").mkdir(parents=True, exist_ok=True)
+    index_dir = out / "memory" / "index"
+    index_dir.mkdir(parents=True, exist_ok=True)
+    (index_dir / "README.txt").write_text(INDEX_README, encoding="utf-8")
     corpus = Path(corpus_dir) if corpus_dir else out / "memory"
     # **覆盖区间要在渲染之前写进人格文件**：它是每轮都在的那一层，而护栏挂在工具
     # 返回值上的话，模型一绕过工具（grep、直接读文件）就一条都不生效
@@ -1923,8 +2025,10 @@ def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
     #      出的），把这件事明确说出来——沉默地覆盖才是最坏的形态。
     #      注意判据取"内容不同"而不是"有没有 .bak"：第一次出货时磁盘上没有旧文件，
     #      那不是"被改过"，不该报。
+    persona_path.parent.mkdir(parents=True, exist_ok=True)
     previous_text = persona_path.read_text(encoding="utf-8") if persona_path.exists() else None
-    rendered = rendered_override if rendered_override is not None else render_persona_md(persona)
+    rendered_body = rendered_override if rendered_override is not None else render_persona_md(persona)
+    rendered = client_persona_text(client, rendered_body)
     overwritten = None
     if previous_text is not None and previous_text != rendered:
         backup = persona_path.with_name(persona_path.name + ".bak")
@@ -1949,16 +2053,17 @@ def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
     # 目录里出现某个文件名，从来不等于那文件是我们写的。
     retired = []
     if previous_persona and previous_persona != CLIENT_FILENAMES[client]:
-        stale = out / previous_persona
-        if stale.exists():
-            bak = stale.with_name(previous_persona + ".bak")
+        stale = retirable_persona_path(out, previous_persona)
+        if stale is not None and stale.exists():
+            bak = stale.with_name(stale.name + ".bak")
             stale.replace(bak)      # 同名 .bak 已存在就覆盖：影子副本不值得留两份
             retired.append(bak)
     # server 默认取**本文件同目录**的 mcp_server.py，不取当前工作目录——
     # 出货时 cwd 是什么谁也保证不了，而这两个文件在包里永远是同级
     server = server_path or Path(__file__).resolve().parent / "mcp_server.py"
     cfg = mcp_config_snippet(server, corpus, out / "threads.jsonl", route=route,
-                             client=client, portable_root=out, timezone=timezone)
+                             client=client, portable_root=out, timezone=timezone,
+                             index_dir=index_dir)
     (out / "mcp-config.json").write_text(cfg, encoding="utf-8")
     # 第四件：闭源前端的引导句（小字段放指针、全文留文件）。所有档都出——
     # 宿主客户端用不上它，但「日后要不要接一个闭源前端」出货时不知道，
@@ -1975,6 +2080,7 @@ def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
         contract = out / CONTRACT_DOC
         contract.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
     return {"persona": persona_path, "memory_dir": out / "memory",
+            "index_dir": index_dir,
             "mcp_config": out / "mcp-config.json", "corpus_files": written,
             "guidance": guidance, "contract": contract, "retired": retired,
             "overwritten_backup": overwritten, "corpus_backup": corpus_backup}
@@ -3235,18 +3341,19 @@ def _selftest():
         assert not any("MEMORY_EMBED" in x or "http" in x for x in a), \
             f"{r} 档把 endpoint/环境变量名写进了 MCP 配置：{a}"
 
-    # 9e2.【变异靶心：三个路径都要解成绝对路径，不是只有 server】走查台账 08-03 第六条。
+    # 9e2.【变异靶心：所有路径都要解成绝对路径，不是只有 server】走查台账 08-03 第六条。
     #      原先只有 `paths[0]` 走了 `resolve()`，`--corpus` 与 `--threads` 是裸 `str()`
     #      ——而同一份配置里那句 `CONFIG_NOTE_MACHINE_BOUND` 写着"写死了这台机器的
     #      绝对路径"，**三分之一是真的**。用户拿相对路径起 `--out`（`--out .` 这种）
     #      时配置里就落相对值，而客户端起 server 的工作目录跟他当时 cd 的地方无关。
     #      ⚠ **靶子必须喂相对路径**：走 `write_bundle(td, …)` 那条路时 `td` 本来就是
-    #      绝对的，**三个值不 resolve 也全是绝对路径，断言恒真**——第一版就是这么写的，
+    #      绝对的，**所有值不 resolve 也全是绝对路径，断言恒真**——第一版就是这么写的，
     #      变异不红才发现。**"断言在缺陷面前全绿"跟"没有这条断言"是一回事。**
     rel_args = json.loads(mcp_config_snippet(
-        "mcp_server.py", "memory", "threads.jsonl"))["mcpServers"]["memory"]["args"]
+        "mcp_server.py", "memory", "threads.jsonl",
+        index_dir="bundle/memory/index"))["mcpServers"]["memory"]["args"]
     for label, value in (("server", rel_args[0]), ("--corpus", rel_args[2]),
-                         ("--threads", rel_args[4])):
+                         ("--index-dir", rel_args[4]), ("--threads", rel_args[6])):
         assert Path(value).is_absolute(), \
             f"mcp-config.json 里 {label} 落的是相对路径，换个工作目录就指不对：{value}"
 
@@ -3292,9 +3399,10 @@ def _selftest():
         root = Path(td)
         (root / "src").mkdir()
         (root / "src" / "mcp_server.py").write_text("# 占位\n", encoding="utf-8")
-        (root / "memory").mkdir()
+        (root / "memory" / "index").mkdir(parents=True)
         inside = dict(server_path=root / "src" / "mcp_server.py",
-                      corpus_dir=root / "memory", threads_path=root / "threads.jsonl")
+                      corpus_dir=root / "memory", threads_path=root / "threads.jsonl",
+                      index_dir=root / "memory" / "index")
         cc = json.loads(mcp_config_snippet(**inside, client="claude-code",
                                            portable_root=root))
         cc_args = cc["mcpServers"]["memory"]["args"]
@@ -3320,7 +3428,8 @@ def _selftest():
         outside = json.loads(mcp_config_snippet(
             Path(__file__).resolve().parent / "mcp_server.py",
             root / "memory", root / "threads.jsonl",
-            client="claude-code", portable_root=root))
+            client="claude-code", portable_root=root,
+            index_dir=root / "memory" / "index"))
         oargs = outside["mcpServers"]["memory"]["args"]
         assert not any("${" in x for x in oargs), \
             f"server 不在产出目录下还产占位符，就是半套可搬运的假货：{oargs}"
@@ -3720,7 +3829,7 @@ def _selftest():
                 partial_state, preview_payload(partial_state)["persona_markdown"],
                 partial_manifest)}
 
-    # 旧目录已有出货人格但没显式传 --persona 时，只能给两项迁移选择。
+    # 旧目录已有出货人格但没显式传 --persona 时，三条路都摆出来，仍不自动采用首项。
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         (root / "AGENTS.md").write_text("# 核心人格\n\n手改内容。\n", encoding="utf-8")
@@ -3729,7 +3838,7 @@ def _selftest():
              "--step", "inspect", "--json"], capture_output=True, text=True,
             encoding="utf-8", check=True)
         assert json.loads(migration.stdout)["choices"] == [
-            "treat_current_as_original", "continue_legacy"]
+            "treat_current_as_original", "use_original_as_is", "continue_legacy"]
 
     # 57. 真 CLI 走 inspect → 十二节选择 → preview → route → ship；函数绿不算接通。
     with tempfile.TemporaryDirectory() as td:
@@ -3879,7 +3988,7 @@ def _selftest():
         assert "去语料里找" not in shipped_text and "虚构自述" in shipped_text
 
     # 61b.【靶心，真命令】「出货文件全文零『它』」那条硬约束必须能看住**存量人格文件**。
-    #      （任务卡《零它硬约束对存量人格文件失效》，2026.08.04 走查现场第一条。）
+    #      靶子必须走「用户已有的人格文件」的 v2 七步：
     #      ⚠ **靶子必须是"用户已有的人格文件"走 v2 七步**，不许拿我们自己造的问卷人格
     #      代替——**那正是这个缺陷本身**：守着这条约束的老断言（`_ship_and_read` 那条）
     #      喂的是程序现造的 v1 问卷产物，**从没见过 v2 的产出**，于是旧版工具留下的
@@ -3952,7 +4061,7 @@ def _selftest():
             f"删干净了就不该再报——见字就报等于把 warning 变成噪声：{dropped_msg}"
 
     # 61d.【两个靶心，真命令】「材料很水」要有留空出口，而且**按得下去**。
-    #      （任务卡《材料很水时没有留空出口》，2026.08.04 走查现场第二条。）
+    #      现场复现形态：
     #      现场证据：十二节 `section_versions` 长度全是 1、`leave_empty` 一处都没有
     #      ——这一步退化成"十二节 × 1 个选项 × 12 次确认"的橡皮图章。
     #      ⚠ **靶心二才是这张卡的本体**：只让按钮出现、按下去却被
@@ -4386,6 +4495,9 @@ def _selftest():
         probe_corpus.mkdir()
         corpus_line = "2020-04-04 虚构丁。"
         (probe_corpus / "w1.md").write_text(corpus_line + "\n", encoding="utf-8")
+        probe_corpus_before = {
+            str(p.relative_to(probe_corpus)): p.read_bytes()
+            for p in probe_corpus.rglob("*") if p.is_file()}
         probe_out = root / "产出"
         probe_out.mkdir()
 
@@ -4430,17 +4542,24 @@ def _selftest():
         }, ensure_ascii=False), "--json")
         keep_ship = probe_ship(pick_delete=False)
 
-        # a)【靶心】报告里的「记忆库」必须指 --corpus 那个目录，而不是空的 <out>/memory。
+        # a)【靶心】报告里的「记忆库」必须指 --corpus 那个目录，另把 <out>/memory/index
+        #    明说成第二读取根，不能把两层混成一个目录。
         #    ⚠ 判据是**那一行里出现的是哪个路径**，不是"报告里提没提 memory"——
         #    缺陷版本打的正是 `记忆库：<out>/memory`，而那个目录一个文件都没有
         #    （六步走这条路 write_bundle 只 mkdir、不写盘），检索读的是 --corpus。
-        #    ⚠ 反面那半也要钉：空目录这件事**必须被说出来**，否则用户照抄它进配置。
+        #    ⚠ 产出 memory/ 现在只拥有独立索引目录；不能再把它整段叫成空记忆库。
         memory_line = next(line for line in keep_ship.splitlines() if "记忆库：" in line)
         assert str(probe_corpus.resolve()) in memory_line, \
-            f"出货报告把检索读不到的空目录当成记忆库报出来了：{memory_line}"
-        assert not list((probe_out / "memory").iterdir()), \
-            "夹具前提变了：这条路上 <out>/memory 本该是空的，空目录那半断言失去靶子"
-        assert "空目录" in keep_ship, "空的 <out>/memory 没被说出来，用户会照抄它进配置"
+            f"出货报告把只装索引的产出目录当成叙事记忆库报出来了：{memory_line}"
+        probe_index = probe_out / "memory" / "index"
+        assert (probe_index / "README.txt").read_text(encoding="utf-8") == INDEX_README
+        assert not list(probe_index.glob("*.md")), "出货不许伪造索引摘要"
+        assert "索引摘要目录" in keep_ship and str(probe_index.resolve()) in keep_ship, \
+            f"报告必须把第二读取根指给用户：{keep_ship}"
+        assert probe_corpus_before == {
+            str(p.relative_to(probe_corpus)): p.read_bytes()
+            for p in probe_corpus.rglob("*") if p.is_file()}, \
+            "外部 --corpus 不许被出货改写"
 
         # b)【靶心】配置里的 command 必须是这台机器上真能跑的解释器。
         #    ⚠ 判据是**能不能起进程**，不是"是不是字面 python3"：写死任何一个名字都
@@ -4448,6 +4567,9 @@ def _selftest():
         #    而症状是客户端 spawn 静默失败、没有一行指回这个字段）。
         probe_cfg = json.loads(
             (probe_out / "mcp-config.json").read_text(encoding="utf-8"))
+        probe_args = probe_cfg["mcpServers"]["memory"]["args"]
+        assert probe_args[probe_args.index("--index-dir") + 1].replace("\\", "/").endswith(
+            "/memory/index"), f"配置没有接入独立索引目录：{probe_args}"
         probe_command = probe_cfg["mcpServers"]["memory"]["command"]
         assert subprocess.run([probe_command, "-c", "import sys"],
                               capture_output=True).returncode == 0, \
@@ -4504,13 +4626,206 @@ def _selftest():
         assert "STALE_COUNT_ASSERTION" not in quiet_ship, \
             f"那一节一条语料都没并进来，「以下三条」仍然是真话，不许报：{quiet_ship}"
 
+    # 74.【原人格直接接入】受管协议块只追加／替换自己的范围，不碰用户正文。
+    #     变异靶心：删掉任一工具约定、重复追加、吞掉代码块里的标题、遇到坏标记仍猜着写、
+    #     漏报相似旧协议或把来源 blocking 洗绿，下面至少一条会红。期望值全部来自手写夹具，
+    #     不复用渲染函数自己算答案。
+    direct_source = "# 我的人格\n\n原文一字不动。\n\n```txt\n## 代码里的标题\n```\n"
+    direct_rendered, direct_warnings = render_direct_persona(direct_source)
+    assert direct_rendered.split(DIRECT_PROTOCOL_START, 1)[0].rstrip("\n") == \
+        direct_source.rstrip("\n"), "直接接入改动了受管标记外的用户正文"
+    assert all(name in direct_rendered for name in (
+        "latent_search", "latent_append", "latent_session_start", "latent_thread_close")), \
+        "直接接入的最低协议缺工具约定"
+    direct_rerendered, _ = render_direct_persona(direct_rendered)
+    assert direct_rerendered.count(DIRECT_PROTOCOL_START) == 1 and \
+        direct_rerendered.count(DIRECT_PROTOCOL_END) == 1, "重复出货把受管协议越叠越多"
+    assert direct_warnings == [], f"干净人格不该凭空报警：{direct_warnings}"
+    _, similar_warnings = render_direct_persona(
+        direct_source + "\n## 记忆库\n\n旧的检索约定。\n")
+    assert DIRECT_PROTOCOL_SIMILAR_TEXT in similar_warnings, \
+        "原人格已有未受管的记忆库协议标题时没有提醒可能重复"
+    for broken in (
+            direct_source + "\n" + DIRECT_PROTOCOL_START,
+            direct_source + "\n" + DIRECT_PROTOCOL_END + "\n" + DIRECT_PROTOCOL_START):
+        try:
+            render_direct_persona(broken)
+            assert False, "单边或倒序标记不许猜着改"
+        except ValueError as exc:
+            assert "DIRECT_PROTOCOL_MARKER_BROKEN" in str(exc), \
+                f"坏标记错误没给稳定代码：{exc}"
+    with tempfile.TemporaryDirectory() as td:
+        direct_root = Path(td)
+        direct_persona = direct_root / "成熟人格.md"
+        direct_persona.write_text(direct_source, encoding="utf-8")
+        direct_out = direct_root / "产出"
+
+        def direct_cli(*extra, check=True):
+            return subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "--out", str(direct_out),
+                 "--persona", str(direct_persona), *extra], capture_output=True,
+                text=True, encoding="utf-8", check=check)
+
+        direct_inspect = direct_cli(
+            "--step", "inspect", "--existing-persona-choice", "use_original_as_is", "--json")
+        direct_payload = json.loads(direct_inspect.stdout)
+        assert direct_payload["mode"] == "direct_persona" and \
+            direct_payload["skipped_steps"] == ["extract", "choose-sections", "preview"] and \
+            direct_payload["next"] == "--step route", \
+            f"直接接入 inspect 没有明确跳步和下一步：{direct_payload}"
+        assert not (direct_out / "persona-extraction").exists(), \
+            "用户选了直接接入，inspect 仍然生成了提取任务包"
+
+        compiled_out = direct_root / "编译产出"
+        compiled = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--out", str(compiled_out),
+             "--persona", str(direct_persona), "--step", "inspect", "--json"],
+            capture_output=True, text=True, encoding="utf-8", check=True)
+        compiled_payload = json.loads(compiled.stdout)
+        assert compiled_payload["mode"] == "compiler_v2" and \
+            compiled_payload["next"] == "--step extract", \
+            "不给新选择时旧的 --persona 编译路径发生了静默换路"
+
+        no_route = direct_cli("--step", "ship", "--client", "claude-code", check=False)
+        assert no_route.returncode != 0 and "检索路线还没选过" in no_route.stderr, \
+            f"直接接入绕过了隐私路线选择：{no_route.stdout}{no_route.stderr}"
+        direct_cli("--step", "route", "--route", "zero-dep")
+        direct_ship = direct_cli("--step", "ship", "--client", "claude-code")
+        shipped_direct = (direct_out / "CLAUDE.md").read_text(encoding="utf-8")
+        assert shipped_direct.split(DIRECT_PROTOCOL_START, 1)[0].rstrip("\n") == \
+            direct_source.rstrip("\n") and shipped_direct.count(DIRECT_PROTOCOL_START) == 1, \
+            "直接出货没有保住用户正文或把协议重复追加了"
+        assert direct_persona.read_text(encoding="utf-8") == direct_source, \
+            "产出目录外的输入人格被直接模式改写了"
+        direct_state = load_state(direct_out)
+        assert direct_state["shipping"]["compiler_gates_passed"] is False and \
+            direct_state["shipping"]["direct_persona_selected"] is True, \
+            "直接模式把跳过编译伪装成了编译闸门通过"
+        direct_cfg = json.loads((direct_out / "mcp-config.json").read_text(encoding="utf-8"))
+        direct_args = direct_cfg["mcpServers"]["memory"]["args"]
+        configured_corpus = Path(direct_args[direct_args.index("--corpus") + 1])
+        assert configured_corpus.resolve() == (direct_out / "memory").resolve(), \
+            "直接模式配置没有指向实际语料目录"
+
+        # 外部输入在 inspect 后变化必须拦；恢复原文后重跑则幂等。
+        direct_persona.write_text(direct_source + "\n后来改了一字。\n", encoding="utf-8")
+        changed = direct_cli("--step", "ship", "--client", "claude-code", check=False)
+        assert changed.returncode != 0 and "ORIGINAL_SOURCE_CHANGED" in changed.stderr, \
+            f"inspect 后源文件变化仍然出了货：{changed.stdout}{changed.stderr}"
+        direct_persona.write_text(direct_source, encoding="utf-8")
+        direct_cli("--step", "ship", "--client", "claude-code")
+        assert (direct_out / "CLAUDE.md").read_text(encoding="utf-8").count(
+            DIRECT_PROTOCOL_START) == 1, "同一外部输入重跑出货不幂等"
+
+        # 输入与目标同路径：允许用户选择覆盖，但必须先留备份，且下一次能识别自己的受管块。
+        same_out = direct_root / "同路径产出"
+        same_out.mkdir()
+        same_persona = same_out / "CLAUDE.md"
+        same_persona.write_text(direct_source, encoding="utf-8")
+
+        def same_cli(*extra, check=True):
+            return subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "--out", str(same_out),
+                 "--persona", str(same_persona), *extra], capture_output=True,
+                text=True, encoding="utf-8", check=check)
+
+        same_cli("--step", "inspect", "--existing-persona-choice", "use_original_as_is",
+                 "--json")
+        same_cli("--step", "route", "--route", "zero-dep")
+        same_cli("--step", "ship", "--client", "claude-code")
+        assert (same_out / "CLAUDE.md.bak").read_text(encoding="utf-8") == direct_source, \
+            "同路径覆盖前没有留下逐字相同的原人格备份"
+        same_cli("--step", "ship", "--client", "claude-code")
+        assert same_persona.read_text(encoding="utf-8").count(DIRECT_PROTOCOL_START) == 1, \
+            "同路径第二次出货没有把自己的受管块幂等更新"
+
+        skipped = direct_cli("--step", "extract", "--json", check=False)
+        assert skipped.returncode != 0 and "用户选择跳过" in skipped.stderr and \
+            "treat_current_as_original" in skipped.stderr, \
+            "直接模式误入编译步骤时没有解释用户选择和切换出口"
+
+        # inspect 会把来源问题如实存进状态；route 不能把它洗绿，ship 必须继续阻断。
+        missing_corpus = direct_root / "不存在的语料"
+        direct_cli("--corpus", str(missing_corpus), "--step", "inspect",
+                   "--existing-persona-choice", "use_original_as_is", "--json")
+        direct_cli("--step", "route", "--route", "zero-dep")
+        bad_source_ship = direct_cli("--step", "ship", "--client", "claude-code",
+                                     check=False)
+        assert bad_source_ship.returncode != 0 and \
+            "CORPUS_NOT_FOUND" in bad_source_ship.stderr, \
+            "直接模式把 inspect 已发现的阻断级来源问题静默洗绿了"
+
+    # Grok 主会话人格的生产变异靶心：客户端映射缺失、嵌套目录未建、frontmatter
+    # 漏包、状态只存 basename、换档备份对含目录的路径调用 with_name 失败，任一处都会红。
+    # 期望路径和头部来自 Grok Build 官方 agent 文件契约，不由实现常量反算。
+    with tempfile.TemporaryDirectory() as td:
+        grok_root = Path(td)
+        grok_source = grok_root / "原人格.md"
+        grok_source.write_text(direct_source, encoding="utf-8")
+        grok_out = grok_root / "产出"
+
+        def grok_cli(*extra, check=True):
+            return subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "--out", str(grok_out),
+                 "--persona", str(grok_source), *extra], capture_output=True,
+                text=True, encoding="utf-8", check=check)
+
+        grok_cli("--step", "inspect", "--existing-persona-choice",
+                 "use_original_as_is", "--json")
+        grok_cli("--step", "route", "--route", "zero-dep")
+        grok_ship = grok_cli("--step", "ship", "--client", "grok")
+        grok_persona = grok_out / ".grok" / "agents" / "companion.md"
+        grok_text = grok_persona.read_text(encoding="utf-8")
+        assert grok_text.startswith(
+            "---\nname: companion\ndescription: 记忆协议生成的长期陪伴主会话\n---\n\n"), \
+            "Grok agent 文件缺少可被宿主识别的最小 frontmatter"
+        assert direct_source.rstrip("\n") in grok_text and \
+            grok_text.count(DIRECT_PROTOCOL_START) == 1, \
+            "Grok 包装层吞掉了直接人格正文或 Latent 受管协议"
+        assert not (grok_out / "AGENTS.md").exists() and \
+            not (grok_out / ".grok" / "personas").exists(), \
+            "Grok 主会话人格误占 Codex 文件或落进仅供子 agent 的 personas 目录"
+        grok_state = load_state(grok_out)
+        assert grok_state["last_shipped_persona"] == ".grok/agents/companion.md", \
+            "状态只保存了 Grok 人格 basename，换档时会找不到嵌套旧文件"
+        assert "/agents" in grok_ship.stdout and "grok --agent companion" in grok_ship.stdout, \
+            "Grok 出货回执没有告诉用户如何启用 companion 主会话"
+
+        # 编译人格和直接人格必须走同一包装边界；不能只靠当前共享调用结构碰巧成立。
+        compiled_grok = Persona("partner")
+        fill_protocol_defaults(compiled_grok)
+        compiled_paths = write_bundle(
+            grok_root / "编译包装", compiled_grok, client="grok", confirmed=True,
+            validation_mode="compiler_v2", rendered_override="# 编译人格\n",
+            add_coverage=False)
+        assert compiled_paths["persona"].read_text(encoding="utf-8").startswith(
+            GROK_AGENT_FRONTMATTER + "# 编译人格\n"), \
+            "编译人格出 Grok 时漏掉了与直接人格共用的 agent 包装"
+
+        grok_cli("--step", "ship", "--client", "codex")
+        assert (grok_out / "AGENTS.md").is_file() and \
+            (grok_out / ".grok" / "agents" / "companion.md.bak").is_file(), \
+            "从 Grok 切到 Codex 时没有安全退役嵌套旧人格"
+
+        # 状态文件不是文件操作授权：伪造 ../ 路径也不能让下一次 ship 移动产出目录外文件。
+        outside = grok_root / "outside.md"
+        outside.write_text("外部文件不能动。\n", encoding="utf-8")
+        forged_state = load_state(grok_out)
+        forged_state["last_shipped_persona"] = "../outside.md"
+        save_state(grok_out, forged_state)
+        grok_cli("--step", "ship", "--client", "grok")
+        assert outside.exists() and \
+            outside.read_text(encoding="utf-8") == "外部文件不能动。\n" and \
+            not outside.with_name("outside.md.bak").exists(), \
+            "伪造的 last_shipped_persona 越过产出目录移动了外部文件"
+
     # 72.【一个靶心，元断言】**项数不许再靠增量漂**（2026.08.05 审核轮，CLAUDE.md 第 10 条）。
     #     **判据（先写后数）——一项 ＝ 一个「下辖断言的注释标头」**，只认两种形态：
     #     **A 型主组**＝缩进恰好 4 空格、`# 数字[小写字母].`（如 `# 61e.`）；
     #     **B 型子组**＝任意缩进、`# 小写字母[一位数字])`（如 `# a)` `# b2)`）。
     #     算法：按 A 切主组；主组内有下辖断言的 B → 计 B 的个数（**主组本身不再另计**，
     #     否则一个组数两遍），没有 B → 计 1；**标头到下一个标头之间没有 `assert` 的不计**。
-    #     按这条数出来是 **64**（这一组 `72` 自己也算一组；脚本即下面那个函数）。
+    #     按这条数出来是 **65**（这一组 `72` 自己也算一组；脚本即下面那个函数）。
     #     ⚠ **那行斜杠描述的条数跟项数不是一回事**，别拿它当项数的判据：描述里
     #     好几段是「甲＋乙＋丙」并着写的，一段对应两三个断言组。
     #     （这里原来写着一个具体的条数「55」，但**没有写下它是按什么切的**——
@@ -4529,7 +4844,7 @@ def _selftest():
 
 
 _SELFTEST_SUMMARY = (
-    "selftest ok（64项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
+    "selftest ok（65项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
           "归属句式 / 默认值不预支历史 / 协议层不问用户 / 导出纪律 / 渲染顺序 / "
           "人称锚死一套 / 用户只有一种称呼形态 / 昵称档不被静默吃掉 / 中性档不丢主语 / 人称从语料读出来 / 中性写法不许漏 / 语料侧判定不许猜 / 全文零它 / 称呼不重复拼接 / 关系状态归开篇 / "
           "答案读回不静默丢 / 任务书不泄漏进人格文件 / 长字面量不崩 / 未决草稿不蒸发 / "
@@ -4551,7 +4866,7 @@ _SELFTEST_SUMMARY = (
           "（⚠ 两条分开断言；⚠ 不拿覆盖率 1.0 当通过证据，它不看 operation） / "
           "选择题那一屏的节标题也不许漏人称占位符（⚠ 靶子必须是有 --persona 的那条路，"
           "零材料 state 走中性写法、这条恒真） / "
-          "mcp-config.json 里三个路径都是绝对的（⚠ 只查 server 那一条在缺陷面前全绿） / "
+          "mcp-config.json 里四个路径都是绝对的（⚠ 只查 server 那一条在缺陷面前全绿） / "
           "MCP 配置里没给时区就落默认东八区、探到的宿主时区一律只进说明不进 args"
           "（云服务器上探出来正好是 UTC，拿它顶替等于给那个缺陷发合格证）/ "
           "「出货文件全文零它」那条硬约束看得住存量人格文件（⚠ 靶子必须是用户已有的"
@@ -4573,8 +4888,8 @@ _SELFTEST_SUMMARY = (
           "找不到」在预览层单列 stale_versions 不混进未确认；⚠ 这三条是 2026.08.05 真机 "
           "state 打回来的）＋"
           "同一形态走真进程看 CLI 实际打出来的两行（61e b2：坏的就是印的那一层））/ "
-          "出货报告里的「记忆库」指的是检索真正读的那个目录，空的 <out>/memory "
-          "必须被说出来（73：⚠ 判据是那一行里出现的是哪个路径，"
+          "出货报告分别指明叙事记忆库与独立索引目录，README.txt 不冒充摘要，外部 corpus "
+          "保持不变（73：⚠ 判据是路径、文件内容与配置参数，"
           "不是「报告里提没提 memory」）＋"
           "mcp-config.json 的 command 在这台机器上真能起进程（⚠ 判据是能不能起，"
           "不是像不像 python3——写死任何一个名字都会在某类机器上挂）＋"
@@ -4584,6 +4899,8 @@ _SELFTEST_SUMMARY = (
           "按条目判会让这条 warning 改不掉）/ "
           "反向：那一节没并进语料时同一句数量断言一个字都不许报"
           "（73b：没有这一段，「见数字就报」跟「报得准」长得一模一样）/ "
+          "原人格直接接入的受管协议只动自己的标记范围（74：用户正文保真／四工具齐／"
+          "重复出货幂等／坏标记明确阻断／相似旧协议提醒／来源 blocking 不洗绿）/ "
           "⚠ 项数自己守自己（72：这一行的数字现读现数本文件，对不上就红——"
           "判据与算法见 72 那组注释）)")
 
@@ -4726,8 +5043,8 @@ def load_init_state(data):
 def version_key(version):
     """版本条目 → 它的 id。**唯一的取键口径**，读的地方都走这里。
 
-    ⚠ **拿不到就抛，不许返回 None**（任务卡《节版本双键收敛》靶心二）：
-    外部那个补丁就是 `version.get("version_id")` 取不到给 `None`，而决定那侧也可能
+    ⚠ **拿不到就抛，不许返回 None**：
+    若 `version.get("version_id")` 取不到时返回 `None`，而决定那侧也可能
     是 `None`，两个 `None` 一比就相等——`BOUNDARY_CONFLICT_UNRESOLVED` 于是被静默
     放过。**从「报错」退化成「假装通过」，比不改更坏。**
     ⚠ 兼容一句：2026.08.05 之前写出去的 state 同时有 `id` 与 `version_id` 且值恒等
@@ -4743,7 +5060,7 @@ def version_key(version):
 def _section_version_dict(version):
     """节版本 → 出给 CLI 的字典。
 
-    ⚠ **只写 `version_id` 一个键**（2026.08.05，任务卡《节版本双键收敛》）：
+    ⚠ **只写 `version_id` 一个键**：
     原先这里同时写 `id` 和 `version_id`、值恒等，而 `persona_compiler._version_to_dict`
     只写 `version_id`——**同一个对象两份序列化、键集不同**，读的一侧也就跟着分家
     （这边按 `id` 匹配、那边写着防御性回退）。真机上已经出现过失步的实例。
@@ -4798,9 +5115,8 @@ def _style_disclaimer_item():
 TASK_DIRECTIVE_TOKENS = ("去语料里找", "记住用户喜好", "请用户补写", "请写一句")
 
 # 维护者的硬约束词面：**出货文件全文零「它」**（人格文件里的 AI 不是"它"）。
-# ⚠ **这一条 2026.08.04 走查前对存量用户完全失效**（任务卡《零它硬约束对存量人格文件
-# 失效》）：守着它的断言（`_ship_and_read` 那条）靶子是**程序自己现造的 v1 问卷人格**，
-# 而七步走用的是 v2 编译器路径——输入是**用户已有的人格文件**，契约是「不改写、
+# ⚠ 这条约束必须覆盖**用户已有的人格文件**走 v2 编译器的路径；只拿程序现造的
+# v1 问卷人格做断言，会漏掉存量文件。七步走的契约是「不改写、
 # 不丢弃任何非空原文」。于是旧版工具留下的 `**它该记住你哪些方面**：…` 原样出货，
 # 10 个「它」、warning 0 条、blocking 0 条，**全程零提示**。
 #
@@ -5019,7 +5335,7 @@ def prepare_section_versions(state):
                 version_id=f"{section}:leave_empty", section=section,
                 item_ids=(), markdown="", source_summary=(), diff="")]
         elif all(item.source_type == "corpus" for item in section_items):
-            # 「本节留空」（任务卡《材料很水时没有留空出口》，2026.08.04 走查现场）：
+            # 「本节留空」：
             # 原先 `leave_empty` **只在某节一条材料都没有时**才被造出来，于是
             # 「有材料」的节永远只有"全收"一个选项——十二节 × 1 个选项 × 12 次确认，
             # 这一步退化成橡皮图章。
@@ -5595,7 +5911,7 @@ def _v2_inputs(args, state=None):
 
 
 def _existing_persona_paths(out_dir, state):
-    """只返回产出目录根下的已知人格文件名，不递归猜测其他 Markdown。"""
+    """只返回产出目录中的已知人格相对路径，不递归猜测其他 Markdown。"""
     out = Path(out_dir)
     names = []
     previous = state.get("last_shipped_persona")
@@ -5616,7 +5932,8 @@ def _step_inspect_v2(args, existing_state=None):
             "schema_version": 2,
             "mode": "migration_choice",
             "existing_persona_files": [str(path.resolve()) for path in existing_personas],
-            "choices": ["treat_current_as_original", "continue_legacy"],
+            "choices": ["treat_current_as_original", "use_original_as_is",
+                        "continue_legacy"],
             "next": "用 --existing-persona-choice 选择；不会自动采用首项",
         }
         if args.json:
@@ -5636,6 +5953,38 @@ def _step_inspect_v2(args, existing_state=None):
         persona_path = existing_personas[0]
 
     manifest = build_source_manifest(persona_path, args.corpus)
+    if args.existing_persona_choice == "use_original_as_is":
+        if not manifest.persona_file:
+            raise SystemExit("原人格直接接入要跟 --persona <现有人格文件> 一起用。")
+        state = new_v2_state(persona_path, args.corpus)
+        state.update({
+            "mode": "direct_persona",
+            "step": "inspected",
+            "source_manifest": _manifest_payload(manifest),
+            "source_hash": manifest.source_hashes.get(str(manifest.persona_file), ""),
+            "skipped_steps": ["extract", "choose-sections", "preview"],
+        })
+        save_state(args.out, state)
+        payload = {
+            "schema_version": 2,
+            "mode": "direct_persona",
+            "source_manifest": state["source_manifest"],
+            "skipped_steps": list(state["skipped_steps"]),
+            "blocking_issues": [issue for issue in state["source_manifest"]["issues"]
+                                if issue["severity"] == "blocking"],
+            "warnings": [issue for issue in state["source_manifest"]["issues"]
+                         if issue["severity"] == "warning"],
+            "note": "这是用户主动选择跳过三项编译检查，不代表这些检查已经通过；"
+                    "原人格正文不拆块、不重排，出货副本只追加 Latent 受管记忆协议。",
+            "next": "--step route",
+        }
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False))
+        else:
+            print("已选择原人格直接接入：跳过 extract／choose-sections／preview。"
+                  "跳过不等于通过编译检查。下一步：--step route。")
+        return
+
     state = new_v2_state(persona_path, args.corpus)
     state["source_manifest"] = _manifest_payload(manifest)
     if manifest.persona_file and not manifest.issues:
@@ -5843,16 +6192,103 @@ def _step_ship_v2(args, state):
         print(line)
     print(f"  MCP 配置：{paths['mcp_config']}")
     print(f"  引导句：{paths['guidance']}")
+    print("\n" + ship_note(client))
     state["step"] = "shipped"
     state["client"] = client
     state["route"] = route
-    state["last_shipped_persona"] = paths["persona"].name
+    state["last_shipped_persona"] = shipped_persona_state_value(args.out, paths["persona"])
     state["shipping"] = {
         "compiler_gates_passed": True,
         "preview_hash": payload["preview_hash"],
         "warnings": [_compile_issue_payload(issue) for issue in issues
                      if issue.severity == "warning"],
     }
+    save_state(args.out, state)
+
+
+def _step_ship_direct(args, state):
+    """原人格直用出货：用户选择跳过编译，绝不把这条路记成编译闸门已通过。"""
+    from persona_compiler import build_source_manifest
+
+    route = args.route or state.get("route")
+    if route not in RETRIEVAL_ROUTES:
+        raise SystemExit("不出货：检索路线还没选过。先运行 --step route --route <key>。")
+    persona_path, corpus_path = _v2_inputs(args, state)
+    manifest = build_source_manifest(persona_path, corpus_path)
+    blocking = [issue for issue in manifest.issues if issue.severity == "blocking"]
+    if blocking:
+        detail = "；".join(f"{issue.code}：{issue.message}" for issue in blocking)
+        raise SystemExit(f"不出货：来源检查仍有阻断项：{detail}")
+    if not manifest.persona_file:
+        raise SystemExit("不出货：原人格文件不存在。重新 --step inspect 并指明 --persona。")
+    actual_hash = manifest.source_hashes.get(str(manifest.persona_file), "")
+    if not state.get("source_hash") or actual_hash != state["source_hash"]:
+        raise SystemExit(
+            "不出货：ORIGINAL_SOURCE_CHANGED：原人格在 inspect 后发生变化。"
+            "请重新 --step inspect --existing-persona-choice use_original_as_is，"
+            "不要把新原文和旧选择混在一起。")
+
+    source_text = manifest.persona_file.read_text(encoding="utf-8")
+    try:
+        rendered, warning_codes = render_direct_persona(source_text)
+    except ValueError as exc:
+        raise SystemExit(f"不出货：{exc}")
+    for code in warning_codes:
+        print(f"⚠ {code}：原人格在 Latent 受管标记外已有记忆检索约定；"
+              "我们不会替用户删除或合并，出货副本可能出现重复说明。")
+    if warning_codes:
+        print()
+
+    # write_bundle 只借来复用目录、配置、备份与客户端出货；真正的人格文本由
+    # rendered_override 提供。协议默认 Persona 没有用户草稿，不会凭空触发确认关卡。
+    persona = Persona("partner")
+    fill_protocol_defaults(persona)
+    client, switched = resolve_client(args.client, state.get("client"))
+    if switched:
+        print(switched + "\n")
+    if args.timezone:
+        state["timezone"] = args.timezone
+    try:
+        paths = write_bundle(
+            args.out, persona, client=client, corpus_dir=corpus_path,
+            confirmed=True, previous_persona=state.get("last_shipped_persona"),
+            route=route, validation_mode="compiler_v2", rendered_override=rendered,
+            add_coverage=False, timezone=args.timezone or state.get("timezone"))
+    except (PermissionError, ValueError, FileNotFoundError) as exc:
+        raise SystemExit(f"不出货：{exc}")
+
+    print("【四件套】")
+    print(f"  人格文件：{paths['persona']}")
+    for line in memory_report_lines(paths, corpus_path):
+        print(line)
+    print(f"  MCP 配置：{paths['mcp_config']}")
+    print(f"  引导句：{paths['guidance']}")
+    if paths.get("overwritten_backup"):
+        print(f"\n⚠ 原人格与出货目标是同一文件或目标已有不同内容；覆盖前已备份成："
+              f"{paths['overwritten_backup']}")
+    print("\n【直接接入】这是用户选择跳过 extract／choose-sections／preview 的结果；"
+          "不代表十二节编译检查已经通过。")
+    print("若运行在临时云端容器，latent_append 写回后必须提交并 "
+          "git push origin HEAD，再合回默认分支；只留在容器磁盘会随回收丢失。")
+    print("\n" + route_note(route))
+    print("\n" + ship_note(client))
+
+    state["step"] = "shipped"
+    state["client"] = client
+    state["route"] = route
+    state["last_shipped_persona"] = shipped_persona_state_value(args.out, paths["persona"])
+    state["shipping"] = {
+        "compiler_gates_passed": False,
+        "direct_persona_selected": True,
+        "skipped_steps": list(state.get("skipped_steps", ())),
+        "warnings": warning_codes,
+    }
+    # 输入与目标同路径时，第一次出货本身就是用户确认过的改动；把哈希推进到我们刚写下
+    # 的副本，下一次才能幂等替换受管块。目标在别处时输入哈希保持 inspect 时的值。
+    if manifest.persona_file.resolve() == paths["persona"].resolve():
+        import hashlib
+        state["source_hash"] = hashlib.sha256(
+            paths["persona"].read_bytes()).hexdigest()
     save_state(args.out, state)
 
 
@@ -6097,7 +6533,7 @@ def _step_ship(args, state):
         print(switched + "\n")
         state["client"] = client
     try:
-        # last_shipped_persona：上一次出货**我们自己**写下的人格文件名。退役只认它——
+        # last_shipped_persona：上一次出货**我们自己**写下的人格相对路径。退役只认它——
         # 目录里叫 CLAUDE.md 的文件可能是用户自己给 Claude Code 写的项目指令，
         # 不是我们的货，不能碰（三轮验收打回）
         paths = write_bundle(args.out, persona, client=client,
@@ -6152,7 +6588,7 @@ def _step_ship(args, state):
     print("\n" + route_note(route))
     print("\n" + ship_note(client))
     state["step"] = "shipped"
-    state["last_shipped_persona"] = paths["persona"].name
+    state["last_shipped_persona"] = shipped_persona_state_value(args.out, paths["persona"])
     save_state(args.out, state)
 
 
@@ -6166,6 +6602,12 @@ def _cli(args):
     if step == "inspect":
         _step_inspect_v2(args, state)
         return
+    if state.get("mode") == "direct_persona" and step in (
+            "extract", "choose-sections", "preview"):
+        raise SystemExit(
+            "当前是用户选择的原人格直接接入，这三步已由用户选择跳过；"
+            "跳过不等于通过。如需十二节编译增强，请重新 --step inspect 并选择 "
+            "--existing-persona-choice treat_current_as_original。")
     if step == "extract":
         _step_extract_v2(args, state)
         return
@@ -6176,7 +6618,10 @@ def _cli(args):
         _step_preview_v2(args, state)
         return
     if not step:
-        if state.get("schema_version") == 2:
+        if state.get("mode") == "direct_persona":
+            step = {"inspected": "route", "route": "ship", "shipped": "ship"}.get(
+                state.get("step", ""), "inspect")
+        elif state.get("schema_version") == 2:
             step = {"": "inspect", "inspected": "extract", "extracted": "extract",
                     "candidates_loaded": "choose-sections",
                     "sections_chosen": "preview", "previewed": "route",
@@ -6187,6 +6632,14 @@ def _cli(args):
                     "answers": "confirm", "confirm": "route", "route": "ship",
                     "shipped": "ship"}[state.get("step", "")]
         print(f"（按进度接着跑：--step {step}）\n")
+        if state.get("mode") == "direct_persona":
+            if step == "route":
+                _step_route(args, state)
+            elif step == "ship":
+                _step_ship_direct(args, state)
+            else:
+                _step_inspect_v2(args, state)
+            return
         if state.get("schema_version") == 2:
             if step == "inspect":
                 _step_inspect_v2(args, state)
@@ -6209,6 +6662,8 @@ def _cli(args):
         _step_confirm(args, state)
     elif step == "route":
         _step_route(args, state)
+    elif step == "ship" and state.get("mode") == "direct_persona":
+        _step_ship_direct(args, state)
     elif step == "ship" and state.get("schema_version") == 2:
         _step_ship_v2(args, state)
     else:
@@ -6271,8 +6726,11 @@ if __name__ == "__main__":
                     help="inspect 步：确认输入人格文件这次少掉的整节就是你有意删的，"
                          "把 PERSONA_SECTION_COLLAPSED 从 blocking 降为 warning")
     ap.add_argument("--existing-persona-choice",
-                    choices=["treat_current_as_original", "continue_legacy"],
-                    help="inspect 检测到旧人格文件时的迁移选择；不给就只展示选项")
+                    choices=["treat_current_as_original", "use_original_as_is",
+                             "continue_legacy"],
+                    help="inspect 检测到现有人格文件时的用户选择：进入十二节编译／"
+                         "原人格不拆块不重排、只给出货副本追加记忆协议／继续旧流程；"
+                         "不给就只展示选项，不替用户自动采用")
     ap.add_argument("--list", action="store_true",
                     help="confirm 步：只列出待确认草稿，不进交互循环")
     ap.add_argument("--decisions-json", dest="decisions_json",

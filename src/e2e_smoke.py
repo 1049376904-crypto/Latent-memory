@@ -278,7 +278,8 @@ def run_persona_compiler_cases():
             encoding="utf-8")
         choice = json.loads(_run_compiler_cli(
             migration_root, "--step", "inspect", "--json").stdout)
-        assert choice["choices"] == ["treat_current_as_original", "continue_legacy"]
+        assert choice["choices"] == [
+            "treat_current_as_original", "use_original_as_is", "continue_legacy"]
         _run_compiler_cli(migration_root, "--step", "inspect", "--json",
                           "--existing-persona-choice", "treat_current_as_original")
         _run_compiler_cli(migration_root, "--step", "extract", "--candidates",

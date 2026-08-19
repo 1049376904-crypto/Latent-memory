@@ -734,11 +734,9 @@ def aggregate_persona_metrics(state):
         decision = decisions.get(section, {})
         version_id = decision.get("version_id") if isinstance(decision, dict) else None
         versions = versions_by_section.get(section, ())
-        # ⚠ 原先这里是 `version.get("version_id", version.get("id"))`——**那处防御性
-        # 回退就是「两个键该信哪个」这份含糊留下的痕迹**（任务卡《节版本双键收敛》
-        # 靶心三）。收敛之后判据只有 `version_id` 一个，回退跟着清掉。
-        # ⚠ 同时守住靶心二：`version_id` 为 None 时**不许拿两个 None 相等当匹配上**
-        # ——外部那个补丁就是这么把 `BOUNDARY_CONFLICT_UNRESOLVED` 静默放过的。
+        # ⚠ 这里只认 `version_id`，不对 `id` 做防御性回退；双键会重新引入
+        # 「两个键该信哪个」的含糊。`version_id` 为 None 时也**不许拿两个 None
+        # 相等当匹配上**，否则会把 `BOUNDARY_CONFLICT_UNRESOLVED` 静默放过。
         selected = None if not version_id else next(
             (version for version in versions
              if (version.get("version_id") if isinstance(version, dict)

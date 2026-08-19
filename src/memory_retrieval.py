@@ -656,6 +656,60 @@ class MemoryIndex:
             self.weights[idx] += self.weight_boost  # 用进废退：命中即加权
         return results
 
+    def retrieve_queries(self, queries, topN=5, candidate_topM=20):
+        """原查询＋至多一个改述查询 → RRF 融合后的前 topN 个片段。
+
+        改述由宿主模型给，不在这里内置同义词表或调用模型。两条查询分别走完整的
+        ``retrieve`` 生产路径，再把各自最多 ``candidate_topM`` 个候选按名次融合。
+        原查询排名表放两票、改述放一票：改述能把词面错位的块带进来，但偏题时不能
+        轻易盖过原查询的精确命中（任务卡“单次改述融合检索”）。
+
+        ``retrieve`` 会给命中块加权；这里每条内部查询后都把权重还原，最后只给真正
+        返回的 topN 加一次。否则同一块被两条查询命中会一次检索加两三次权重，候选池里
+        没返回的块也会偷加权。只传一条时直接走旧入口，保证旧客户端行为逐字不变。
+        """
+        if not isinstance(queries, (list, tuple)):
+            raise ValueError("queries 必须是查询字符串列表")
+        cleaned = []
+        for query in queries:
+            if not isinstance(query, str) or not query.strip():
+                raise ValueError("每条查询都必须是非空字符串")
+            query = query.strip()
+            if query not in cleaned:
+                cleaned.append(query)
+        if not cleaned:
+            raise ValueError("至少需要一条查询")
+        if len(cleaned) > 2:
+            raise ValueError("最多只接受原查询和一个改述查询，不循环扩写")
+        if len(cleaned) == 1:
+            return self.retrieve(cleaned[0], topN=topN)
+
+        baseline = list(self.weights)
+        rank_lists = []
+        pool_n = max(int(topN), int(candidate_topM))
+        try:
+            for query in cleaned:
+                self.weights[:] = baseline
+                rows = self.retrieve(query, topN=pool_n)
+                rank_lists.append([row["id"] for row in rows])
+        finally:
+            # 内部查询即使异常，也不能把跑到一半的候选权重留在索引上。
+            self.weights[:] = baseline
+
+        # 原查询两票、改述一票。rrf_fuse 自己去重并给稳定的同分顺序。
+        fused = rrf_fuse([rank_lists[0], rank_lists[0], rank_lists[1]], self.rrf_k)
+        fused = fused[:topN]
+        results = [{
+            "id": idx,
+            "text": self.chunks[idx],
+            "meta": self.meta[idx],
+            "score": score,
+            "weight": self.weights[idx],
+        } for idx, score in fused]
+        for idx, _ in fused:
+            self.weights[idx] += self.weight_boost
+        return results
+
     # ---------- 权重持久化（任务卡"记忆写回与权重持久化"） ----------
     #
     # 用进废退权重原来只活在内存里，而 MCP server 是 stdio 进程、客户端每次会话
@@ -858,7 +912,8 @@ def miss_rate_note(rate, threshold=None):
             f"这**不代表**这件事一定没发生过——你用的词跟记录里的写法不一样时也会这样"
             f"（尤其是问'她最近在焦虑什么'这类归纳性问题）。"
             f"但如果下面这些片段跟你问的对不上，**优先考虑库里确实没记过这件事**，"
-            f"如实说没找到，不要拿沾边的记录去圆。")
+            f"最多换一种更具体的说法再查一次：补上名字、物件、地点，或记录里可能用过的词。"
+            f"第二次仍然对不上就如实说没找到，不要继续循环，也不要拿沾边的记录去圆。")
 
 
 def annotate_block(block, rate, threshold=None):
@@ -1651,6 +1706,10 @@ def _selftest(embed=False):
     #      不是事件存在性检测器，措辞不许把它说成后者
     assert "不代表" in miss_rate_note(high), \
         "标注必须写明高缺失率≠这件事没发生（它只是专名缺席检测器），否则会诱导模型误判"
+    assert "最多换一种更具体的说法再查一次" in miss_rate_note(high), \
+        "标注必须给一次改述重试出口——不能第一次词面错位就直接下结论"
+    assert "第二次仍然对不上" in miss_rate_note(high) and "不要继续循环" in miss_rate_note(high), \
+        "改述重试必须有一次上限；循环查到有结果会把无关片段当答案"
     #      不硬拒：同一个查询，检索结果与标注无关
     r_before = [x["id"] for x in _build_synth(embed=embed).retrieve("量子对撞机的运行日志", topN=5)]
     r_after = [x["id"] for x in _build_synth(embed=embed).retrieve("量子对撞机的运行日志", topN=5)]
@@ -1658,6 +1717,62 @@ def _selftest(embed=False):
     #      拼接放在库里（外壳不许自拼，见 mcp_server 薄适配层纪律）
     assert annotate_block("正文", 0.0) == "正文", "低缺失率原样返回"
     assert annotate_block("正文", high).startswith("正文\n"), "高缺失率把标注追加在后面"
+
+    # 14d.【单次改述融合：原查询两票、改述一票、最终结果只加权一次】
+    #      夹具全部虚构。自然问法与 gold 没有共享 bigram，单查应空手；宿主补上记录里
+    #      可能用过的具体词后，融合应把 gold 带回 top5。
+    idx14d = MemoryIndex(embed=False)
+    idx14d.add("阁楼那台天文镜最后换了目镜，配件已经齐了。", {"heading": "旧器材"})
+    idx14d.add("周末去河边公园散步，看见两只白鹭。", {"heading": "散步"})
+    idx14d.build()
+    natural14d = "看星星的设备后来弄好了吗"
+    variant14d = "阁楼天文镜目镜配件"
+    assert idx14d.retrieve(natural14d, topN=5) == [], \
+        "夹具前提坏了：自然问法必须先复现词面错位，不能做成原查询本来就命中"
+    before14d = list(idx14d.weights)
+    fused14d = idx14d.retrieve_queries([natural14d, variant14d], topN=5)
+    assert fused14d and fused14d[0]["id"] == 0, \
+        f"具体改述该把词面错位的 gold 带回 top5：{fused14d}"
+    assert idx14d.weights[0] == before14d[0] + idx14d.weight_boost \
+        and idx14d.weights[1] == before14d[1], \
+        "内部两次检索不能重复加权；只有最终 topN 命中块加一次"
+
+    #      改述偏题保护：原查询精确命中 A，改述精确命中 B，原查询两票后 A 仍排前。
+    idx14e = MemoryIndex(embed=False)
+    idx14e.add("周末去河边公园散步，看见两只白鹭。", {"heading": "散步"})
+    idx14e.add("设备编号 ZX419 的保修单已经归档。", {"heading": "保修"})
+    idx14e.build()
+    before14e = list(idx14e.weights)
+    guarded14e = idx14e.retrieve_queries(["ZX419 保修单", "河边公园白鹭"], topN=1)
+    assert [row["id"] for row in guarded14e] == [1], \
+        f"偏题改述不能覆盖原查询的精确命中：{guarded14e}"
+    assert idx14e.weights[1] == before14e[1] + idx14e.weight_boost \
+        and idx14e.weights[0] == before14e[0], \
+        "偏题改述的内部候选没进最终 topN，不能偷加权"
+
+    #      不传改述时必须走旧入口；相同改述退化成一条，参数坏了明确报错。
+    old14f = MemoryIndex(embed=False)
+    new14f = MemoryIndex(embed=False)
+    for text14f in ("阳台薄荷换了新花盆。", "咖啡机保险丝已经换好。"):
+        old14f.add(text14f, {})
+        new14f.add(text14f, {})
+    old14f.build()
+    new14f.build()
+    assert [r["id"] for r in old14f.retrieve("薄荷花盆", topN=2)] == \
+           [r["id"] for r in new14f.retrieve_queries(["薄荷花盆"], topN=2)], \
+        "单查询新入口必须与旧 retrieve 顺序一致"
+    same14f = MemoryIndex(embed=False)
+    for text14f in ("阳台薄荷换了新花盆。", "咖啡机保险丝已经换好。"):
+        same14f.add(text14f, {})
+    same14f.build()
+    assert [r["id"] for r in same14f.retrieve_queries(["薄荷花盆", " 薄荷花盆 "], topN=2)] == [0], \
+        "相同改述应去重后退化为单查询"
+    for bad14f in (("不是列表",), (["原查询", "改述一", "改述二"],), (["原查询", " "],)):
+        try:
+            same14f.retrieve_queries(bad14f[0], topN=2)
+            assert False, f"坏参数必须明确报错：{bad14f[0]!r}"
+        except ValueError:
+            pass
 
     # 15.【可靠命中门槛靶心（2026.07.31 验收反馈；变异：去掉 scored_ok 过滤必红）】
     #     词面/语义都零信号的 query → 空手而归，且一个块都不加权——不设门槛的话

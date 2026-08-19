@@ -75,34 +75,51 @@ ABSENT_PROBES = [
 ]
 
 
-def run_probes(chunks, probes, embed=False, verbose=True):
+def screen_probes(chunks, probes):
+    """检索前一次性过护栏 → (留用, 作废)。
+
+    留用每项为 ``(原序号, 问题, 区分词)``；作废每项为
+    ``(原序号, 问题, 命中的区分词)``。单独导出这一层，是让别的正式量具复用同一把
+    护栏，而不是各自在循环里抄一份看起来相同、以后会漂移的实现。
+    """
+    alltext = "\n".join(chunks)
+    kept, dropped = [], []
+    for n, (q, words) in enumerate(probes, 1):
+        leaked = [w for w in words if w in alltext]
+        target = dropped if leaked else kept
+        target.append((n, q, leaked if leaked else list(words)))
+    return kept, dropped
+
+
+def run_probes(chunks, probes, embed=False, verbose=True, index=None):
     """跑一轮探针，返回 (正确空手数, 计分数, 被护栏拦下数, 明细)。
 
-    明细每项：(状态, 问题, 附加信息)，状态 ∈ {"SKIP", "EMPTY", "LEAK"}。"""
-    alltext = "\n".join(chunks)
+    明细每项：(状态, 问题, 附加信息)，状态 ∈ {"SKIP", "EMPTY", "LEAK"}。
+    `index` 供判据实验传入已接好外部表的索引；不给时维持原来的建库路径。"""
+    kept, dropped = screen_probes(chunks, probes)
 
-    idx = MemoryIndex(embed=embed)
-    for c in chunks:
-        idx.add(c, {})
-    idx.build()
+    idx = index
+    if idx is None:
+        idx = MemoryIndex(embed=embed)
+        for c in chunks:
+            idx.add(c, {})
+        idx.build()
 
     cap = idx._distinctive_df()        # 问闸本人，不抄它的判据
     dfs = idx._bm25.df                 # 读闸看到的那份 df，不自己重扫
 
-    tested = ok = skipped = 0
+    tested, ok, skipped = len(kept), 0, len(dropped)
     detail = []
-    for q, words in probes:
-        # 护栏：区分词只要有一个在语料里出现过，这道题作废。
-        # **这一步在检索之前**——顺序不能反：先跑检索再验证，等于允许一道
-        # 无效题的结果影响判断，哪怕最后没计分，看的人已经看过那个数了。
-        leaked = [w for w in words if w in alltext]
-        if leaked:
-            skipped += 1
+    # 护栏必须在第一次 retrieve 前整批完成；不让无效题先影响权重、再在循环里作废。
+    # 输出顺序仍按原题序，避免导出独立入口时顺手改坏旧调用方看到的 detail 顺序。
+    dropped_by_id = {n: leaked for n, _q, leaked in dropped}
+    for n, (q, _words) in enumerate(probes, 1):
+        leaked = dropped_by_id.get(n)
+        if leaked is not None:
             detail.append(("SKIP", q, leaked))
             if verbose:
                 print(f"SKIP(语料里其实有: {','.join(leaked)})", q)
             continue
-        tested += 1
         res = idx.retrieve(q, topN=5)
         if not res:
             ok += 1
@@ -131,6 +148,10 @@ def selftest():
         "楼下那家螺蛳粉店换了老板，味道淡了不少。",
     ]
     # 1. 护栏抓住"我以为语料里没有"——「陶艺」其实在第一块里
+    kept, dropped = screen_probes(
+        chunks, [("上次陶艺课我拉坏了几个坯", ["陶艺", "坯"])])
+    assert not kept and dropped[0][0] == 1 and "陶艺" in dropped[0][2], \
+        "独立护栏入口必须保留原序号并说出命中的区分词"
     ok, tested, skipped, detail = run_probes(
         chunks, [("上次陶艺课我拉坏了几个坯", ["陶艺", "坯"])], verbose=False)
     assert (skipped, tested) == (1, 0), \

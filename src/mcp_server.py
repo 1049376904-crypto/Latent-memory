@@ -103,6 +103,9 @@ INSTRUCTIONS = (
     "记错了的事也有出口：对方指出某段记忆不对或已经过时，**当场用 latent_correct "
     "撤回旧记录并写上更正**——只口头认错不改库，下次照样检索到错的。\n"
     "查过但确实没有的，就如实说没找到——查过之后的“没有”是诚实，查之前的“没有”才是错。\n"
+    "第一次检索没找到、或返回内容明显对不上时，最多再查一次：保留原 query，把更具体的"
+    "说法放进 queryVariant（补名字、物件、地点或记录里可能用过的词）；服务器会融合两种"
+    "问法。第二次仍对不上就停，不要循环查到有为止。\n"
     "新会话开场先调一次 latent_session_start，会话结束前调一次 latent_thread_close。"
 )
 
@@ -118,11 +121,23 @@ TOOLS = [
                        "不是本次对话的聊天记录）。**对方提到任何过去发生过的事、"
                        "约定、日期、地点、称呼、人名，或你对细节拿不准时，先查这里**——"
                        "不要在查之前说“我没有记录”“我不记得”，那在挂着记忆库时是错的。"
+                       "若第一次结果不相关，最多重试一次：原问题仍放 query，更具体的说法放"
+                       "queryVariant；两种问法会融合，第二次仍不相关就如实说没找到。"
                        "查完自然接上话，不用报告查过。",
+        "annotations": {
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": False,
+            "openWorldHint": False,
+        },
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "要查什么"},
+                "queryVariant": {
+                    "type": "string",
+                    "description": "可选的一种更具体说法；与原 query 融合。最多一个，不能循环扩写",
+                },
                 "topN": {"type": "integer", "description": "返回几条，默认 5"},
             },
             "required": ["query"],
@@ -134,6 +149,12 @@ TOOLS = [
         "description": "新会话开场**主动**调一次（不用等对方要求）：带回上次会话聊到哪、"
                        "当下什么状态、有什么没聊完，以及最近发生过的事，"
                        "并附四项故障信号自查指令。",
+        "annotations": {
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
@@ -144,6 +165,12 @@ TOOLS = [
                        "会话结束**。写发生了什么和原话（纪录片写法，不写评语）；"
                        "current_state 必填：这件事现在的状态（约定成立/还在处理/"
                        "已解决……）——不写的话，未来重读会把它当成正在发生的事。",
+        "annotations": {
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": False,
+            "openWorldHint": False,
+        },
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -166,6 +193,12 @@ TOOLS = [
                        "quote 必须从 latent_search 返回的原文里**逐字**摘一段、"
                        "足够长能唯一定位那条记录。只口头认错不调这个工具的话，"
                        "库没变，下次照样检索到错的。",
+        "annotations": {
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": False,
+            "openWorldHint": False,
+        },
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -187,6 +220,12 @@ TOOLS = [
         "description": "会话结束前**主动**调一次：记下这次聊了什么线、当下状态、"
                        "有什么没聊完，下个会话靠它接上。当下状态必填——不写的话，"
                        "下个会话会把已经结束的事读成正在发生。",
+        "annotations": {
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": False,
+            "openWorldHint": False,
+        },
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -216,7 +255,8 @@ class MemoryServer:
 
     def __init__(self, index=None, thread_store=None, search_topN=5, recall_topN=3,
                  corpus_dir=None, weights_path=None, retractions_path=None,
-                 entities_path=None, loader=None, time_context=None):
+                 entities_path=None, loader=None, time_context=None,
+                 source_dirs=None):
         # 两个 topN 分开（2026.07.31 真实语料冒烟后拆的）：显式检索是用户/模型
         # 主动问一件事，多给几条值；开场召回每次换窗都付一遍，条数要克制
         self.index = index if index is not None else MemoryIndex().build()
@@ -233,6 +273,9 @@ class MemoryServer:
         # corpus_dir 是写回的落点，没配就明确拒写；weights_path 没配则权重只活在
         # 内存里（selftest/临时用法），配了就启动时载入、每次检索命中后落盘
         self.corpus_dir = corpus_dir
+        # source_dirs 只管读取与 HTTP 指纹；它可以包含独立索引目录，但绝不能替代
+        # corpus_dir 成为写回落点。未传时退回旧行为，只监听主语料。
+        self.source_dirs = tuple(source_dirs or ([corpus_dir] if corpus_dir else []))
         self.weights_path = weights_path
         # 撤回账本（错误记忆治理闭环）：配了就启动时载入、每次撤回后落盘——
         # 不落盘的话"改过来了"只活一个进程，跟权重当初同一个坑
@@ -273,36 +316,75 @@ class MemoryServer:
             self.index.build()
         self.recall.index = self.index
 
-    # ---------- 三个工具：只转发，不实现 ----------
+    # ---------- 五个工具：只转发，不实现 ----------
 
     def _tool_memory_search(self, args, now=None):
         query = args.get("query")
         if not isinstance(query, str) or not query.strip():
             raise ToolError("query 必填且不能为空")
-        results = self.index.retrieve(query, topN=int(args.get("topN", self.search_topN)))
+        variant = args.get("queryVariant")
+        if variant is not None and (not isinstance(variant, str) or not variant.strip()):
+            raise ToolError("queryVariant 若提供，必须是非空字符串")
+        queries = [query] + ([variant] if variant is not None else [])
+        top_n = int(args.get("topN", self.search_topN))
+        results = self.index.retrieve_queries(queries, topN=top_n) \
+            if variant is not None else self.index.retrieve(query, topN=top_n)
         if self.weights_path is not None:
             # 用进落盘：retrieve 的副作用是命中块 +weight_boost，不落盘的话
             # server 一重启就归零——权重持久化的"存"这半就在这一行
             self.index.save_weights(self.weights_path)
-        note = miss_rate_note(query_miss_rate(self.index, query))
+        miss_rate = min(query_miss_rate(self.index, q) for q in queries)
+        note = miss_rate_note(miss_rate)
         if not results:
             # 可靠命中门槛（验收反馈）：低相关不硬凑。这句要同时做两件事——
             # 说清"查过了、真没有"，并明确解锁如实回答（instructions 堵的是
             # "没查就说没记录"，查过之后的"没有"是诚实，不是那句被堵的话术）
-            raise ToolError("没有可靠命中：记忆库里没有与这个说法词面或语义相关的"
-                            "记录。你已经查过了——如实告诉对方没找到/记不清即可；"
-                            "也可以换个说法再查一次（人名、地点、当时的用词）。"
-                            + (" " + note if note else ""))
+            retry = ("你已经带 queryVariant 重试过了——第二次仍没找到，请停止检索并"
+                     "如实告诉对方没找到/记不清，不要拿沾边内容凑答案。") \
+                if variant is not None else \
+                ("你已经查过一次；最多再试一次：保留原 query，把更具体的说法放进 "
+                 "queryVariant（人名、物件、地点或当时可能用过的词）。")
+            raise ToolError("没有可靠命中：记忆库里没有与这个说法词面或语义相关的记录。"
+                            + retry + (" " + note if note else ""))
         # 缺失率标注（2026.08.01，第二份外部反馈标定）：**不改变返回什么**，
         # 只在结果后面附一句可核对的话。真实威胁是"库里没有却返回了五条真记忆、
         # 模型拿去圆"，而这个判断只有读到内容的模型能下——机制层负责把不确定性
         # 摆到台面上，不负责替它拒绝。
         # 拼接走 annotate_block（库函数），外壳仍然只是转发+组合调用，不自己拼字符串
         return annotate_block(format_recall_block(results, time_context=self.time_context),
-                              query_miss_rate(self.index, query))
+                              miss_rate)
+
+    @staticmethod
+    def _session_start_failure_reason(exc):
+        """把读取异常归到用户能行动的方向，不回显可能含正文的异常消息。"""
+        if isinstance(exc, FileNotFoundError):
+            return "文件不存在或路径错误"
+        if isinstance(exc, PermissionError):
+            return "文件不可读（权限不足）"
+        if isinstance(exc, json.JSONDecodeError):
+            return "会话线索文件不是合法 JSON"
+        if isinstance(exc, UnicodeError):
+            return "文件编码读取失败"
+        return "文件读取失败"
 
     def _tool_session_start(self, args, now=None):
-        block = self.recall.on_session_start(now=now)
+        try:
+            block = self.recall.on_session_start(now=now)
+        except (OSError, UnicodeError, json.JSONDecodeError) as first:
+            reason = self._session_start_failure_reason(first)
+            print(f"session_start 第一次{reason}，自动重试：{type(first).__name__}",
+                  file=sys.stderr)
+            try:
+                block = self.recall.on_session_start(now=now)
+            except (OSError, UnicodeError, json.JSONDecodeError) as second:
+                second_reason = self._session_start_failure_reason(second)
+                print(f"session_start 重试后仍{second_reason}：{type(second).__name__}",
+                      file=sys.stderr)
+                raise ToolError(
+                    "session_start 读取记忆失败：自动重试 1 次后仍失败（首次 "
+                    f"{type(first).__name__}，重试 {type(second).__name__}；{second_reason}）。"
+                    "服务端没有返回空结果，而是执行失败。请检查 --corpus、--threads "
+                    "指向的路径、文件可读性与服务端日志。") from None
         if block is None:
             raise ToolError("记忆库是空的，没有可召回的内容")
         return block
@@ -433,6 +515,14 @@ class MemoryServer:
         except ToolError as e:
             # 工具执行错误：按规格回正常结果 + isError，让模型看得到失败原因
             return self._ok(mid, {"content": [{"type": "text", "text": str(e)}], "isError": True})
+        except Exception as e:
+            # 最终错误边界：不让工具内部异常冲破 HTTP/stdio，客户端只看见空白。
+            # 不打印 e 的正文——底层异常可能夹带记忆内容或请求参数。
+            print(f"工具执行异常（{name}）：{type(e).__name__}", file=sys.stderr)
+            message = (f"{name} 执行失败（{type(e).__name__}）。服务端没有返回空结果，"
+                       "而是工具执行异常；请查看服务端日志并检查相关文件与配置。")
+            return self._ok(mid, {"content": [{"type": "text", "text": message}],
+                                  "isError": True})
         return self._ok(mid, {"content": [{"type": "text", "text": text}], "isError": False})
 
     @staticmethod
@@ -701,15 +791,15 @@ def http_bind_guard(host, token):
             f"或绑回 127.0.0.1 由带鉴权的反向代理转发。")
 
 
-def _corpus_signature(corpus_dir):
-    """语料目录的文件级指纹（路径+mtime+大小）。只看 .md——sidecar（.weights.json
+def _corpus_signature(source_dirs):
+    """全部读取根的文件级指纹（路径+mtime+大小）。只看 .md——sidecar（.weights.json
     每次检索都落盘）进指纹的话每个请求都会触发假重读。
 
     ⚠ glob 到 stat 之间文件可能已被删（并发整理语料），**漏掉它就行、不许抛**
     （2026.08.03 外部评审：这里抛 FileNotFoundError 会变成 500）——文件没了本身
     就是一次语料变化，指纹里少一条正好让下一次比较发现它。"""
     out = []
-    for p in corpus_files(corpus_dir):
+    for p in corpus_files(source_dirs):
         try:
             st = p.stat()
         except OSError:
@@ -728,8 +818,8 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None,
     http_bind_guard(host, token)
     lock = threading.Lock()                  # index 的增删改建都不是线程安全的：串行化
     deny_log = _make_deny_logger()           # 被拒请求留痕（带刷屏上限，见那个函数）
-    state = {"sig": _corpus_signature(server.corpus_dir)
-             if (server.corpus_dir and server.loader) else None}
+    state = {"sig": _corpus_signature(server.source_dirs)
+             if (server.source_dirs and server.loader) else None}
     # 开着的 GET 空长流：计数（配上限用）与「服务端要停了」的信号。
     # ⚠ **`closing` 不能省**：长流线程平时蹲在 `wait(心跳间隔)` 上，没有这个信号
     # 就得等一个心跳周期才发现服务停了——selftest 里 `shutdown()` 会跟着变慢，
@@ -1009,7 +1099,7 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None,
                 # 保留 before，让下一个请求去发现并重读——宁可多重读一次，
                 # 不可漏掉一次）。
                 if state["sig"] is not None:
-                    sig = _corpus_signature(server.corpus_dir)
+                    sig = _corpus_signature(server.source_dirs)
                     if sig != state["sig"]:
                         server._reload_from_disk()
                         state["sig"] = sig
@@ -1020,7 +1110,7 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None,
                     # 顺带：只读请求（latent_search 是绝大多数）written_paths 是空的，
                     # 这里整个跳过，不再每个请求 stat 全库两遍
                     base = {p: (m, s) for p, m, s in state["sig"]}
-                    for p, m, s in _corpus_signature(server.corpus_dir):
+                    for p, m, s in _corpus_signature(server.source_dirs):
                         if p in server.written_paths:
                             base[p] = (m, s)
                     state["sig"] = tuple(sorted((p, m, s) for p, (m, s) in base.items()))
@@ -1082,7 +1172,33 @@ _MTIME_WARN_RATIO = 0.2
 _HEADING_ONLY_WARN_RATIO = 0.5
 
 
-def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None):
+def retrieval_dirs(corpus_dir, index_dir=None):
+    """主语料与可选人工索引目录 → 绝对读取根。"""
+    roots = [Path(corpus_dir).resolve()]
+    if index_dir is not None:
+        index_root = Path(index_dir).resolve()
+        if not index_root.exists():
+            raise FileNotFoundError(f"索引摘要目录不存在：{index_root}")
+        if not index_root.is_dir():
+            raise NotADirectoryError(f"索引摘要路径不是目录：{index_root}")
+        roots.append(index_root)
+    return tuple(dict.fromkeys(roots))
+
+
+def make_corpus_loader(corpus_dir, index_dir=None, embed=False, provider=None):
+    """构造双根只读 loader；缓存与所有写侧状态仍只落主语料。"""
+    source_dirs = retrieval_dirs(corpus_dir, index_dir)
+    cache_path = Path(corpus_dir) / ".embed_cache.json" if embed else None
+
+    def loader():
+        return load_corpus(source_dirs, embed=embed, provider=provider,
+                           cache_path=cache_path)
+
+    return source_dirs, loader
+
+
+def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None,
+             index_dir=None):
     """体检语料目录与接线，返回 [{level,title,detail}, ...]。**纯读，不写盘。**
 
     检的是"配好了没有"，不是"检索好不好"——后者归回归集（regression_set.py）。
@@ -1106,8 +1222,8 @@ def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None):
         add(FAIL, "语料目录", f"{root} 不是目录。--corpus 要指向记忆库那一层目录，不是单个文件。")
         return out
 
-    files = corpus_files(root)          # 递归，子目录里的 md 也算
-    if not files:
+    corpus_only_files = corpus_files(root)  # 递归，子目录里的 md 也算
+    if not corpus_only_files:
         # 典型是指到了 src/ 或路径写岔了一格。给候选时**只看目录里有没有 md，
         # 不看目录叫什么名字**——外层目录名本来就是自由的（叫 corpus/、我的记忆/
         # 都一样读得到），拿名字猜就是在教人一个错的判据
@@ -1118,16 +1234,26 @@ def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None):
                 else "它的同级目录里也没有——确认一下记忆库到底建在哪儿。")
         add(FAIL, "语料文件", f"{root} 下（含子目录）没找到任何 .md 语料。{hint}")
         return out
-    add(OK, "语料目录", f"{root}（{len(files)} 个 md 文件）")
+    add(OK, "语料目录", f"{root}（{len(corpus_only_files)} 个 md 文件）")
 
-    stray = [p.name for p in files if p.name.lower() in _NOT_CORPUS_MD]
+    try:
+        roots = retrieval_dirs(root, index_dir)
+    except (FileNotFoundError, NotADirectoryError) as e:
+        add(FAIL, "索引摘要目录", str(e) + "。检查 MCP 配置里的 --index-dir；"
+            "不需要独立索引层时删掉这一对参数。")
+        return out
+    if index_dir is not None:
+        add(OK, "索引摘要目录", f"{Path(index_dir).resolve()}（只读人工摘要）")
+    files = corpus_files(roots)
+
+    stray = [p.name for p in corpus_only_files if p.name.lower() in _NOT_CORPUS_MD]
     if stray:
         add(WARN, "混进来的文件",
             f"语料里有 {'、'.join(sorted(set(stray)))}——这些是产出目录那一层的文件，"
             "不是记忆。多半是 --corpus 多指了一层（应指向里面的记忆库目录）。"
             "它们会被当成记忆检索到，但不会报任何错。")
 
-    index = load_corpus(root)          # embed=False：这一档不写任何缓存文件
+    index = load_corpus(roots)         # embed=False：这一档不写任何缓存文件
     if not index.chunks:
         # "有 md、但一块都切不出来"是上面那道 `not files` 关卡挡不住的一档：
         # 文件全是空行/只有空白的话，语料目录看着满满当当，库却是空的，
@@ -1463,8 +1589,13 @@ def startup_failure_report(stage, exc, *, embed=False, http_bind=None, log_path=
     重排会让别处对「②」的引用悄悄指向另一条。）
 
     返回一段多行文本，第一行是人话、第二行是出口，末行指向落盘的完整堆栈。"""
-    if stage == "bind" and isinstance(exc, OSError) and exc.errno == errno.EADDRINUSE:
-        why = f"要监听的地址已经被别的进程占着，起不来（{http_bind}）。"
+    bind_unavailable = (
+        stage == "bind" and isinstance(exc, OSError) and
+        (exc.errno == errno.EADDRINUSE or getattr(exc, "winerror", None) == 10013)
+    )
+    if bind_unavailable:
+        why = (f"要监听的地址已经被别的进程占着，或被 Windows 保留，"
+               f"起不来（{http_bind}）。")
         how = ("出口：换一个端口重起（例如 --http 127.0.0.1:8766），"
                "或者先把占着这个端口的进程停掉再重起"
                "（Linux/macOS：lsof -i :<端口>；Windows：netstat -ano | findstr :<端口>）。")
@@ -1476,10 +1607,11 @@ def startup_failure_report(stage, exc, *, embed=False, http_bind=None, log_path=
                "⚠ 不要自己把配置里的 --embed 删掉：--embed 必须跟 init_state 记的检索路线一致，"
                "手删参数是隐患，正确出口是重跑 --step route。")
     elif stage == "load":
-        why = "语料读不进来，索引没建起来（--corpus 指的目录不对、读不了，或里面的文件有问题）。"
-        how = ("出口：把同一行参数里的 --http/--threads 都留着、"
-               "把命令换成 python mcp_server.py --doctor --corpus <同一个目录> 跑一次，"
-               "体检只读不写盘，会逐项说清哪一项过不去。")
+        why = "加载阶段失败了；只凭这次异常无法判断是配置、依赖还是语料出了问题。"
+        how = ("出口：先把同一行参数里的 --http/--threads 都留着、"
+               "把命令换成 python mcp_server.py --doctor --corpus <同一个目录> 跑一次；"
+               "体检只读不写盘。若体检没指出问题，再看随后落盘的完整报错，"
+               "按里面的异常类型排查配置值、依赖或模型服务。")
     else:
         why = "服务端在启动阶段失败了。"
         how = ("出口：python mcp_server.py --doctor --corpus <同一个目录> 跑一次体检，"
@@ -1640,12 +1772,16 @@ def _selftest():
     instr = r["result"]["instructions"]
     assert "长期" in instr and "不是本次对话" in instr, "必须说清这是跨会话的长期记忆库"
     assert "我没有相关记录" in instr, "必须直接堵死“我没有记录”这句默认话术"
+    assert "queryVariant" in instr and "最多再查一次" in instr and "第二次仍对不上就停" in instr, \
+        "instructions 必须把单次改述的入口与停止边界一起交给宿主"
 
     # 2b. 工具描述要写成触发条件，不是功能陈述——同样是真机反馈
     d = {t["name"]: t["description"] for t in
          srv.handle({"jsonrpc": "2.0", "id": 21, "method": "tools/list"})["result"]["tools"]}
     assert "不是本次对话" in d["latent_search"] and "我不记得" in d["latent_search"], \
         "latent_search 描述要说清记忆类型并堵死默认话术"
+    assert "queryVariant" in d["latent_search"] and "最多重试一次" in d["latent_search"], \
+        "latent_search 描述必须告诉宿主怎么触发受控改述融合"
     assert "主动" in d["latent_session_start"] and "主动" in d["latent_thread_close"], \
         "两个生命周期工具要写明主动调用，不用等对方要求"
     #    initialized 是通知，不能回响应（回了客户端会当成野生响应）
@@ -1659,11 +1795,31 @@ def _selftest():
                                           "latent_thread_close"]
     for t in tools:
         assert set(t) >= {"name", "description", "inputSchema"} and t["inputSchema"]["type"] == "object"
+    # 2c.【工具 annotations】变异靶心：任一工具漏字段、把检索冒充只读、
+    #     把更正冒充纯追加，或把本地记忆库误标成 open world，这张逐字表都会红。
+    expected_annotations = {
+        "latent_search": {"readOnlyHint": False, "destructiveHint": False,
+                          "idempotentHint": False, "openWorldHint": False},
+        "latent_session_start": {"readOnlyHint": True, "destructiveHint": False,
+                                 "idempotentHint": True, "openWorldHint": False},
+        "latent_append": {"readOnlyHint": False, "destructiveHint": False,
+                          "idempotentHint": False, "openWorldHint": False},
+        "latent_correct": {"readOnlyHint": False, "destructiveHint": True,
+                           "idempotentHint": False, "openWorldHint": False},
+        "latent_thread_close": {"readOnlyHint": False, "destructiveHint": False,
+                                "idempotentHint": False, "openWorldHint": False},
+    }
+    assert {t["name"]: t.get("annotations") for t in tools} == expected_annotations, \
+        "五个工具的 annotations 必须按真实副作用逐项声明"
     assert tools[4]["inputSchema"]["required"] == ["window", "current_state"], "当下状态必填要写进 schema"
     assert tools[3]["inputSchema"]["required"] == ["quote", "reason"], \
         "更正工具必填 quote+reason——没有原因的撤回不可追溯"
     assert tools[2]["inputSchema"]["required"] == ["text", "current_state"], \
         "写回的当下状态必填也要写进 schema（病灶迁移在写入口强制）"
+    search_schema = tools[0]["inputSchema"]
+    assert search_schema["required"] == ["query"] \
+        and search_schema["properties"]["queryVariant"]["type"] == "string", \
+        "queryVariant 必须是可选单字符串；原 query 仍是唯一必填项"
 
     # 3. tools/call 正常往返：结果结构照规格（content 数组 + type:text + isError）
     def call(name, args=None, mid=9):
@@ -1672,6 +1828,40 @@ def _selftest():
     res = call("latent_search", {"query": "咖啡机坏了"})["result"]
     assert res["isError"] is False and res["content"][0]["type"] == "text"
     assert "保险丝熔断" in res["content"][0]["text"]
+
+    # 3b.【单次改述融合真 tools/call】原问法没有共享 bigram，改述补记录用词后命中。
+    #     这条同时钉住 schema 背后的生产接线；只测 MemoryIndex 不足以证明 MCP 能用。
+    variant_srv = MemoryServer(index=MemoryIndex(), thread_store=ThreadStore())
+    variant_srv.index.add("阁楼那台天文镜最后换了目镜，配件已经齐了。", {"heading": "旧器材"})
+    variant_srv.index.add("周末去河边公园散步，看见两只白鹭。", {"heading": "散步"})
+    variant_srv.index.build()
+    variant_call = variant_srv.handle({
+        "jsonrpc": "2.0", "id": 31, "method": "tools/call",
+        "params": {"name": "latent_search", "arguments": {
+            "query": "看星星的设备后来弄好了吗",
+            "queryVariant": "阁楼天文镜目镜配件",
+        }}}, now=now)["result"]
+    assert variant_call["isError"] is False and "配件已经齐了" in variant_call["content"][0]["text"], \
+        f"queryVariant 必须穿过 MCP 并把词面错位的块带回来：{variant_call}"
+
+    #     第二次仍空手就明确停；没传改述时只给一次出口。坏类型不能静默转字符串。
+    empty_search_srv = MemoryServer(index=MemoryIndex().build(), thread_store=ThreadStore())
+
+    def empty_search(args):
+        return empty_search_srv.handle({
+            "jsonrpc": "2.0", "id": 32, "method": "tools/call",
+            "params": {"name": "latent_search", "arguments": args}}, now=now)["result"]
+
+    first_empty = empty_search({"query": "不存在的旧事"})
+    second_empty = empty_search({"query": "不存在的旧事", "queryVariant": "具体名字地点"})
+    bad_variant = empty_search({"query": "不存在的旧事", "queryVariant": 7})
+    assert first_empty["isError"] and "最多再试一次" in first_empty["content"][0]["text"], \
+        "第一次空手要给唯一一次改述出口"
+    assert second_empty["isError"] and "第二次仍没找到" in second_empty["content"][0]["text"] \
+        and "停止检索" in second_empty["content"][0]["text"], \
+        "带改述仍空手必须明确停止，不能诱导循环"
+    assert bad_variant["isError"] and "非空字符串" in bad_variant["content"][0]["text"], \
+        "queryVariant 类型错了要指名报参数错误"
 
     # 4.【变异靶心·薄适配层】外壳输出必须逐字等于底层库返回——谁在适配层里重新
     #    实现格式化，这条立刻红。这正是"分得清是接口问题还是底层库问题"的保证
@@ -1701,6 +1891,147 @@ def _selftest():
                            "params": {"name": "latent_session_start"}}, now=now)
     assert "result" in r5 and r5["result"]["isError"] is True, \
         f"工具执行失败该回 isError 结果而不是协议错误——模型要看得到失败原因：{r5}"
+    # 5b.【Kelivo 偶发空结果·读取异常只重试一次】生产变异：删掉
+    #     `_tool_session_start` 的重试分支 → 这条会拿不到响应；把次数改成 0 或 2，
+    #     calls 断言会红。替身只代替现场拿不到的短暂文件读取异常，协议包装与
+    #     MemoryServer 都走真实实现。
+    class FlakyRecall:
+        def __init__(self):
+            self.calls = 0
+
+        def on_session_start(self, now=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise OSError("合成的短暂读取失败")
+            return "【合成召回】第二次读取成功"
+
+    retry_srv = MemoryServer(index=MemoryIndex().build())
+    retry_srv.recall = FlakyRecall()
+    try:
+        retry_res = retry_srv.handle(
+            {"jsonrpc": "2.0", "id": 120, "method": "tools/call",
+             "params": {"name": "latent_session_start"}}, now=now)
+    except OSError:
+        retry_res = None
+    assert retry_res is not None and retry_res["result"]["isError"] is False, \
+        "session_start 第一次读取异常后该自动重试，不该让客户端拿到空响应"
+    assert retry_res["result"]["content"][0]["text"] == "【合成召回】第二次读取成功", \
+        "重试成功仍须逐字返回底层结果"
+    assert retry_srv.recall.calls == 2, "读取异常只自动重试一次"
+
+    # 5c.【重试仍失败必须有明确错误】生产变异：第二次异常不转 ToolError →
+    #     这条拿不到协议响应；重试超过一次则 calls 断言红。
+    class SequenceRecall:
+        def __init__(self, outcomes):
+            self.outcomes = list(outcomes)
+            self.calls = 0
+
+        def on_session_start(self, now=None):
+            outcome = self.outcomes[self.calls]
+            self.calls += 1
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+    twice_srv = MemoryServer(index=MemoryIndex().build())
+    twice_srv.recall = SequenceRecall([OSError("第一次"), OSError("第二次")])
+    try:
+        twice_response = twice_srv.handle(
+            {"jsonrpc": "2.0", "id": 121, "method": "tools/call",
+             "params": {"name": "latent_session_start"}}, now=now)
+    except OSError:
+        twice_response = None
+    assert twice_response is not None, "连续两次读取异常也必须返回协议响应，不能空着断开"
+    twice = twice_response["result"]
+    assert twice["isError"] is True and twice["content"][0]["text"], \
+        "重试仍失败要回非空 isError"
+    assert "session_start" in twice["content"][0]["text"]
+    assert "自动重试 1 次" in twice["content"][0]["text"]
+    assert "OSError" in twice["content"][0]["text"] and twice_srv.recall.calls == 2
+
+    # 5d.【错误要指对方向】JSONL 解析失败不能笼统说成路径问题。生产变异：
+    #     删掉 JSONDecodeError 分类 → “不是合法 JSON”断言红。
+    decode_srv = MemoryServer(index=MemoryIndex().build())
+    decode_srv.recall = SequenceRecall([
+        json.JSONDecodeError("合成 JSON 错误", "{", 1),
+        json.JSONDecodeError("合成 JSON 错误", "{", 1),
+    ])
+    decoded = decode_srv.handle(
+        {"jsonrpc": "2.0", "id": 122, "method": "tools/call",
+         "params": {"name": "latent_session_start"}}, now=now)["result"]
+    assert decoded["isError"] is True and "不是合法 JSON" in decoded["content"][0]["text"], \
+        "会话线索 JSON 坏了就直说解析失败，别把人引去查限流或空库"
+
+    # 5e. 路径不存在与权限不足分开说；两者都是用户能直接排查的文件问题。
+    for exc_type, want in ((FileNotFoundError, "路径错误"), (PermissionError, "权限不足")):
+        classified_srv = MemoryServer(index=MemoryIndex().build())
+        classified_srv.recall = SequenceRecall([exc_type("第一次"), exc_type("第二次")])
+        classified = classified_srv.handle(
+            {"jsonrpc": "2.0", "id": 123, "method": "tools/call",
+             "params": {"name": "latent_session_start"}}, now=now)["result"]
+        assert classified["isError"] is True and want in classified["content"][0]["text"], \
+            f"{exc_type.__name__} 应明确提示 {want}，实际：{classified}"
+
+    encoding_srv = MemoryServer(index=MemoryIndex().build())
+    encoding_srv.recall = SequenceRecall([
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "合成"),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "合成"),
+    ])
+    encoding_result = encoding_srv.handle(
+        {"jsonrpc": "2.0", "id": 124, "method": "tools/call",
+         "params": {"name": "latent_session_start"}}, now=now)["result"]
+    assert encoding_result["isError"] is True and \
+        "编码读取失败" in encoding_result["content"][0]["text"], \
+        "文件编码错误要与普通读取失败分开说"
+
+    # 5f. 真空库是确定的业务结果，不是偶发读取失败：一次就报空库，不重试。
+    none_srv = MemoryServer(index=MemoryIndex().build())
+    none_srv.recall = SequenceRecall([None, "不该调用第二次"])
+    none_result = none_srv.handle(
+        {"jsonrpc": "2.0", "id": 125, "method": "tools/call",
+         "params": {"name": "latent_session_start"}}, now=now)["result"]
+    assert none_result["isError"] is True and "记忆库是空的" in none_result["content"][0]["text"]
+    assert none_srv.recall.calls == 1, "真空库不该自动重试"
+
+    # 5g.【最终错误边界】不在预期列表里的异常也不能冲破 HTTP/stdio，让客户端
+    #     只看见空白。生产变异：删掉 `_call_tool` 的最终 except → 这条拿不到响应。
+    unexpected_srv = MemoryServer(index=MemoryIndex().build())
+    unexpected_calls = {"n": 0}
+
+    def boom(args, now=None):
+        unexpected_calls["n"] += 1
+        raise RuntimeError("合成敏感正文不应外泄")
+
+    unexpected_srv._handlers = lambda: {"latent_session_start": boom}
+    try:
+        unexpected = unexpected_srv.handle(
+            {"jsonrpc": "2.0", "id": 126, "method": "tools/call",
+             "params": {"name": "latent_session_start"}}, now=now)
+    except RuntimeError:
+        unexpected = None
+    assert unexpected is not None and unexpected["result"]["isError"] is True, \
+        "未预料异常也必须回 isError，不能断开成空响应"
+    unexpected_text = unexpected["result"]["content"][0]["text"]
+    assert unexpected_text and "session_start" in unexpected_text and "RuntimeError" in unexpected_text
+    assert "合成敏感正文" not in unexpected_text and unexpected_calls["n"] == 1, \
+        "异常正文不外泄，handler 也不自动重放"
+
+    # 5h.【防过度重试】写工具第一次可能已经落盘，只是回响应时失败；最终兜底
+    #     可以把错误说出来，但绝不能为了“自动恢复”再调用一次。
+    write_srv = MemoryServer(index=MemoryIndex().build())
+    write_calls = {"n": 0}
+
+    def write_boom(args, now=None):
+        write_calls["n"] += 1
+        raise RuntimeError("合成的写后失败")
+
+    write_srv._handlers = lambda: {"latent_append": write_boom}
+    write_failed = write_srv.handle(
+        {"jsonrpc": "2.0", "id": 127, "method": "tools/call",
+         "params": {"name": "latent_append", "arguments": {"text": "合成"}}},
+        now=now)["result"]
+    assert write_failed["isError"] is True and write_failed["content"][0]["text"]
+    assert write_calls["n"] == 1, "写工具失败只报错，不自动重放"
     #    参数非法（缺 query）同样走 isError，不是崩
     assert call("latent_search", {})["result"]["isError"] is True
     #    arguments 不是对象 → 协议错误
@@ -1941,6 +2272,75 @@ def _selftest():
         assert by["检索自查"]["level"] == OK, "拿语料自己的标题该查得到"
         assert "没有向语料目录写入任何文件" in report
 
+        # 14b.【独立索引目录·README 不冒充索引】外部 --corpus 不许被出货改写，
+        #      所以人工摘要要从第二个只读根接进来。README 故意用 .txt：只有它时
+        #      仍该报警；放入真实摘要 .md 后才算有索引层。
+        corpus_no_index = _P(td) / "corpus-no-index"
+        (corpus_no_index / "timeline").mkdir(parents=True)
+        (corpus_no_index / "timeline" / "window_04_2026-06-17.md").write_text(
+            "## 修咖啡机\n加热管不工作，拆开发现保险丝熔断，换上通电正常。\n",
+            encoding="utf-8")
+        index_dir = _P(td) / "bundle" / "memory" / "index"
+        index_dir.mkdir(parents=True)
+        (index_dir / "README.txt").write_text(
+            "这只是写法说明，不是索引摘要。\n", encoding="utf-8")
+        before_corpus = _snapshot(corpus_no_index)
+        before_index = _snapshot(index_dir)
+        without_summary = diagnose(
+            corpus_no_index, threads_path=_P(td) / "threads.jsonl", index_dir=index_dir)
+        assert _snapshot(corpus_no_index) == before_corpus and \
+            _snapshot(index_dir) == before_index, \
+            "体检必须同时只读主语料与独立索引目录"
+        assert any(c["title"] == "分层" and c["level"] == WARN
+                   for c in without_summary), "README.txt 不许冒充索引层"
+
+        (index_dir / "window_04_2026-06-17.md").write_text(
+            "## 第4窗摘要\n咖啡机保险丝已经换好。\n", encoding="utf-8")
+        with_summary = diagnose(
+            corpus_no_index, threads_path=_P(td) / "threads.jsonl", index_dir=index_dir)
+        by_with_index = {c["title"]: c for c in with_summary}
+        assert "索引层 1" in by_with_index["建库"]["detail"], \
+            f"第二根里的摘要没有被认成索引层：{with_summary}"
+        assert not any(c["title"] == "分层" and c["level"] == WARN
+                       for c in with_summary), "真实摘要进第二根后应消除缺层警告"
+
+        assert retrieval_dirs(corpus_no_index, corpus_no_index) == \
+            (corpus_no_index.resolve(),), "同一个目录传两次不许重复建块"
+        missing_index = (_P(td) / "missing-index").resolve()
+        bad_index = diagnose(corpus_no_index, index_dir=missing_index)
+        assert bad_index[-1]["level"] == FAIL and \
+            bad_index[-1]["title"] == "索引摘要目录" and \
+            str(missing_index) in bad_index[-1]["detail"], \
+            f"显式 --index-dir 不存在时必须指名绝对路径：{bad_index}"
+        index_file = _P(td) / "not-a-directory.txt"
+        index_file.write_text("不是目录。\n", encoding="utf-8")
+        bad_index_file = diagnose(corpus_no_index, index_dir=index_file)
+        assert bad_index_file[-1]["level"] == FAIL and \
+            "不是目录" in bad_index_file[-1]["detail"], \
+            f"显式 --index-dir 指向文件时必须说清：{bad_index_file}"
+
+        captured_loader = {}
+        original_load_corpus = globals()["load_corpus"]
+
+        def capture_load_corpus(paths, **kwargs):
+            captured_loader["paths"] = tuple(paths)
+            captured_loader.update(kwargs)
+            return "合成索引"
+
+        globals()["load_corpus"] = capture_load_corpus
+        try:
+            source_dirs, loader14b = make_corpus_loader(
+                corpus_no_index, index_dir=index_dir, embed=True,
+                provider="合成 embedding 提供方")
+            assert loader14b() == "合成索引"
+        finally:
+            globals()["load_corpus"] = original_load_corpus
+        assert source_dirs == (corpus_no_index.resolve(), index_dir.resolve())
+        assert captured_loader["cache_path"] == \
+            corpus_no_index / ".embed_cache.json", \
+            f"双根加载不能让 embedding 缓存漂到索引目录：{captured_loader}"
+        assert captured_loader["provider"] == "合成 embedding 提供方"
+
         #    指错目录的三种典型都要给出**能照着改**的话，不是"失败"两个字
         gone = diagnose(_P(td) / "根本没有这个目录")
         assert gone[0]["level"] == FAIL and "--corpus" in gone[0]["detail"]
@@ -2031,6 +2431,22 @@ def _selftest():
             f"时间范围（最早/最晚）要在输出里——旧快照那个坑靠它：{out}"
         assert "filename" in out, f"时间戳来源分布要在输出里：{out}"
         assert _snapshot(corpus) == before, "真进程跑一遍同样不许写盘"
+
+        #    真 CLI 接第二根：两边都只读，且参数必须真的进 doctor，不是只在函数层可用。
+        independent_index = _P(td) / "bundle" / "memory" / "index"
+        independent_index.mkdir(parents=True)
+        (independent_index / "window_04_2026-06-17.md").write_text(
+            "## 第4窗摘要\n咖啡机保险丝已经换好。\n", encoding="utf-8")
+        before_main = _snapshot(corpus)
+        before_independent = _snapshot(independent_index)
+        code_index, out_index = run_doctor(
+            td, "--corpus", "corpus", "--index-dir", str(independent_index))
+        assert code_index == 0 and "索引摘要目录" in out_index and \
+            "索引层 2" in out_index, \
+            f"真 CLI 没把独立索引目录接进 doctor：{code_index} / {out_index}"
+        assert _snapshot(corpus) == before_main and \
+            _snapshot(independent_index) == before_independent, \
+            "真 CLI doctor 必须同时只读主语料与独立索引目录"
 
         #    空目录：显著提示 + 退出码非零（自动化靠它，人靠那句话）
         empty = _P(td) / "空目录"
@@ -2170,6 +2586,25 @@ def _selftest():
                                             "arguments": {"query": "绿萝换盆"}}})
         assert code18 == 200 and "大一号的盆" in body18, \
             f"中文该原样穿过 HTTP 并命中：{body18}"
+        #     本轮新增错误边界也要走真 HTTP，不拿进程内 handle 代替传输结果：
+        #     未预料异常仍回 200 JSON-RPC，content 非空且 isError=true。
+        handlers18 = srv18._handlers
+
+        def http_boom18(args, now=None):
+            raise RuntimeError("合成敏感正文不应外泄")
+
+        srv18._handlers = lambda: {"latent_session_start": http_boom18}
+        try:
+            code18, body18 = post18(
+                {"jsonrpc": "2.0", "id": 41, "method": "tools/call",
+                 "params": {"name": "latent_session_start"}})
+        finally:
+            srv18._handlers = handlers18
+        error18 = json.loads(body18)["result"]
+        assert code18 == 200 and error18["isError"] is True, \
+            f"工具异常要穿过真 HTTP 变成 isError：{body18}"
+        assert error18["content"][0]["text"] and "RuntimeError" in error18["content"][0]["text"]
+        assert "合成敏感正文" not in body18, "异常正文不许经 HTTP 泄露"
         #     常驻自动重读（变异：把 do_POST 里的指纹检查删掉 → 这条红）：
         #     手动上传 md 是 supergateway 时代实测过的静默坑——常驻只在启动读一次，
         #     新语料一条都查不到且不报错
@@ -2340,6 +2775,46 @@ def _selftest():
         assert "Streamable HTTP 服务在" in out_lo, \
             f"回环裸跑照常起动（反代在前的形态）：{out_lo}"
         assert "TLS" not in out_lo, f"回环上不许吵这一句：{out_lo}"
+
+    # 18i.【独立索引目录也要触发 HTTP 自动重读】主语料没有变化，只往第二根放入
+    #      摘要；下一次请求必须重建并命中。只测 loader 能读两根不够：旧指纹仍只盯
+    #      corpus 时，服务会安静地永远看不见这次更新。
+    with tempfile.TemporaryDirectory() as td18i:
+        root18i = _P(td18i)
+        corpus18i = root18i / "corpus"
+        index18i = root18i / "bundle" / "memory" / "index"
+        (corpus18i / "timeline").mkdir(parents=True)
+        index18i.mkdir(parents=True)
+        (corpus18i / "timeline" / "window_01_2026-08-01.md").write_text(
+            "## 咖啡机旧记录\n一开始怀疑加热管。\n", encoding="utf-8")
+        source18i, loader18i = make_corpus_loader(corpus18i, index_dir=index18i)
+        srv18i = MemoryServer(index=loader18i(), thread_store=ThreadStore(),
+                              corpus_dir=corpus18i, source_dirs=source18i,
+                              loader=loader18i)
+        httpd18i = make_http_server(srv18i, host="127.0.0.1", port=0)
+        threading.Thread(target=httpd18i.serve_forever, daemon=True).start()
+
+        def call18i(query):
+            payload = json.dumps({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "latent_search", "arguments": {"query": query}},
+            }, ensure_ascii=False).encode("utf-8")
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{httpd18i.server_address[1]}/mcp",
+                data=payload, headers={"Content-Type": "application/json",
+                                       "Accept": "application/json"})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.read().decode("utf-8")
+
+        before18i = call18i("咖啡机 加热管 保险丝")
+        assert "不是加热管" not in before18i, "摘要还没落盘前不许凭空命中"
+        (index18i / "topic_咖啡机_2026-08-09.md").write_text(
+            "## 咖啡机主题线\n最后确认故障是保险丝，不是加热管。\n",
+            encoding="utf-8")
+        after18i = call18i("咖啡机 加热管 保险丝")
+        assert "不是加热管" in after18i, \
+            f"第二根变化后下一请求必须自动重读：{after18i}"
+        httpd18i.shutdown()
 
     # 18e.【自动重读不许吞掉同窗口的手动上传·变异靶心】（2026.08.03 外部评审的竞态）：
     #     原先 handle 之后无条件重算指纹，于是一次 latent_append 与用户手动上传
@@ -2753,6 +3228,20 @@ def _selftest():
     #     出现了什么，**我们在终端里看到了不算**。别把这一项读成靶心二已经验过。
     #     变异：删掉 __main__ 里的 try/except（回到裸堆栈）/ 让 _startup_failed 直接
     #           sys.exit 不起降级壳 / 三条话术合并成一句 → 各自红
+    #     【本轮补的未知加载异常靶心】`_looks_offline()` 认不出的异常不能再被
+    #     自信地说成「语料／--corpus 有问题」。2026.08.06 真机夹具用中文 API key
+    #     撞出 UnicodeEncodeError，语料完全没坏，旧兜底却把人引去查语料。
+    unknown_load21 = startup_failure_report(
+        "load", UnicodeEncodeError("latin-1", "中", 0, 1, "合成配置编码错误"),
+        embed=True)
+    assert "语料读不进来" not in unknown_load21 and "--corpus 指的目录不对" not in unknown_load21, \
+        f"未知加载异常不许再冒充已确诊的语料错误：{unknown_load21!r}"
+    assert "无法判断" in unknown_load21 and "配置" in unknown_load21 and \
+        "依赖" in unknown_load21 and "语料" in unknown_load21, \
+        f"未知加载异常要如实列出未决方向，不许只剩一句空泛失败：{unknown_load21!r}"
+    assert "--doctor" in unknown_load21 and "完整报错" in unknown_load21, \
+        f"中性提示仍要给可行动出口：先体检，再看完整报错：{unknown_load21!r}"
+
     _MARK21 = {                       # 三条各自的指纹（判据先写下来，再开始数）
         1: "embedding 模型",          # 表里第 1 条：--embed 档，模型没下过 ＋ 没网
         3: "被别的进程占着",           # 表里第 3 条：--http 端口被占
@@ -2790,7 +3279,9 @@ def _selftest():
 
         #    a) 表里第 3 条：`--http` 端口被占。**真占一个端口**，不是模拟异常。
         squat21 = _socket21.socket()
-        squat21.setsockopt(_socket21.SOL_SOCKET, _socket21.SO_REUSEADDR, 1)
+        # ⚠ 不许给占位 socket 开 SO_REUSEADDR：Windows 会允许
+        # ThreadingHTTPServer 再绑同一端口，子进程真启动后卡在 serve_forever，
+        # 夹具最终只会报 90 秒超时，根本没走到「端口被占」错误出口。
         squat21.bind(("127.0.0.1", 0))
         squat21.listen(1)
         busy_port21 = squat21.getsockname()[1]
@@ -2985,7 +3476,8 @@ def _selftest():
         assert _NOTE_405_FALLBACK not in got405c[0], \
             f"这一格照抄「这不是错误」同样是冒充判据：{got405c!r}"
 
-    print("selftest ok（22项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层 / "
+    print("selftest ok（22项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层（含 "
+          "session_start 读取异常只重试一次、未预料异常不空断、写工具不重放）/ "
           "完整链路 / stdio / UTF-8 / 写回当场可查 / 用进撑过重启 / "
           "无可靠命中明确说 / 撤回更正闭环 / 缺失率标注接线 / 实体标注接线 / "
           "部署体检只读 / 部署体检走真进程（相对路径解析开、空语料非零退出、"
@@ -3030,6 +3522,8 @@ if __name__ == "__main__":
                     help="部署体检：查语料目录、时间戳成色、sidecar、写回落点与 MCP 接线，"
                          "只读不写盘。有一项过不去时退出码为 1")
     ap.add_argument("--corpus", help="md 语料目录")
+    ap.add_argument("--index-dir",
+                    help="人工索引摘要目录（可选，只读；与 --corpus 合并检索）")
     ap.add_argument("--threads", help="会话线索 jsonl 路径（省略则内存态）")
     ap.add_argument("--embed", action="store_true", help="用真 embedding")
     ap.add_argument("--embed-provider", dest="embed_provider",
@@ -3071,18 +3565,11 @@ if __name__ == "__main__":
         if not args.corpus:
             ap.error("--doctor 要跟 --corpus 一起用：体检的就是它指向的那个目录")
         checks = diagnose(args.corpus, threads_path=args.threads, embed=args.embed,
-                          time_context=time_ctx)
+                          time_context=time_ctx, index_dir=args.index_dir)
         print(format_doctor_report(checks))
         # 退出码给自动化用：有 ✗ 就非零，⚠ 不算失败（那些是"能用但会悄悄变差"）
         sys.exit(1 if any(c["level"] == FAIL for c in checks) else 0)
     elif args.corpus:
-        # 权重文件放语料目录下，起点号不带 .md——不会被 load_corpus 当语料吃进去
-        # 块向量缓存（.embed_cache.json）同理，由 load_corpus 默认落在这里：
-        # 没有它，云端档每次起服务都要把全库重算一遍
-        loader = lambda: load_corpus(args.corpus, embed=args.embed,
-                                     provider=(resolve_provider(args.embed_provider)
-                                               if args.embed else None))
-
         def _startup_failed(stage, exc):
             """启动失败的唯一出口：给人话、落盘、然后按传输形态决定怎么送到用户眼前。
 
@@ -3105,13 +3592,18 @@ if __name__ == "__main__":
         # 慢的时候要有话说（第 4 条）：只加提示，不动加载时序（靶心四）
         _load_done = slow_load_notice()
         try:
+            source_dirs, loader = make_corpus_loader(
+                args.corpus, index_dir=args.index_dir, embed=args.embed,
+                provider=(resolve_provider(args.embed_provider)
+                          if args.embed else None))
             srv = MemoryServer(index=loader(),
                                thread_store=ThreadStore(args.threads),
                                corpus_dir=args.corpus,
                                weights_path=Path(args.corpus) / ".weights.json",
                                retractions_path=Path(args.corpus) / ".retractions.json",
                                entities_path=Path(args.corpus) / ".entities.json",
-                               loader=loader, time_context=time_ctx)
+                               loader=loader, time_context=time_ctx,
+                               source_dirs=source_dirs)
         except Exception as e:                       # noqa: BLE001（裸堆栈正是本卡要消灭的）
             _load_done()
             _startup_failed("load", e)

@@ -27,7 +27,12 @@
 
 **给外部复测的人（不需要把语料给任何人）**：
   python3 distinctive_token_experiment.py --all \\
-      --corpus <你的语料目录或 jsonl> --probes <你的编造题.json>
+      --corpus <你的语料目录或 jsonl> --probes <你的编造题.json> \\
+      --entities <对应语料的 .entities.json>
+
+  `--entities` 不给时，`entity` 与 `ngram+entity` 两行明确显示“未测”，不会把
+  恒空放行集计成成绩；只跑零依赖判据时不需要实体表。实体表沿用产品既有格式，
+  按内容哈希对号入座；与本轮语料零块匹配会直接报错。
 
   编造题文件是一个 JSON 数组，每项 `[问题, [区分词, ...]]`——区分词是这道题里
   承载"编造事实"的内容词，护栏会**先验证它们在你语料全文里一个都不出现**，
@@ -44,7 +49,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from memory_retrieval import MemoryIndex, load_corpus  # noqa: E402
+from memory_retrieval import (  # noqa: E402
+    MemoryIndex,
+    entities_from_answer,
+    load_corpus,
+)
 import absent_probe_harness as harness  # noqa: E402
 
 CRITERIA = ("bigram", "df3", "ngram", "entity", "ngram+entity", "seg")
@@ -267,6 +276,8 @@ def gate_miss_rate(idx, cases):
 def run_one(criterion, chunks, probes, cases, entities=None, n=DEFAULT_N,
             quiet=False):
     """跑一条判据 → 一行数字。语料正文一个字都不进返回值。"""
+    if criterion in {"entity", "ngram+entity"} and not entities:
+        return {"criterion": criterion, "skip_reason": "未提供实体表"}
     row = {"criterion": criterion}
     patch(criterion, n=n)
     try:
@@ -280,7 +291,7 @@ def run_one(criterion, chunks, probes, cases, entities=None, n=DEFAULT_N,
             idx_probe.build()
         try:
             ok, tested, skipped, detail = harness.run_probes(
-                chunks, probes, verbose=False)
+                chunks, probes, verbose=False, index=idx_probe)
         except RuntimeError as e:                        # seg 档没装分词器
             unpatch()
             return {"criterion": criterion, "skip_reason": str(e)}
@@ -338,6 +349,35 @@ def load_external(corpus_path):
             p.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def load_external_entities(chunks, entities_path):
+    """把产品既有的 .entities.json 按内容哈希接到本轮外部语料。"""
+    path = Path(entities_path)
+    if not path.exists():
+        raise FileNotFoundError(f"实体表不存在：{path}")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "实体表格式错误：必须是内容哈希到实体列表的 JSON 对象") from exc
+    if not isinstance(raw, dict) or any(
+            not isinstance(values, list)
+            or any(not isinstance(value, str) for value in values)
+            for values in raw.values()):
+        raise ValueError("实体表格式错误：必须是内容哈希到实体列表的 JSON 对象")
+    idx = MemoryIndex()
+    for chunk in chunks:
+        idx.add(chunk, {})
+    idx.build()
+    try:
+        matched = idx.load_entities(path)
+    except (AttributeError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "实体表格式错误：必须是内容哈希到实体列表的 JSON 对象") from exc
+    if matched == 0:
+        raise ValueError("实体表与当前外部语料零块匹配")
+    return {i: set(values) for i, values in idx._entities.items()}
+
+
 # ---------- selftest ----------
 
 def _selftest():
@@ -391,7 +431,82 @@ def _selftest():
     assert idx2.lexical_admit(tokenize(idx2._exp_query)) == {0}, "有表时该认得出"
     unpatch()
 
-    # 4. 外部语料模式只回数字：报表里不许出现任何语料正文
+    # 4. 实体相关判据没接实体表时必须明确报“未测”，不能把恒空放行集计成成绩。
+    #    这条会抓住外部模式把 entities 固定成 None 后仍输出 entity 9/9 的平凡解。
+    probes = [("我那台单簧管修好了吗", ["单簧管"])]
+    for criterion in ("entity", "ngram+entity"):
+        for empty_entities in (None, {}):
+            row = run_one(
+                criterion, chunks, probes, cases=None, entities=empty_entities)
+            assert row == {"criterion": criterion, "skip_reason": "未提供实体表"}, \
+                f"{criterion} 没有可用实体时必须标成未测，实际 {row}"
+
+    # 5. 实体表不只要“载入成功”，还必须真进 absent 计分所用的那一个索引。
+    #    语料里有“咖啡机”，编造事实词“电池／牌子”没有；接线正确时实体判据会
+    #    因查询中的“咖啡机”开闸，所以这题应漏检 0/1，而不是恒空放行的 1/1。
+    wired = run_one(
+        "entity",
+        chunks,
+        [("咖啡机换的电池是什么牌子", ["电池", "牌子"])],
+        cases=None,
+        entities={0: {"咖啡机"}},
+    )
+    assert (wired["absent_ok"], wired["absent_n"]) == (0, 1), \
+        f"实体表必须进入 absent 计分索引，实际 {wired}"
+
+    # 6. 外部实体表沿用产品的内容哈希格式：匹配表真接入，错表必须吵着失败。
+    #    这条会抓住“参数看似存在但没接线”和“拿错表仍算平凡解”两种坏法。
+    entities_path = Path(__file__).with_name(".distinctive-token-selftest.entities.json")
+    wrong_path = Path(__file__).with_name(".distinctive-token-selftest-wrong.entities.json")
+    malformed_path = Path(__file__).with_name(
+        ".distinctive-token-selftest-malformed.entities.json")
+    malformed_values_path = Path(__file__).with_name(
+        ".distinctive-token-selftest-malformed-values.entities.json")
+    try:
+        source = MemoryIndex()
+        for c in chunks:
+            source.add(c, {})
+        valid = entities_from_answer(source, {"1": ["咖啡机"]})
+        entities_path.write_text(json.dumps(valid, ensure_ascii=False), encoding="utf-8")
+        loaded = load_external_entities(chunks, entities_path)
+        assert loaded == {0: {"咖啡机"}}, f"实体表没有按内容哈希接回原块：{loaded}"
+
+        wrong_path.write_text(
+            json.dumps({"不匹配的内容哈希": ["咖啡机"]}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        try:
+            load_external_entities(chunks, wrong_path)
+        except ValueError as exc:
+            assert "零块匹配" in str(exc), f"错表错误信息没有指出根因：{exc}"
+        else:
+            raise AssertionError("与当前语料零块匹配的实体表必须失败")
+
+        malformed_path.write_text("[]", encoding="utf-8")
+        try:
+            load_external_entities(chunks, malformed_path)
+        except ValueError as exc:
+            assert "格式错误" in str(exc), f"坏格式错误信息没有指出根因：{exc}"
+        else:
+            raise AssertionError("不是内容哈希映射的实体表必须失败")
+
+        malformed_values_path.write_text(
+            json.dumps({next(iter(valid)): "咖啡机"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        try:
+            load_external_entities(chunks, malformed_values_path)
+        except ValueError as exc:
+            assert "格式错误" in str(exc), f"实体值不是列表时没有指出格式错误：{exc}"
+        else:
+            raise AssertionError("实体表的每个值都必须是实体字符串列表")
+    finally:
+        entities_path.unlink(missing_ok=True)
+        wrong_path.unlink(missing_ok=True)
+        malformed_path.unlink(missing_ok=True)
+        malformed_values_path.unlink(missing_ok=True)
+
+    # 7. 外部语料模式只回数字：报表里不许出现任何语料正文
     #    （回传的那张表不该夹带别人和 TA 的 AI 说过的话）
     rows = [run_one("bigram", chunks, [("我那台单簧管修好了吗", ["单簧管"])],
                     cases=None)]
@@ -401,13 +516,14 @@ def _selftest():
         assert body not in table, f"外部模式的报表里出现了语料正文：{body}"
     assert "1/1" in table, f"数字该在：{table}"
 
-    # 5. seg 档没装分词器时如实报"未测"，不静默降级成别的判据
+    # 8. seg 档没装分词器时如实报"未测"，不静默降级成别的判据
     if _seg_words("测试一下") is None:
         r = run_one("seg", chunks, [("我那台单簧管修好了吗", ["单簧管"])], cases=None)
         assert r.get("skip_reason"), "装不上分词器要明确报未测，不许偷偷换判据"
 
-    print("selftest ok（5项断言：判据切换生效且补丁可复原 / 护栏真被调用且抓住出题人 / "
-          "实体判据不静默退回 / 外部模式只回数字 / 缺依赖如实报未测）")
+    print("selftest ok（8项断言：判据切换生效且补丁可复原 / 护栏真被调用且抓住出题人 / "
+          "实体判据不静默退回 / 空实体表不计分 / 实体表真进入 absent 计分索引 / "
+          "外部实体表接线且错表拒绝 / 外部模式只回数字 / 缺依赖如实报未测）")
 
 
 def main():
@@ -418,6 +534,7 @@ def main():
     ap.add_argument("-n", type=int, default=DEFAULT_N, help="ngram 档的 n，默认 3")
     ap.add_argument("--corpus", help="外部语料（目录或 jsonl）；不给则用回归集合成语料")
     ap.add_argument("--probes", help="外部编造题 json：[[问题, [区分词,...]], ...]")
+    ap.add_argument("--entities", help="外部实体表（.entities.json，须与 --corpus 同用）")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.selftest:
@@ -428,11 +545,19 @@ def main():
     if args.all:
         criteria = list(CRITERIA)
 
+    if args.entities and not args.corpus:
+        ap.error("--entities 只能与 --corpus 一起使用")
+
     external = bool(args.corpus)
     if external:
         chunks = load_external(args.corpus)
         cases = None                      # 别人的语料没有我们的期望集
         entities = None
+        if args.entities:
+            try:
+                entities = load_external_entities(chunks, args.entities)
+            except (OSError, ValueError) as exc:
+                ap.error(f"实体表不可用：{exc}")
     else:
         import regression_set as RS
         idx = RS.build_index(scale="established")

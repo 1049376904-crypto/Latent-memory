@@ -145,4 +145,4 @@
 
 ## License
 
-MIT
+AGPL-3.0-or-later，完整条款见 [LICENSE](LICENSE)。
